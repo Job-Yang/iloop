@@ -14,6 +14,7 @@ from typing import List, Protocol, runtime_checkable
 class Capability(str, Enum):
     DOCTOR = "doctor"
     BUILD = "build"
+    RUN = "run"
     INSTALL = "install"
     LAUNCH = "launch"
     LOGS = "logs"
@@ -21,6 +22,9 @@ class Capability(str, Enum):
     SCREENSHOT = "screenshot"
     CRASH = "crash"
     PROBE = "probe"
+    TAP = "tap"
+    SWIPE = "swipe"
+    TYPE_TEXT = "type_text"
 
 
 class CapabilityStatus(str, Enum):

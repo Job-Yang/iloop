@@ -3,15 +3,16 @@
 > 何时读：要 build/install/launch、模拟器或真机跑、抓运行态证据时。
 
 ## 编译与安装
-- 编译只走 `python3 -m cli invoke build`（内核 iOS 插件封装 xcodebuild），禁止裸 `xcodebuild`；安装只走 `invoke install`。
+- 编译只走 `python3 -m cli invoke build` 或可恢复的 `run/resume ... caps=build,run`。iOS 插件调用公开 XcodeBuildMCP CLI，禁止裸 `xcodebuild`。
+- XcodeBuildMCP 的 Skill/MCP/CLI 是同一开源项目的不同入口；iLoop 的可交付依赖是 CLI 二进制。安装：`brew tap getsentry/xcodebuildmcp && brew install xcodebuildmcp`。
 - 成功看 success markers（`BUILD SUCCEEDED`）+ 产物存在，**不只看 exit code**（VDD：exit 0 不等于成功）。
 - 失败先分类：环境/签名/依赖/编译/链接/构建服务/测试/资源，别把环境问题误修成业务代码。
-- **失败第一步查错题本**：分类后动手前先 `lessons_search "<报错关键词>"`——覆盖工程 `lessons/` + `seed_lessons/`。命中就按已有解法走（用当前日志复核，旧解法可能过期），别从零硬解。
+- **失败第一步查错题本**：分类后动手前先 `python3 -m cli lessons search "<报错关键词>"`。命中就按已有解法走（用当前日志复核，旧解法可能过期），别从零硬解。
 - `Multiple commands produce`、签名、DerivedData 之类先查插件参数和工程配置，不改头文件/podspec/Info.plist 硬修。
 - **Xcode 自发现**：内核 `discover_developer_dir` 会自动找到已装的 Xcode（不依赖全局 `xcode-select`），并注入 `DEVELOPER_DIR`。`doctor` 会如实报告依赖是否齐备。
 
 ## 单轮闭环
-- 流程：`log_round_start → 计划 → 改动 → build → 读日志 → 修复 → 按目标取证 → log_round_end → 刷看板`。
+- 流程：`run 建 Task → 计划/改动 → resume caps=build,run,... → 读证据 → 修复 → 按目标取证 → accept/wrapup`。Runtime 自动保存 round、evidence 和 dashboard；手动轮次用 `round start/end`。
 - 收口时按实自报这轮产出了哪些证据（`build` 编译通过 / `screenshot` 截图 / `log` 日志 / `crash` 崩溃报告 / `ui` 视图层级 / `acceptance` 独立验收），看板靠它统计"iLoop 给了多少证据"，是小场景价值的关键来源，别省。临时探针日志默认不提交，收口前清理。
 
 ## 运行态证据策略
@@ -25,16 +26,16 @@
 - **判断法**：现象依赖硬件/签名/真实服务端策略吗？是→真机（`--real`），否→模拟器。两种设备结论互不推断，下结论写明在哪种设备。
 
 ## 模拟器工具链
-- 快速闭环：`invoke build → invoke install → invoke launch → invoke screenshot/view_tree/logs（按需）`。
-- 底层走 `xcrun simctl`（install/launch/openurl/screenshot/log）+ `xcodebuild`。只验编译时别跑重型 runtime。
+- 快速闭环：优先 `resume <task_id> caps=run,view_tree,screenshot,logs ...`。`run` 是 XcodeBuildMCP 的 build-and-run，一次完成编译、安装、拉起并启动动态日志。
+- 底层走 XcodeBuildMCP CLI：build/run/install/launch/snapshot-ui/tap/swipe/type/screenshot/probe。只验编译时使用 `build`，别跑重型 runtime。
 - 模拟器异常不能推断真机；涉硬件/权限/音视频/系统账号/真实网络必须切真机。
 
 ## 真机执行（含真机 UI 自动化——VDD 一等能力）
-- 标准链路：`invoke build --real → invoke install --real → invoke launch --real → 按目标取证 → 归档`。
-- **执行栈全开源**：install/launch 走 `xcrun devicectl`；真机 UI（截图/点击/滑动/输入/UI 层级树）走 Appium 社区版 **WebDriverAgent**（内核 `plugins/ios_native/wda_client.py`），经 `iproxy` 转发到 127.0.0.1:8100；录屏走 WDA MJPEG + `ffmpeg`。
-- **签名**：本机 Xcode 账号（`Apple Development` + `-allowProvisioningUpdates`，读工程 `User.xcconfig`），无任何私有签名服务。
+- 标准链路：`resume <task_id> --real caps=run,... workspace=... scheme=... device_udid=...`。
+- **执行栈全开源**：build/install/launch 走 XcodeBuildMCP device workflow；真机 UI（截图/点击/滑动/输入/UI 层级树）走 Appium 社区版 **WebDriverAgent**（内核 `plugins/ios_native/wda_client.py`），经 `iproxy` 转发到 127.0.0.1:8100。
+- **签名**：使用工程在本机 Xcode 中已有的签名配置，无任何私有签名服务。
 - 首装/首启遇登录/验证码/隐私/权限/证书信任等人工卡口，第一时间让用户处理并记 `asked_human=true`。
-- **诚实缺口**：真机 crash 本地采集（`.ips`）尚未实现（内核 `crash` 能力返回 unsupported）；真机 UI batch 目前只支持 tap。别假装完整。
+- **诚实缺口**：真机 crash 已通过 `devicectl` 拉取；WDA 生命周期仍需外部启动，真机不提供模拟器那套语义 elementRef。没有在线 WDA 时必须明确失败，别假装完整。
 
 ## UI 验证决策表（改了任何 UI，先查这张表用对工具"看到渲染结果"再核对——禁止只 grep 源码）
 > 铁律：UI 改动的真值源是**渲染出来的画面**，不是源码里有没有那行 CSS/DOM/约束。改完必须"渲染→亲眼看/客观测→对照目标"再宣布完成。用错验证方式=没验证。

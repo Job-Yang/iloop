@@ -163,7 +163,7 @@ iLoop 不要求别人迁移到一套全新的 Agent 体系。它更像一个下�
 
 iLoop 的平台插件负责把这些反馈接进来；内核只关心证据是什么、从哪里来、能否复核。
 
-开源版的 iOS 插件当前支持 build、install、launch、logs、view tree、screenshot、probe 和 crash。模拟器走 `simctl`，真机走 `devicectl` 与 Appium WebDriverAgent。
+开源版的 iOS 插件当前支持 build、run、install、launch、logs、view tree、screenshot、probe、crash，以及 tap、swipe、type text。编译、运行、安装和模拟器 UI 统一走公开的 XcodeBuildMCP CLI；真机 UI 走 Appium WebDriverAgent。`run`/`launch` 由 XcodeBuildMCP 同步启动动态日志采集，`logs` 再把真实日志归档进任务证据。
 
 ---
 
@@ -432,15 +432,16 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 - 错题本、反循环、能力 Gate、红线守卫；
 - 提效看板；
 - Agent 驱动的扩展脚手架和校验器；
-- iOS 官方插件：build、install、launch、logs、view tree、screenshot、probe、crash；
+- 可恢复运行时：Task 计划、当前阶段、Case/Gate、轮次账、证据索引和看板均落盘，`run/resume/tasks` 可跨会话继续；
+- iOS 官方插件：XcodeBuildMCP build/run/install/launch/动态日志/模拟器 UI 自动化，以及 WDA 真机 UI、screenshot、probe、crash；
 - 模拟器与真机执行路径，真机 UI 基于 Appium WebDriverAgent；
-- 83 条 selftest 断言。
+- 96 条 selftest 断言（内核 75 + iOS 插件 21）。
 
 ### 已真实验证
 
 - 内核和 iOS 插件 selftest 全绿；
 - Xcode 自动发现；
-- 模拟器 probe 与 screenshot 端到端运行，截图产物可复核；
+- 旧版模拟器 probe 与 screenshot 曾端到端运行；本次迁移后的 XcodeBuildMCP 路径已通过命令契约测试，当前会话受 Simulator 沙箱限制，仍待非沙箱复验；
 - oncall demo 从事件到病例、证据、四关、通知完整运行；
 - 扩展创建、校验和防覆盖核心 flow。
 
@@ -448,7 +449,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 
 - 更多真实 iOS 工程上的 build / install / launch 组合；
 - 更多真机与系统版本覆盖；
-- 真机 UI batch 目前只支持 tap；
+- WDA 生命周期自动管理与真机语义 elementRef 操作；
 - Android、Web、Lynx 等新平台应以插件方式逐个接入并真实验证，不能仅凭架构推断已经通用。
 
 这也是 iLoop 对自己的要求：可以说架构为跨平台准备好了，但在某个平台真跑通之前，不能把“可以扩展”说成“已经支持”。

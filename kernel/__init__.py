@@ -42,6 +42,8 @@ from .redline import (
     check_command, guard_command, guard_write_path, RedlineViolation,
 )
 from .dashboard import Dashboard
+from .task import TaskRecord, TaskStatus, TaskStep, StepStatus, TaskStore
+from .runtime import Runtime
 
 __all__ = [
     "EvidenceArtifact", "EvidenceKind",
@@ -62,6 +64,7 @@ __all__ = [
     "merge_into_registry", "load_installed_extensions", "has_errors", "ValidationIssue",
     "check_command", "guard_command", "guard_write_path", "RedlineViolation",
     "Dashboard",
+    "TaskRecord", "TaskStatus", "TaskStep", "StepStatus", "TaskStore", "Runtime",
 ]
 
 __version__ = "0.0.1"

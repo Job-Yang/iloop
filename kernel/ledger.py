@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import asdict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -66,6 +67,29 @@ class Ledger:
         self.rounds: List[Round] = []
         self.traces: List[str] = []
 
+    @classmethod
+    def load(cls, data_dir: str | Path) -> "Ledger":
+        ledger = cls(data_dir)
+        rounds_path = ledger.dir / "rounds.json"
+        traces_path = ledger.dir / "trace.jsonl"
+        if rounds_path.exists():
+            for row in json.loads(rounds_path.read_text(encoding="utf-8")):
+                ledger.rounds.append(Round(
+                    index=row["index"],
+                    goal=row["goal"],
+                    status=RoundStatus(row["status"]),
+                    root_cause_tag=row.get("root_cause_tag", ""),
+                    started_at=row.get("started_at", time.time()),
+                    ended_at=row.get("ended_at"),
+                ))
+        if traces_path.exists():
+            ledger.traces = [
+                json.loads(line)["line"]
+                for line in traces_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        return ledger
+
     def log_round_start(self, goal: str, root_cause_tag: str = "") -> Round:
         r = Round(index=len(self.rounds) + 1, goal=goal, root_cause_tag=root_cause_tag)
         self.rounds.append(r)
@@ -101,6 +125,15 @@ class Ledger:
 
     def flush(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        rounds = []
+        for round_ in self.rounds:
+            row = asdict(round_)
+            row["status"] = round_.status.value
+            rounds.append(row)
+        (self.dir / "rounds.json").write_text(
+            json.dumps(rounds, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         (self.dir / "trace.jsonl").write_text(
             "\n".join(json.dumps({"line": t}, ensure_ascii=False) for t in self.traces),
             encoding="utf-8",

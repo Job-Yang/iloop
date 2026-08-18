@@ -23,10 +23,12 @@
 - 红线守卫 `redline`（危险命令拦截 + 禁止污染工程目录）
 - 扩展机制 `extension`（二开硬边界，核心只读，命名空间防覆盖）
 - 命令执行框架 `runner`（Xcode 自发现 + 红线拦截）
+- 可恢复运行时 `Runtime` + `TaskStore`：Task/Case/Gate/Ledger/Evidence 原子落盘，`run/resume/tasks/round/case/accept/wrapup/dashboard` 串成闭环
 
 ### iOS 官方插件
-- build / install / launch / screenshot / view_tree / logs / probe / crash 真实现
-- 模拟器走 `simctl` + `xcodebuild`，真机走 `devicectl` + Appium 社区版 WebDriverAgent
+- build / run / install / launch / screenshot / view_tree / logs / probe / crash / tap / swipe / type_text 真实现
+- 编译、运行、安装和模拟器 UI 统一走公开 XcodeBuildMCP CLI；真机 UI 走 Appium 社区版 WebDriverAgent
+- `run`/`launch` 启动 XcodeBuildMCP 动态日志，`logs` 只归档真实日志，不再拿设备信息冒充
 - 本机 Xcode 自动发现（不依赖全局 `xcode-select`），本地签名无私有服务
 - 真机 crash 本地采集（`devicectl` 拉取）；模拟器 crash 扫 DiagnosticReports
 
@@ -34,8 +36,8 @@
 - 入口提示词 `AGENT_PROMPT.md` + 分片提示词 `prompts/`
 - `SPEC.md`（四协议）/ `DESIGN.md`（设计）/ `EXTENDING.md`（二开）/ `docs/VDD.md`（方法论）
 - README 与 DESIGN 按“程序员反馈循环 → 长任务问题 → 架构设计”重写；二次开发改为 Agent 执行协议
-- selftest 83 断言（内核 67 + iOS 插件 16），全绿才算完成
+- selftest 96 断言（内核 75 + iOS 插件 21），全绿才算完成
 
 ### 已知缺口（诚实标注）
-- 真机 UI batch 目前只支持 tap 步骤
-- iOS build/install 需真实工程环境端到端验证
+- 真机 WDA 生命周期仍需外部启动，真机语义 elementRef 操作不与模拟器混用
+- iOS build/run 仍需在一个公开样例工程上补持续 E2E

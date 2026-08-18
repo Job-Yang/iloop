@@ -390,6 +390,70 @@ def test_flow_next_suggest() -> None:
     check("flow: 加载到 10 个核心 flow", len(reg.all()) == 10)
 
 
+def test_case_and_ledger_resume() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        case_path = Path(d) / "case.json"
+        case = Case("resume-case", "页面异常")
+        hypothesis = case.add_hypothesis("渲染分支错误", wants_capability="view_tree")
+        evidence = EvidenceArtifact(
+            capability="view_tree", source="test", kind="observed", summary="目标控件缺失"
+        )
+        case.attach(hypothesis.id, evidence, gate="mechanism")
+        case.save(case_path)
+        restored = Case.load(case_path)
+        check("断点: Case 恢复假设与 wants_capability",
+              restored.hypotheses["h1"].wants_capability == "view_tree")
+        check("断点: Case 恢复 Gate 绑定",
+              restored.evaluate_gate().detail["mechanism"])
+
+        ledger = Ledger(d)
+        ledger.log_round_start("编译", "compile")
+        ledger.log_round_end(RoundStatus.FAILED)
+        ledger.trace("blocked", "编译失败")
+        ledger.flush()
+        loaded = Ledger.load(d)
+        check("断点: Ledger 恢复轮次", len(loaded.rounds) == 1
+              and loaded.rounds[0].status == RoundStatus.FAILED)
+        check("断点: Ledger 恢复 trace", loaded.traces[-1].endswith("编译失败"))
+
+
+def test_runtime_task_resume_and_evidence() -> None:
+    from kernel import CapabilityResult, CapabilityStatus, Runtime, TaskStatus
+
+    class FakePlugin:
+        platform_id = "fake"
+
+        def capabilities(self):
+            return list(Capability)
+
+        def invoke(self, capability, **kwargs):
+            return CapabilityResult(
+                self.platform_id, capability.value, CapabilityStatus.SUCCESS,
+                f"{capability.value} verified", "/tmp/evidence", ["artifact-1"],
+            )
+
+    with tempfile.TemporaryDirectory() as d:
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        runtime = Runtime(d, registry, FakePlugin())
+        task = runtime.start(
+            "修复页面崩溃",
+            constraints=["不改公共 API"],
+            acceptance=["编译通过"],
+            capabilities=["build", "logs"],
+        )
+        task = runtime.execute_capabilities(task, ["build", "logs"])
+        restored = runtime.load(task.id)
+        card = runtime.tasks.resume_card(restored)
+        check("运行时: Task 原子落盘并可恢复", restored.id == task.id
+              and card["constraints"] == ["不改公共 API"])
+        check("运行时: 能力步骤完成并记录证据", len(restored.evidence_ids) == 2
+              and len(runtime.evidence(task.id)) == 2)
+        check("运行时: 执行后仍可继续而非假装完成", restored.status == TaskStatus.OPEN)
+        check("运行时: 自动生成任务看板",
+              (Path(d) / "runtime" / task.id / "dashboard.html").exists())
+
+
 def run() -> int:
     for fn in [
         test_evidence_observed_vs_inferred,
@@ -416,6 +480,8 @@ def run() -> int:
         test_runner_blocks_dangerous_by_default,
         test_dashboard_metrics_and_render,
         test_flow_next_suggest,
+        test_case_and_ledger_resume,
+        test_runtime_task_resume_and_evidence,
     ]:
         fn()
     passed = sum(1 for _, ok in _checks if ok)

@@ -34,7 +34,7 @@
 插件对内核暴露的统一动作面。每个能力同名实现（不支持就 no-op 返回 `unsupported`），产出统一结果。
 
 内核认识的能力集（首发）：
-`doctor · build · install · launch · logs · view_tree · screenshot · crash · probe`
+`doctor · build · run · install · launch · logs · view_tree · screenshot · crash · probe · tap · swipe · type_text`
 
 统一结果 JSON：
 

@@ -122,11 +122,16 @@ iLoop 把记忆拆成不同用途：
 
 - Python 3.9+。内核只用标准库，不需要 `pip install`。
 - 使用 iOS 插件需要 macOS + Xcode。
-- 真机 UI 自动化需要 `ffmpeg` 和 `iproxy`。
+- iOS 编译、运行和模拟器 UI 自动化使用公开的 [XcodeBuildMCP](https://github.com/getsentry/XcodeBuildMCP) CLI。
+- 真机 WDA UI 自动化额外需要 `iproxy`。
 
 ```bash
 git clone https://github.com/Job-Yang/iloop.git
 cd iloop
+
+# 安装公开执行底座（MIT；MCP/Skill 与 CLI 是同一项目的不同入口）
+brew tap getsentry/xcodebuildmcp
+brew install xcodebuildmcp
 
 # 内核与插件自测
 python3 -m cli selftest
@@ -136,7 +141,20 @@ python3 -m cli plan "帮我修复下单页崩溃"
 
 # iOS 环境体检
 python3 -m cli doctor
+
+# 创建可恢复任务；能力结果、轮次和看板写入 ~/.iloop/data/
+export ILOOP_PROJECT_ROOT=/path/to/your/app
+python3 -m cli run "帮我修复下单页崩溃" \
+  constraints="不改公共 API" \
+  acceptance="编译通过;拉起无 crash"
+
+# 中断或换会话后恢复
+python3 -m cli tasks
+python3 -m cli resume <task_id> caps=build,run,logs \
+  workspace=App.xcworkspace scheme=App sim_udid=<simulator-id>
 ```
+
+`project_root` 用于隔离不同工程的数据；也可固定设置 `ILOOP_PROJECT_ROOT`。任务、证据和看板默认写入 `~/.iloop/data/<project-id>/`，不污染业务仓。
 
 然后把仓根的 [AGENT_PROMPT.md](AGENT_PROMPT.md) 作为项目规则或 Agent 入口加载到 Claude Code、Codex、Cursor 或自建宿主。提示词、内核和插件一起随仓库分发，不需要再拉第二套工具链。
 
@@ -169,9 +187,11 @@ Agent 会按入口协议自动完成：
 
 版本 `0.0.1`，首发范围是**平台无关内核 + iOS 官方插件**。
 
-- selftest 83 条断言全绿：内核 67 + iOS 插件 16。
-- 模拟器 screenshot / probe 已端到端真跑。
-- iOS build、install、真机 UI 和 crash 已有真实命令实现；仍需要更多真实工程与设备覆盖。
-- 已知缺口：真机 UI batch 当前只支持 tap。
+- selftest 96 条断言全绿：内核 75 + iOS 插件 21。
+- Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
+- 模拟器 build/run/install/launch/UI tree/tap/swipe/type/screenshot/probe 统一走 XcodeBuildMCP CLI。
+- `run`/`launch` 产生的 XcodeBuildMCP 动态日志可由 `logs` 归档；没有真实日志时明确失败，不再拿设备信息冒充。
+- 真机 build/install/launch 走 XcodeBuildMCP，UI 与截图走公开 WDA，crash 走 `devicectl`。
+- 已知缺口：真机 WDA 生命周期仍需外部启动；真机语义 elementRef 操作不与模拟器混用。
 
 MIT License。欢迎使用、修改和二次开发。

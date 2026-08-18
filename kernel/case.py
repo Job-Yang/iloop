@@ -170,6 +170,7 @@ class Case:
             "created_at": self.created_at,
             "hypotheses": [asdict_h(h) for h in self.hypotheses.values()],
             "evidence": [e.to_dict() for e in self.evidence.values()],
+            "gate_bindings": self._gate.bindings(),
             "timeline": self.timeline,
         }
 
@@ -178,6 +179,40 @@ class Case:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 
+    @classmethod
+    def load(cls, path: str | Path) -> "Case":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        case = cls(data["case_id"], data["symptom"])
+        case.status = CaseStatus(data["status"])
+        case.created_at = data.get("created_at", case.created_at)
+        case.hypotheses = {
+            row["id"]: Hypothesis(
+                id=row["id"],
+                text=row["text"],
+                status=row.get("status", "open"),
+                evidence_ids=list(row.get("evidence_ids", [])),
+                wants_capability=row.get("wants_capability", ""),
+            )
+            for row in data.get("hypotheses", [])
+        }
+        case.evidence = {
+            row["id"]: EvidenceArtifact(**row)
+            for row in data.get("evidence", [])
+        }
+        for gate, evidence_ids in data.get("gate_bindings", {}).items():
+            for evidence_id in evidence_ids:
+                evidence = case.evidence.get(evidence_id)
+                if evidence is not None:
+                    case._gate.bind(gate, evidence)
+        case.timeline = list(data.get("timeline", []))
+        return case
+
 
 def asdict_h(h: Hypothesis) -> dict:
-    return {"id": h.id, "text": h.text, "status": h.status.value, "evidence_ids": h.evidence_ids}
+    return {
+        "id": h.id,
+        "text": h.text,
+        "status": h.status.value,
+        "evidence_ids": h.evidence_ids,
+        "wants_capability": h.wants_capability,
+    }

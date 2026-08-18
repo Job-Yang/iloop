@@ -52,3 +52,7 @@ class FourGate:
             detail[g] = any(e.is_observed() for e in self._bind[g])
         missing = [g for g in GATES if not detail[g]]
         return GateResult(passed=not missing, detail=detail, missing=missing)
+
+    def bindings(self) -> Dict[str, List[str]]:
+        """Serializable evidence ids bound to each gate."""
+        return {gate: [e.id for e in evidence] for gate, evidence in self._bind.items()}

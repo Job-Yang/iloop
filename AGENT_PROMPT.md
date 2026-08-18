@@ -20,10 +20,18 @@
 
 ```
 python3 -m cli plan "<任务>"        # flow 路由 + 自治分级（先跑这个）
+python3 -m cli run "<任务>" [caps=build,run,logs] [k=v ...]  # 建任务并按需执行能力
+python3 -m cli resume <task_id> [caps=...] [k=v ...]         # 从磁盘断点继续
+python3 -m cli tasks                # 未完成任务恢复卡（阶段/约束/下一步）
+python3 -m cli task show|step|complete ...                   # 推进结构化任务计划
+python3 -m cli case show|tick|resolve <task_id>              # 病例续诊
+python3 -m cli lessons search|add ...                        # 错题本召回/沉淀
+python3 -m cli accept <task_id>                              # 独立验收入口
+python3 -m cli wrapup <task_id>                              # 验收、完成、生成看板
 python3 -m cli flows                # 列出已加载 flow
 python3 -m cli experts "<任务>"     # 诊断方法专家路由
 python3 -m cli doctor [--real]      # iOS 插件依赖体检
-python3 -m cli invoke <cap> [--real] [k=v ...]   # 真调能力(build/install/launch/screenshot/view_tree/logs/probe)
+python3 -m cli invoke <cap> [--real] [k=v ...]   # build/run/UI/logs/crash 等原子能力
 python3 -m cli oncall-demo          # 演示：同一内核驱动 oncall 诊断
 python3 -m cli extension-init <team.ext>          # 创建业务扩展包（二开入口）
 python3 -m cli extension-validate <dir>           # 校验扩展包
@@ -66,12 +74,13 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 ## 反循环（防死循环）
 
 - 同根因构建失败最多修 3 轮，单任务总失败最多 6 轮，超过停手给证据+候选+推荐（内核 `Ledger.should_stop`）。
-- 每轮 `log_round_start`/`end`。连续多个 thought 无工具调用要停手确认。
+- 多步/跨模块任务必须用 `run` 建 Task；每轮通过 `round start/end` 或 `run/resume caps=...` 记账。换会话先执行 `tasks`，读回当前阶段、不可遗忘约束和下一步，禁止凭聊天记忆重建。
+- 连续多个 thought 无工具调用要停手确认。
 
 ## 长期记忆 · 错题本（强制成对）
 
 - 只处理工程/工具链类报错（环境/编译/链接/签名/构建服务、重试失败）；纯业务 bug/一次通过不触发。
-- 先 `lessons_search`；解决后满足"非业务 + 高概率复现 + 解法非平凡"才 `lesson_add`。
+- 先 `lessons search "<关键词>"`；解决后满足"非业务 + 高概率复现 + 解法非平凡"才 `lessons add title=... symptom=... root_cause=... fix=...`。
 - 种子错题本见 `seed_lessons/`（通用工程坑）。
 
 ## 红线（任何时候不可违反，细则见 `prompts/record-wrapup.md`）
