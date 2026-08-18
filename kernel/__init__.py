@@ -36,7 +36,7 @@ from .gate_capability import CapabilityGate, RequiredOperation, OpStatus
 from .runner import CommandRunner, CommandOutput, discover_developer_dir
 from .extension import (
     Extension, scaffold_extension, load_extension, validate_extension,
-    merge_into_registry, has_errors, ValidationIssue,
+    merge_into_registry, load_installed_extensions, has_errors, ValidationIssue,
 )
 from .redline import (
     check_command, guard_command, guard_write_path, RedlineViolation,
@@ -59,7 +59,7 @@ __all__ = [
     "CapabilityGate", "RequiredOperation", "OpStatus",
     "CommandRunner", "CommandOutput", "discover_developer_dir",
     "Extension", "scaffold_extension", "load_extension", "validate_extension",
-    "merge_into_registry", "has_errors", "ValidationIssue",
+    "merge_into_registry", "load_installed_extensions", "has_errors", "ValidationIssue",
     "check_command", "guard_command", "guard_write_path", "RedlineViolation",
     "Dashboard",
 ]

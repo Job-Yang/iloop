@@ -25,6 +25,7 @@ class Flow:
     name: str
     autonomy: Autonomy
     when_keywords: List[str] = field(default_factory=list)
+    priority: int = 0
     guidance: str = ""
     required_docs: List[str] = field(default_factory=list)
     evidence_strategy: str = ""
@@ -65,8 +66,12 @@ class FlowRegistry:
         return list(self._flows.values())
 
     def plan(self, task: str) -> Optional[Flow]:
-        """按 when_keywords 命中数选最匹配的 flow；没命中返回 None。"""
-        ranked = sorted(self._flows.values(), key=lambda f: f.score(task), reverse=True)
+        """按关键词命中数优先、priority 次优先选择 flow；没命中返回 None。"""
+        ranked = sorted(
+            self._flows.values(),
+            key=lambda f: (f.score(task), f.priority),
+            reverse=True,
+        )
         if ranked and ranked[0].score(task) > 0:
             return ranked[0]
         return None

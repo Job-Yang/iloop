@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -33,6 +34,14 @@ FLOWS_JSON = ROOT / "workflow" / "flows.json"
 def _registry() -> FlowRegistry:
     reg = FlowRegistry()
     reg.load_json(FLOWS_JSON)
+    from kernel import load_installed_extensions
+    extensions_dir = os.environ.get(
+        "ILOOP_EXTENSIONS_DIR",
+        str(Path.home() / ".iloop" / "extensions"),
+    )
+    _, issues = load_installed_extensions(reg, extensions_dir)
+    for issue in issues:
+        print(f"  ⚠️ 扩展未加载: {issue.message}", file=sys.stderr)
     return reg
 
 

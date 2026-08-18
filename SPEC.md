@@ -64,6 +64,7 @@
   "name": "<中文名>",
   "autonomy": "L1 | L2 | L3",
   "when_keywords": ["<触发词>"],
+  "priority": 0,
   "guidance": "<方向参考，不是必跑清单>",
   "required_docs": ["<开工前必读文档路径>"],
   "evidence_strategy": "<这类任务优先取什么证据：日志/UI/截图/crash/静态>",
@@ -72,6 +73,7 @@
 ```
 
 - `autonomy`：L1 只看不改 / L2 动手改(最小改动+编译+验证+可回滚) / L3 放手干(需授权+清单+验收标准)。
+- `priority`：关键词命中数相同时的路由优先级。扩展可用更高值覆盖宽泛核心匹配，但不能覆盖核心 `flow_id`。
 - 内置 flow 与插件 flow 由加载器合并；插件 flow 只增不覆盖内核。
 
 ---

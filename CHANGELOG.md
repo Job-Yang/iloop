@@ -10,6 +10,7 @@
 - 证据协议 `EvidenceArtifact`（observed / inferred，推断不许当观测）
 - 能力契约 `Capability` + `Plugin` 协议（不支持能力返回 unsupported）
 - flow 路由 + L1/L2/L3 自治分级 + `next_suggest` 主动引导，插件 flow 不覆盖核心
+- 扩展 flow 自动扫描与加载；同等关键词命中时支持 `priority` 精确路由
 - 四道关卡 `FourGate`（时间 / 范围 / 机制 / 反证，只认 observed 证据）
 - 病例状态机 `Case`：建档 → 列原因 → 逐个证据排除 → `tick` 下一步检查 → `consult` 会诊 → `reroute` 重分诊 → 过四关收敛
 - 9 个诊断方法专家 `ExpertRegistry`（只描述"怎么想"，零平台绑定）
@@ -32,7 +33,8 @@
 ### 文档与工程
 - 入口提示词 `AGENT_PROMPT.md` + 分片提示词 `prompts/`
 - `SPEC.md`（四协议）/ `DESIGN.md`（设计）/ `EXTENDING.md`（二开）/ `docs/VDD.md`（方法论）
-- selftest 82 断言（内核 66 + iOS 插件 16），全绿才算完成
+- README 与 DESIGN 按“程序员反馈循环 → 长任务问题 → 架构设计”重写；二次开发改为 Agent 执行协议
+- selftest 83 断言（内核 67 + iOS 插件 16），全绿才算完成
 
 ### 已知缺口（诚实标注）
 - 真机 UI batch 目前只支持 tap 步骤

@@ -300,6 +300,34 @@ def test_extension_cannot_clobber_core() -> None:
         check("扩展: 越界劫持核心 flow 被拒（二开硬边界）", has_errors(issues))
 
 
+def test_extension_auto_loads_into_plan() -> None:
+    import json as _json
+    import os as _os
+    from kernel import scaffold_extension
+    from cli import _registry
+
+    with tempfile.TemporaryDirectory() as d:
+        ext = scaffold_extension("team.oncall", d)
+        flow_file = ext.root / "flows.json"
+        flows = _json.loads(flow_file.read_text(encoding="utf-8"))
+        flows[0]["when_keywords"] = ["专属告警词"]
+        flow_file.write_text(_json.dumps(flows, ensure_ascii=False), encoding="utf-8")
+
+        old = _os.environ.get("ILOOP_EXTENSIONS_DIR")
+        _os.environ["ILOOP_EXTENSIONS_DIR"] = d
+        try:
+            hit = _registry().plan("处理专属告警词")
+        finally:
+            if old is None:
+                _os.environ.pop("ILOOP_EXTENSIONS_DIR", None)
+            else:
+                _os.environ["ILOOP_EXTENSIONS_DIR"] = old
+        check(
+            "扩展: 安装目录被 plan 自动加载并命中",
+            hit is not None and hit.flow_id == "team.oncall.example",
+        )
+
+
 def test_redline_guards() -> None:
     from kernel import check_command, guard_write_path, RedlineViolation
     safe, _ = check_command(["xcrun", "simctl", "list"])
@@ -383,6 +411,7 @@ def run() -> int:
         test_channel_and_gate,
         test_extension_mechanism,
         test_extension_cannot_clobber_core,
+        test_extension_auto_loads_into_plan,
         test_redline_guards,
         test_runner_blocks_dangerous_by_default,
         test_dashboard_metrics_and_render,

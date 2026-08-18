@@ -57,6 +57,7 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
         "name": f"{name} 示例 flow",
         "autonomy": "L1",
         "when_keywords": ["示例"],
+        "priority": 10,
         "guidance": "在此实现你的业务 flow；flow_id 必须以扩展名为前缀。",
         "required_docs": [],
         "evidence_strategy": "按你的领域定",
@@ -102,6 +103,43 @@ def merge_into_registry(reg: FlowRegistry, ext: Extension) -> int:
     if not flows_file.exists():
         return 0
     return reg.load_json(flows_file)
+
+
+def load_installed_extensions(reg: FlowRegistry, base_dir: str | Path) -> tuple[int, List[ValidationIssue]]:
+    """扫描扩展目录，把校验通过的扩展 flow 合并进注册表。
+
+    plan/flows 调用它后，业务扩展无需修改核心注册表即可自动生效。
+    非法扩展不加载，并返回问题供 CLI 外显。
+    """
+    base = Path(base_dir).expanduser()
+    if not base.exists():
+        return 0, []
+
+    core_ids = {f.flow_id for f in reg.all()}
+    loaded = 0
+    issues: List[ValidationIssue] = []
+    for root in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest = root / MANIFEST_NAME
+        if not manifest.exists():
+            continue
+        try:
+            ext = load_extension(root)
+        except Exception as exc:
+            issues.append(ValidationIssue("error", f"{root.name}: manifest 加载失败: {exc}"))
+            continue
+
+        ext_issues = validate_extension(ext, core_flow_ids=core_ids)
+        if has_errors(ext_issues):
+            issues.extend(
+                ValidationIssue(i.level, f"{ext.name}: {i.message}") for i in ext_issues
+            )
+            continue
+        try:
+            loaded += merge_into_registry(reg, ext)
+            core_ids.update(f.flow_id for f in reg.all())
+        except Exception as exc:
+            issues.append(ValidationIssue("error", f"{ext.name}: flow 合并失败: {exc}"))
+    return loaded, issues
 
 
 def has_errors(issues: List[ValidationIssue]) -> bool:
