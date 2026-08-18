@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# iLoop 运行期产物（不入库）
+/tmp/iloop-*/
+*/evidence/
+*/runtime-evidence/
+extensions/
+data/
+profiles/
+config.yaml
+
+# 系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.swp

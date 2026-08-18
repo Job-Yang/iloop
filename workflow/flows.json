@@ -1,0 +1,112 @@
+[
+  {
+    "flow_id": "core.investigate",
+    "name": "取证调查",
+    "autonomy": "L1",
+    "when_keywords": ["排查", "调查", "为什么", "定位", "investigate", "why", "分析"],
+    "guidance": "只看不改：建档、列可能原因、逐个用证据排除。先诊断再取证。",
+    "required_docs": ["SPEC.md", "prompts/triage-impact.md"],
+    "evidence_strategy": "日志/源码/抓包优先，先分辨真假再动手",
+    "escalate_when": "命中环境/权限/缺输入卡口时停手升级",
+    "next_suggest": "要不要我把定位到的根因直接进入修复流程？"
+  },
+  {
+    "flow_id": "core.diagnose",
+    "name": "跨域诊断",
+    "autonomy": "L1",
+    "when_keywords": ["诊断", "根因", "疑难", "多个原因", "diagnose", "复杂问题"],
+    "guidance": "病例建档→列候选原因→逐个证据排除→过四道关卡收敛。用诊断方法专家路由。",
+    "required_docs": ["SPEC.md", "prompts/triage-impact.md"],
+    "evidence_strategy": "每步只推进一个最能分辨真假的检查，证据分级标来源",
+    "escalate_when": "存活候选不唯一或四关无法闭合时补证或升级",
+    "next_suggest": "根因已收敛，要不要我给出最小可逆修复方案？"
+  },
+  {
+    "flow_id": "core.bugfix",
+    "name": "缺陷修复",
+    "autonomy": "L2",
+    "when_keywords": ["修复", "bug", "崩溃", "crash", "fix", "报错", "闪退"],
+    "guidance": "复现→最小改动→编译→真跑验证，每步可回滚，范围限在已对齐任务内。",
+    "required_docs": ["SPEC.md", "prompts/build-and-run.md"],
+    "evidence_strategy": "复现→改→真跑验证，过四道关卡",
+    "escalate_when": "同根因失败超过 3 轮",
+    "next_suggest": "崩溃已修复验证；要不要跑一遍相关入口回归，确认没连带影响？"
+  },
+  {
+    "flow_id": "core.feature",
+    "name": "功能开发",
+    "autonomy": "L2",
+    "when_keywords": ["新增", "功能", "feature", "实现", "开发", "需求"],
+    "guidance": "先定验收标准（可验证硬指标），再动手；最小改动，跟随既有风格。",
+    "required_docs": ["SPEC.md", "prompts/feature-and-iterate.md"],
+    "evidence_strategy": "验收标准当假设，逐条验收当排除",
+    "escalate_when": "验收标准无法对齐时先澄清",
+    "next_suggest": "这是模拟器结果；要不要我装个真机包让你实际点一下看效果？"
+  },
+  {
+    "flow_id": "core.small_iter",
+    "name": "小迭代",
+    "autonomy": "L2",
+    "when_keywords": ["文案", "样式", "微调", "改个", "小改", "颜色"],
+    "guidance": "改动小别上重流程。最小改动+编译，有可见改动快速看一眼即可。",
+    "required_docs": ["prompts/feature-and-iterate.md"],
+    "evidence_strategy": "有可见改动截一张图对照，不牵连主链路不切真机",
+    "escalate_when": "改动牵连主链路或需要真机能力",
+    "next_suggest": "改好了；要不要顺手看下相邻页面有没有受影响？"
+  },
+  {
+    "flow_id": "core.refactor",
+    "name": "重构回归",
+    "autonomy": "L2",
+    "when_keywords": ["重构", "refactor", "回归", "regression", "影响面"],
+    "guidance": "先圈定受影响入口/路由/DI，行为基线优先，回归证明关键入口行为不变。",
+    "required_docs": ["prompts/feature-and-iterate.md", "prompts/triage-impact.md"],
+    "evidence_strategy": "先给影响面分析，再挑受影响主链路逐个运行态回归",
+    "escalate_when": "跨模块影响不确定或涉及不可控第三方组件",
+    "next_suggest": "重构验证通过；要不要我把受影响入口逐个回归一遍？"
+  },
+  {
+    "flow_id": "core.verify",
+    "name": "验证验收",
+    "autonomy": "L1",
+    "when_keywords": ["验证", "验收", "回归", "verify", "acceptance"],
+    "guidance": "按出错代价定强度：亏得起验得轻，亏不起验到底。高风险起独立验收。",
+    "required_docs": ["SPEC.md", "docs/VDD.md", "prompts/record-wrapup.md"],
+    "evidence_strategy": "验数据看日志、验控件看UI树、验最终表现看截图、验崩溃看crash",
+    "escalate_when": "代价极高的改动应起独立挑错角色复核",
+    "next_suggest": "验收通过；要不要我刷一下提效看板汇总本轮证据？"
+  },
+  {
+    "flow_id": "core.env_doctor",
+    "name": "环境体检",
+    "autonomy": "L1",
+    "when_keywords": ["环境", "跑不起来", "构建失败", "签名", "证书", "doctor", "依赖"],
+    "guidance": "先分类错误再检索 lessons，只修当前根因并重跑相同探针验证。",
+    "required_docs": ["prompts/build-and-run.md", "prompts/triage-impact.md"],
+    "evidence_strategy": "doctor 体检+错题本召回，修复后重跑同一探针",
+    "escalate_when": "真缺完整 Xcode/证书失效等真卡口（先确认不是可自愈假卡口）",
+    "next_suggest": "环境已就绪；要不要我直接开始你本来要做的任务？"
+  },
+  {
+    "flow_id": "core.oncall",
+    "name": "事件驱动诊断",
+    "autonomy": "L1",
+    "when_keywords": ["oncall", "告警", "值班", "工单", "线上问题", "alert"],
+    "guidance": "事件源→病例建档→证据驱动诊断→按代价处置→通知渠道。飞书/告警平台是插件实现。",
+    "required_docs": ["SPEC.md", "prompts/capability-gate.md", "prompts/triage-impact.md"],
+    "evidence_strategy": "拉事件→建档→证据排除→四关收敛→结论通知",
+    "escalate_when": "缺平台授权时走能力 Gate 升级，不用低可信数据伪装收口",
+    "next_suggest": "诊断结论已通知；要不要我把根因沉淀进错题本？"
+  },
+  {
+    "flow_id": "core.extend",
+    "name": "二次开发",
+    "autonomy": "L2",
+    "when_keywords": ["扩展", "二开", "插件", "自定义 flow", "extension", "定制"],
+    "guidance": "只走 extension-init→只改扩展目录→extension-validate。核心整体只读。",
+    "required_docs": ["EXTENDING.md"],
+    "evidence_strategy": "扩展校验通过 + 真实任务 plan 命中扩展 flow",
+    "escalate_when": "需要新增公共内核能力/平台 adapter 时走内核 MR，不在扩展里改核心",
+    "next_suggest": "扩展骨架就绪；要不要我帮你在扩展里实现第一个业务 flow？"
+  }
+]

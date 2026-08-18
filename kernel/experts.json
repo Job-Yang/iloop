@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "description": "iLoop 诊断方法专家注册表（开源内核）。专家只回答限定问题、只描述怎么想，不绑定任何具体平台。证据由实现 Capability 契约的插件提供。final conclusion 归 coordinator。",
+  "expert_protocol": {
+    "verdicts": ["supports", "contradicts", "inconclusive", "cross_domain"],
+    "required_output": ["verdict", "summary", "evidence_ids", "remaining_uncertainty", "suggested_experts", "next_test"]
+  },
+  "experts": [
+    {
+      "id": "initial_triage",
+      "name": "初诊与鉴别诊断",
+      "role": "coordinator",
+      "can_answer": ["症状是什么", "当前有哪些候选根因", "下一条最有区分度的检查是什么"],
+      "default_hypotheses": [
+        "现象来自真实业务或运行行为变化",
+        "现象来自数据采集、加工或展示口径变化",
+        "现象来自版本、配置或发布变化"
+      ],
+      "questions": ["异常最早从什么时间开始", "影响范围是单端、单版本、单入口还是跨范围", "当前能拿到哪一种最直接的运行或数据证据"],
+      "wants_capabilities": [],
+      "cost": "low"
+    },
+    {
+      "id": "metric_anomaly",
+      "name": "指标异常分析",
+      "role": "method_expert",
+      "triggers": ["指标", "上涨", "下降", "突增", "突降", "占比", "转化率", "漏斗", "pv", "uv"],
+      "can_answer": ["拐点在何时", "哪个维度产生超额贡献", "变化来自分子、分母还是流量结构"],
+      "default_hypotheses": ["异常由特定时间窗和流量维度的超额贡献造成", "异常只是总流量或样本结构同比例变化", "指标异常来自源字段失效而非真实业务变化"],
+      "questions": ["按时间、平台、版本、渠道和入口逐层比较分子、分母与比例", "找出相对基线增长最异常而非绝对量最大的维度"],
+      "wants_capabilities": ["metrics"],
+      "cost": "medium"
+    },
+    {
+      "id": "data_validity",
+      "name": "数据有效性与采集链路",
+      "role": "method_expert",
+      "triggers": ["无效", "缺失", "空值", "漏数", "没上报", "不上报", "字段", "采集", "兜底", "口径"],
+      "can_answer": ["派生指标对应哪些源字段", "缺失发生在成功样本还是失败样本", "问题位于采集、加工还是展示层"],
+      "default_hypotheses": ["源字段没有生成或没有上报", "数据加工或派生口径把有效样本转成异常值", "业务执行失败导致字段合理缺失"],
+      "questions": ["拆开派生指标与源字段并比较缺失关系", "按成功失败状态验证缺失是否符合业务语义"],
+      "wants_capabilities": ["metrics", "logs"],
+      "cost": "medium"
+    },
+    {
+      "id": "ui_behavior",
+      "name": "UI 状态与交互诊断",
+      "role": "method_expert",
+      "triggers": ["按钮", "页面", "不显示", "不见", "消失", "点不了", "样式", "布局", "白屏", "交互", "ui"],
+      "can_answer": ["问题是数据未到、状态判断错误还是渲染异常", "控件是否存在、隐藏或不可交互", "最终用户画面和预期差异是什么"],
+      "default_hypotheses": ["服务端或配置没有下发 UI 所需数据", "客户端状态或策略隐藏了控件", "控件存在但布局、层级或交互状态异常"],
+      "questions": ["先判断数据、状态和渲染三层中的哪一层异常", "用 UI 树验证存在性，用截图验证最终表现"],
+      "wants_capabilities": ["view_tree", "screenshot", "logs"],
+      "cost": "medium"
+    },
+    {
+      "id": "runtime_stability",
+      "name": "运行稳定性诊断",
+      "role": "method_expert",
+      "triggers": ["崩溃", "闪退", "crash", "卡死", "无响应", "异常退出", "oom", "watchdog"],
+      "can_answer": ["是否发生真实进程退出", "堆栈和运行日志指向哪条链路", "线上聚类是否与版本或变更相关"],
+      "default_hypotheses": ["客户端代码路径触发崩溃或资源问题", "运行环境或系统条件触发异常", "线上聚类与当前改动没有直接关系"],
+      "questions": ["先确认 crash report、进程状态和复现条件", "按版本、堆栈和变更范围做相关性验证"],
+      "wants_capabilities": ["crash", "logs"],
+      "cost": "medium"
+    },
+    {
+      "id": "api_data_contract",
+      "name": "接口与数据契约诊断",
+      "role": "method_expert",
+      "triggers": ["接口", "请求", "返回", "下发", "服务端", "数据不一致", "抓包", "logid"],
+      "can_answer": ["服务端是否正确下发", "客户端是否过滤或误解字段", "接口、模型和 UI 之间的数据契约在哪里断裂"],
+      "default_hypotheses": ["服务端没有下发或策略屏蔽了目标数据", "客户端模型解析或过滤导致数据丢失", "接口数据正常，问题在后续状态或渲染"],
+      "questions": ["拿到真实请求响应并对照客户端解析和消费代码", "把结论落到具体字段、策略和代码位置"],
+      "wants_capabilities": ["network_capture", "logs"],
+      "cost": "medium"
+    },
+    {
+      "id": "release_change",
+      "name": "发布与变更关联",
+      "role": "method_expert",
+      "triggers": ["版本", "发布", "上线", "全量", "灰度", "变更", "mr", "commit"],
+      "can_answer": ["异常拐点附近有哪些变更", "候选变更的命中范围是否覆盖异常范围", "版本聚类是否足以支持客户端归因"],
+      "default_hypotheses": ["客户端版本或代码变更导致异常", "动态配置或资源发布导致跨版本异常", "发布时间相关但影响范围不匹配，只是巧合"],
+      "questions": ["比较异常拐点和发布时间", "验证候选变更是否覆盖异常端、版本、入口和页面"],
+      "wants_capabilities": ["vcs", "release_registry"],
+      "cost": "medium"
+    },
+    {
+      "id": "experiment_causality",
+      "name": "实验因果验证",
+      "role": "method_expert",
+      "triggers": ["实验", "ab", "实验组", "对照组"],
+      "can_answer": ["实验组和对照组是否存在决定性差异", "哪个分组贡献异常", "实验配置是否能解释数据机制"],
+      "default_hypotheses": ["某个实验组配置直接导致异常", "所有组同比例变化，实验不是根因", "实验命中与异常相关但还缺机制证据"],
+      "questions": ["获取对照组和实验组后按同一基础条件比较", "对照配置 key 和代码路径解释因果机制"],
+      "wants_capabilities": ["experiment_registry", "metrics", "vcs"],
+      "cost": "medium"
+    },
+    {
+      "id": "code_impact",
+      "name": "代码机制与影响面",
+      "role": "method_expert",
+      "triggers": ["代码", "源码", "sdk", "模块", "逻辑", "改动", "影响面"],
+      "can_answer": ["代码机制能否解释数据或运行现象", "候选代码是否覆盖所有异常入口", "变更是否具有版本或平台边界"],
+      "default_hypotheses": ["共享代码路径能够解释全部异常范围", "候选代码只影响局部入口，不能作为主因", "代码没有变化，但远程配置改变了现有路径行为"],
+      "questions": ["从异常入口反向确认是否都经过候选代码", "用源码条件和运行证据解释机制，而不是只看提交时间"],
+      "wants_capabilities": ["vcs", "logs"],
+      "cost": "medium"
+    },
+    {
+      "id": "environment_build",
+      "name": "环境与构建诊断",
+      "role": "method_expert",
+      "triggers": ["编译失败", "构建失败", "签名", "证书", "环境", "跑不起来", "build failed", "链接失败"],
+      "can_answer": ["问题来自代码、依赖、签名还是本机环境", "已有错题本是否有可复用解法", "最小可逆修复是什么"],
+      "default_hypotheses": ["代码或依赖导致编译链接失败", "签名、账号或证书导致构建安装失败", "本机工具链或配置选择错误"],
+      "questions": ["先分类错误并检索 lessons", "只修当前根因并重新运行相同探针验证"],
+      "wants_capabilities": ["build", "doctor", "vcs"],
+      "cost": "medium"
+    }
+  ]
+}
