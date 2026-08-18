@@ -31,7 +31,7 @@ iLoop 是一个**验证驱动（VDD）的研发 Agent 闭环内核**。它不替
 
 ```bash
 # 1. 拉仓（提示词 + 内核 + 插件都在这一个仓里，不用再拉别的）
-git clone https://github.com/<your-org>/iloop.git
+git clone https://github.com/Job-Yang/iloop.git
 cd iloop
 
 # 2. 自测，全绿说明环境就绪
