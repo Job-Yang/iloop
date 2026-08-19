@@ -10,7 +10,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class TaskStatus(str, Enum):
@@ -33,6 +33,8 @@ class TaskStep:
     capability: str = ""
     status: StepStatus = StepStatus.PENDING
     summary: str = ""
+    evidence_ids: List[str] = field(default_factory=list)
+    completion_source: str = ""  # machine | human_confirmed
 
     def __post_init__(self) -> None:
         if isinstance(self.status, str):
@@ -52,7 +54,17 @@ class TaskRecord:
     acceptance: List[str] = field(default_factory=list)
     steps: List[TaskStep] = field(default_factory=list)
     evidence_ids: List[str] = field(default_factory=list)
+    required_operation_ids: List[str] = field(default_factory=list)
+    capability_runs: Dict[str, str] = field(default_factory=dict)
     case_path: str = ""
+    capability_gate_path: str = ""
+    global_review_path: str = ""
+    acceptance_path: str = ""
+    project_root: str = ""
+    global_review_required: bool = False
+    independent_acceptance_required: bool = False
+    global_review_status: str = "not_required"
+    acceptance_status: str = "not_required"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 

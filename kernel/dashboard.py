@@ -18,9 +18,14 @@ from .evidence import EvidenceArtifact
 
 
 class Dashboard:
-    def __init__(self, ledger: Ledger, *, evidence: Optional[List[EvidenceArtifact]] = None) -> None:
+    def __init__(self, ledger: Ledger, *, evidence: Optional[List[EvidenceArtifact]] = None,
+                 task: Optional[dict] = None, global_review: Optional[dict] = None,
+                 acceptance: Optional[dict] = None) -> None:
         self.ledger = ledger
         self.evidence = evidence or []
+        self.task = task or {}
+        self.global_review = global_review or {}
+        self.acceptance = acceptance or {}
 
     def metrics(self) -> dict:
         rounds = self.ledger.rounds
@@ -35,6 +40,11 @@ class Dashboard:
             "evidence_inferred": len(self.evidence) - observed,
             "evidence_by_capability": dict(ev_by_cap),
             "traces": len(self.ledger.traces),
+            "global_review_status": self.global_review.get("status", "not_required"),
+            "global_impacts": len(self.global_review.get("impacts", [])),
+            "acceptance_status": (self.acceptance.get("result") or {}).get(
+                "verdict", "not_required"
+            ),
         }
 
     def render_html(self) -> str:
@@ -63,6 +73,8 @@ ul{{background:#fff;border-radius:8px;padding:12px 28px;line-height:1.9}}
   <div class="card"><div class="n">{m['evidence_total']}</div><div class="l">证据总数</div></div>
   <div class="card"><div class="n">{m['evidence_observed']}</div><div class="l">观测证据</div></div>
   <div class="card"><div class="n">{m['evidence_inferred']}</div><div class="l">推断证据</div></div>
+  <div class="card"><div class="n">{html.escape(m['global_review_status'])}</div><div class="l">全局复核 · {m['global_impacts']} 项</div></div>
+  <div class="card"><div class="n">{html.escape(m['acceptance_status'])}</div><div class="l">独立验收</div></div>
 </div>
 <h2>证据类型分布</h2>
 <table><tr><th>能力</th><th>证据数</th></tr>{cap_rows}</table>

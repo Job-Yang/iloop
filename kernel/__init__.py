@@ -27,7 +27,7 @@ from .ledger import Ledger, Round, RoundStatus, render, BRAND, PHASES
 from .acceptance import (
     RiskLevel, assess_risk, needs_independent_review,
     AcceptancePackage, AcceptanceResult, Verdict, IndependentReviewer,
-    ChangeScore, score_change,
+    ChangeScore, score_change, AcceptanceStore,
 )
 from .channel import (
     Event, EventSource, Notifier, StdoutNotifier, WebhookNotifier, StaticEventSource,
@@ -36,7 +36,8 @@ from .gate_capability import CapabilityGate, RequiredOperation, OpStatus
 from .runner import CommandRunner, CommandOutput, discover_developer_dir
 from .extension import (
     Extension, scaffold_extension, load_extension, validate_extension,
-    merge_into_registry, load_installed_extensions, has_errors, ValidationIssue,
+    merge_into_registry, load_installed_extensions, load_extension_plugin,
+    load_installed_plugins, has_errors, ValidationIssue,
 )
 from .redline import (
     check_command, guard_command, guard_write_path, RedlineViolation,
@@ -44,6 +45,9 @@ from .redline import (
 from .dashboard import Dashboard
 from .task import TaskRecord, TaskStatus, TaskStep, StepStatus, TaskStore
 from .runtime import Runtime
+from .global_review import GlobalReview, ImpactItem, analyze_global_impact
+from .project import ProjectMemory
+from .ui_flow import UIFlow, UINode, UIFlowStore, ACTION_CAPABILITY
 
 __all__ = [
     "EvidenceArtifact", "EvidenceKind",
@@ -56,15 +60,19 @@ __all__ = [
     "Ledger", "Round", "RoundStatus", "render", "BRAND", "PHASES",
     "RiskLevel", "assess_risk", "needs_independent_review",
     "AcceptancePackage", "AcceptanceResult", "Verdict", "IndependentReviewer",
-    "ChangeScore", "score_change",
+    "ChangeScore", "score_change", "AcceptanceStore",
     "Event", "EventSource", "Notifier", "StdoutNotifier", "WebhookNotifier", "StaticEventSource",
     "CapabilityGate", "RequiredOperation", "OpStatus",
     "CommandRunner", "CommandOutput", "discover_developer_dir",
     "Extension", "scaffold_extension", "load_extension", "validate_extension",
-    "merge_into_registry", "load_installed_extensions", "has_errors", "ValidationIssue",
+    "merge_into_registry", "load_installed_extensions", "load_extension_plugin",
+    "load_installed_plugins", "has_errors", "ValidationIssue",
     "check_command", "guard_command", "guard_write_path", "RedlineViolation",
     "Dashboard",
     "TaskRecord", "TaskStatus", "TaskStep", "StepStatus", "TaskStore", "Runtime",
+    "GlobalReview", "ImpactItem", "analyze_global_impact",
+    "ProjectMemory",
+    "UIFlow", "UINode", "UIFlowStore", "ACTION_CAPABILITY",
 ]
 
 __version__ = "0.0.1"

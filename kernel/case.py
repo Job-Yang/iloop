@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from .evidence import EvidenceArtifact
 from .gate import FourGate, GateResult
@@ -144,12 +144,23 @@ class Case:
         self.timeline.append(f"↻ 重分诊：{reason}")
         return self.surviving()
 
-    def evaluate_gate(self) -> GateResult:
-        return self._gate.evaluate()
+    def evaluate_gate(
+        self,
+        verify_attestation: Optional[Callable] = None,
+        expected_bindings: Optional[dict] = None,
+    ) -> GateResult:
+        return self._gate.evaluate(verify_attestation, expected_bindings)
 
-    def try_resolve(self) -> tuple[bool, str]:
+    def gate_bindings(self) -> Dict[str, List[str]]:
+        return self._gate.bindings()
+
+    def try_resolve(
+        self,
+        verify_attestation: Optional[Callable] = None,
+        expected_bindings: Optional[dict] = None,
+    ) -> tuple[bool, str]:
         """能否收敛：必须过四关 且 只剩一个存活候选。"""
-        gate = self.evaluate_gate()
+        gate = self.evaluate_gate(verify_attestation, expected_bindings)
         surviving = self.surviving()
         if not gate.passed:
             return False, f"四关未过：缺 {gate.missing}"

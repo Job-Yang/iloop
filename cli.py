@@ -7,11 +7,18 @@
   python3 -m cli resume <task_id> [caps=...] [k=v ...]
   python3 -m cli tasks [--all]              # 可恢复任务与下一步
   python3 -m cli task show|step|complete ...
-  python3 -m cli case show|tick|resolve <task_id>
-  python3 -m cli accept <task_id>
+  python3 -m cli case show|tick|evidence|gate|resolve <task_id>
+  python3 -m cli next <task_id>
+  python3 -m cli capability require|complete|cancel|status <task_id>
+  python3 -m cli global-review prepare|show|record <task_id>
+  python3 -m cli accept prepare|record|status <task_id>
   python3 -m cli wrapup <task_id>
   python3 -m cli round start|end <task_id> [...]
   python3 -m cli lessons search|add ...
+  python3 -m cli context manifest
+  python3 -m cli constitution list|add ...
+  python3 -m cli blocker <task_id> reason=... evidence=... options=... recommendation=...
+  python3 -m cli ui-flow new|list|show|verify|to-task ...
   python3 -m cli dashboard <task_id>
   python3 -m cli flows                      # 列出已加载 flow
   python3 -m cli experts "<任务>"           # 诊断方法专家路由
@@ -37,8 +44,10 @@ sys.path.insert(0, str(ROOT))
 from kernel import (  # noqa: E402
     FlowRegistry, Capability, ExpertRegistry, render,
     Case, EvidenceArtifact, StaticEventSource, Event, StdoutNotifier,
-    Runtime, TaskStore, TaskStatus, StepStatus, Lesson, LessonBook, Ledger, RoundStatus,
-    AcceptancePackage, IndependentReviewer, Verdict,
+    Runtime, TaskStore, TaskStatus, TaskStep, StepStatus, Lesson, LessonBook, Ledger, RoundStatus,
+    AcceptancePackage, AcceptanceStore, Verdict, EvidenceKind, CapabilityGate,
+    GlobalReview, ProjectMemory, UIFlowStore, ACTION_CAPABILITY,
+    load_installed_plugins,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
 
@@ -67,7 +76,17 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
         data_dir=str(data_dir / "platform"),
         config=kwargs,
     )
-    return Runtime(data_dir, _registry(), plugin)
+    platform = kwargs.get("platform", "ios_native")
+    if platform != "ios_native":
+        extensions_dir = os.environ.get(
+            "ILOOP_EXTENSIONS_DIR", str(Path.home() / ".iloop" / "extensions")
+        )
+        candidates = load_installed_plugins(extensions_dir, kwargs)
+        plugin = next((candidate for candidate in candidates
+                       if candidate.platform_id == platform), None)
+        if plugin is None:
+            raise ValueError(f"extension platform plugin not found: {platform}")
+    return Runtime(data_dir, _registry(), plugin, project_root=project_root)
 
 
 def _split(value: str) -> list[str]:
@@ -176,13 +195,14 @@ def cmd_dashboard(task_id: str) -> int:
 
 
 def cmd_task(action: str, rest: list[str]) -> int:
-    store = TaskStore(_data_dir())
+    runtime = _runtime(False, {})
+    store = runtime.tasks
     if action == "list":
         return cmd_tasks("--all" in rest)
     if not rest:
         print("usage: task show|step|complete <task_id> [...]")
         return 2
-    task = store.load(rest[0])
+    task = runtime.load(rest[0])
     if action == "show":
         print(json.dumps(store.resume_card(task), ensure_ascii=False, indent=2))
         return 0
@@ -193,8 +213,29 @@ def cmd_task(action: str, rest: list[str]) -> int:
             print(f"step index out of range: 1..{len(task.steps)}")
             return 2
         step = task.steps[index - 1]
-        step.status = StepStatus(values.get("status", "done"))
+        requested = StepStatus(values.get("status", "done"))
+        evidence_ids = _split(values.get("evidence", ""))
+        human_confirmed = values.get("human_confirmed", "").lower() in ("1", "true", "yes")
+        known_evidence = {item.id for item in runtime.evidence(task.id)}
+        unknown = [item for item in evidence_ids if item not in known_evidence]
+        if unknown:
+            print(render("blocked", f"步骤引用未知 evidence ids: {unknown}"))
+            return 1
+        if requested == StepStatus.DONE and not evidence_ids and not human_confirmed:
+            print(render("blocked", "步骤完成需要 evidence=<id> 或 human_confirmed=true"))
+            return 1
+        if human_confirmed:
+            print(render(
+                "blocked",
+                "CLI 不可信，不能写入用户确认；由宿主通过 Runtime attestation_verifier API 注入",
+            ))
+            return 1
+        step.status = requested
         step.summary = values.get("summary", step.summary)
+        step.evidence_ids = evidence_ids or step.evidence_ids
+        step.completion_source = "human_confirmed" if human_confirmed else (
+            "machine" if step.evidence_ids else step.completion_source
+        )
         task.current_stage = values.get("stage", task.current_stage)
         store.save(task)
         print(render("plan", f"task={task.id} · step={index} -> {step.status.value}",
@@ -233,35 +274,375 @@ def cmd_case(action: str, task_id: str) -> int:
     return 2
 
 
-def cmd_accept(task_id: str) -> int:
+def cmd_case_write(action: str, task_id: str, rest: list[str]) -> int:
     runtime = _runtime(False, {})
     task = runtime.load(task_id)
-    criteria = task.acceptance or ["任务目标有 observed 证据"]
-    result = IndependentReviewer().review(AcceptancePackage(
-        case_id=task.id,
-        goal=task.goal,
-        criteria=criteria,
-        evidence=runtime.evidence(task.id),
-    ))
-    path = runtime._task_dir(task.id) / "acceptance.json"
-    path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-    print(render("verify" if result.verdict == Verdict.PASS else "blocked",
-                 f"独立验收={result.verdict.value}", result="；".join(result.reasons)))
-    return 0 if result.verdict == Verdict.PASS else 1
+    path = Path(task.case_path)
+    case = Case.load(path)
+    values = _parse_kv(rest)
+    if action == "evidence":
+        requested_kind = EvidenceKind(values.get("kind", "inferred"))
+        required = () if requested_kind == EvidenceKind.OBSERVED else (
+            "capability", "source", "summary"
+        )
+        missing = [key for key in required if not values.get(key)]
+        if missing:
+            print("usage: case evidence <task_id> capability=... source=... summary=... "
+                  "[kind=observed|inferred] [outcome=success|failure|neutral] "
+                  "[path=...] [hypothesis=h1] [gate=time|scope|mechanism|counter_evidence]")
+            return 2
+        kind = requested_kind
+        evidence_path = values.get("path") or None
+        attestation_metadata = {}
+        if kind == EvidenceKind.OBSERVED:
+            print(render(
+                "blocked",
+                "CLI 不可信，不能手工写 observed evidence；请执行受信 Capability",
+            ))
+            return 1
+        else:
+            capability = values["capability"]
+            source = values["source"]
+            summary = values["summary"]
+            outcome = values.get("outcome", "neutral")
+        evidence = EvidenceArtifact(
+            capability=capability,
+            source=source,
+            kind=kind,
+            summary=summary,
+            path=evidence_path,
+            outcome=outcome,
+            metadata=attestation_metadata,
+        )
+        hypothesis = values.get("hypothesis", "h1")
+        case.attach(
+            hypothesis,
+            evidence,
+            refutes=values.get("refutes", "").lower() in ("1", "true", "yes"),
+        )
+        gate = values.get("gate", "")
+        if gate:
+            if kind != EvidenceKind.OBSERVED or gate not in evidence.metadata.get("gates", []):
+                print(render("blocked", f"evidence attestation does not claim gate={gate}"))
+                return 1
+            case.bind_gate(gate, evidence)
+        case.save(path)
+        runtime._append_evidence(task.id, evidence)
+        task.evidence_ids.append(evidence.id)
+        runtime.tasks.save(task)
+        print(json.dumps(evidence.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if action == "gate":
+        gate = values.get("gate", "")
+        evidence_id = values.get("evidence", "")
+        evidence = case.evidence.get(evidence_id)
+        if not gate or evidence is None:
+            print("usage: case gate <task_id> gate=<name> evidence=<evidence-id>")
+            return 2
+        if gate not in evidence.metadata.get("gates", []):
+            print(render("blocked", f"evidence does not attest gate={gate}"))
+            return 1
+        already_bound = {
+            bound_id
+            for bound_gate, ids in case.gate_bindings().items()
+            if bound_gate != gate
+            for bound_id in ids
+        }
+        if evidence_id in already_bound and len(evidence.metadata.get("gates", [])) < 2:
+            print(render("blocked", "single-gate evidence cannot be reused for another gate"))
+            return 1
+        case.bind_gate(gate, evidence)
+        case.save(path)
+        print(render("verify", f"{gate} 已绑定证据 {evidence_id}"))
+        return 0
+    return 2
+
+
+def cmd_next(task_id: str) -> int:
+    runtime = _runtime(False, {})
+    task = runtime.load(task_id)
+    print(json.dumps(runtime.next_action(task), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_capability_gate(action: str, task_id: str, rest: list[str]) -> int:
+    runtime = _runtime(False, {})
+    task = runtime.load(task_id)
+    gate = CapabilityGate.load(task.capability_gate_path)
+    values = _parse_kv(rest)
+    if action == "require":
+        op_id = values.get("id", "")
+        reason = values.get("reason", "")
+        if not op_id or not reason:
+            print("usage: capability require <task_id> id=<operation-id> reason=<why>")
+            return 2
+        runtime.require_operation(task, op_id, reason)
+        gate = CapabilityGate.load(task.capability_gate_path)
+    elif action == "complete":
+        print(render(
+            "blocked",
+            "CLI 不可信，不能完成平台 Gate；由受信宿主 Adapter 通过 API 回写",
+        ))
+        return 1
+    elif action == "cancel":
+        print(render(
+            "blocked",
+            "CLI 不可信，不能取消平台 Gate；由受信宿主根据用户确认通过 API 回写",
+        ))
+        return 1
+    elif action != "status":
+        print("usage: capability require|complete|cancel|status <task_id> ...")
+        return 2
+    gate.save(task.capability_gate_path)
+    print(json.dumps(gate.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_global_review(action: str, task_id: str, rest: list[str]) -> int:
+    runtime = _runtime(False, {})
+    task = runtime.load(task_id)
+    values = _parse_kv(rest)
+    if action == "prepare":
+        project_root = values.get("project_root") or os.environ.get("ILOOP_PROJECT_ROOT")
+        if not project_root:
+            print("global-review prepare requires project_root=... or ILOOP_PROJECT_ROOT")
+            return 2
+        review = runtime.prepare_global_review(task, project_root, base=values.get("base", "HEAD"))
+    else:
+        if not Path(task.global_review_path).exists():
+            print(render("blocked", "global review has not been prepared"))
+            return 1
+        review = GlobalReview.load(task.global_review_path)
+        if action == "record":
+            evidence_ids = _split(values.get("evidence", ""))
+            evidence_by_id = {item.id: item for item in runtime.evidence(task.id)}
+            unknown = [item for item in evidence_ids if item not in evidence_by_id]
+            if unknown:
+                print(render("blocked", f"全局复核引用未知 evidence ids: {unknown}"))
+                return 1
+            invalid = [
+                item for item in evidence_ids
+                if not runtime._supports_success(evidence_by_id[item], task)
+            ]
+            if invalid:
+                print(render("blocked", f"全局复核只接受成功 observed evidence: {invalid}"))
+                return 1
+            unrelated = [
+                item for item in evidence_ids
+                if values.get("target", "")
+                not in evidence_by_id[item].metadata.get("subjects", [])
+            ]
+            if unrelated and values.get("accepted", "").lower() not in ("1", "true", "yes"):
+                print(render(
+                    "blocked",
+                    f"全局复核证据未声明覆盖 target={values.get('target', '')}: {unrelated}",
+                ))
+                return 1
+            user_confirmation = values.get("user_confirmation", "")
+            if user_confirmation:
+                confirmation = evidence_by_id.get(user_confirmation)
+                if (
+                    confirmation is None
+                    or confirmation.metadata.get("human_confirmed") is not True
+                    or not runtime._supports_success(confirmation, task)
+                    or values.get("target", "")
+                    not in confirmation.metadata.get("subjects", [])
+                ):
+                    print(render("blocked", "风险接受需要真实 human confirmation evidence"))
+                    return 1
+            try:
+                review.verify(
+                    values.get("target", ""),
+                    evidence_ids,
+                    accepted=values.get("accepted", "").lower() in ("1", "true", "yes"),
+                    resolution=values.get("reason", ""),
+                    user_confirmation_id=user_confirmation,
+                )
+            except (KeyError, ValueError) as error:
+                print(render("blocked", str(error)))
+                return 1
+            review.save(task.global_review_path)
+            task.global_review_status = review.status
+            runtime.tasks.save(task)
+        elif action != "show":
+            print("usage: global-review prepare|show|record <task_id> ...")
+            return 2
+    print(json.dumps(review.to_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_accept(action: str, task_id: str, rest: list[str]) -> int:
+    runtime = _runtime(False, {})
+    task = runtime.load(task_id)
+    store = AcceptanceStore(task.acceptance_path)
+    values = _parse_kv(rest)
+    if action == "prepare":
+        fingerprint = ""
+        if task.global_review_path and Path(task.global_review_path).exists():
+            fingerprint = GlobalReview.load(task.global_review_path).fingerprint
+        package = AcceptancePackage(
+            case_id=task.id,
+            goal=task.goal,
+            criteria=task.acceptance or ["目标与完整 diff 一致", "关键路径有成功 observed 证据"],
+            evidence=runtime.evidence(task.id),
+            subject_fingerprint=fingerprint,
+        )
+        store.prepare(package)
+        task.independent_acceptance_required = True
+        task.acceptance_status = "prepared"
+        runtime.tasks.save(task)
+        print(json.dumps(package.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if action == "record":
+        print(render(
+            "blocked",
+            "CLI 不可信，不能回写独立验收；由宿主通过 AcceptanceStore.record_file(verifier) API 写入",
+        ))
+        return 1
+    if action == "status":
+        print(json.dumps(store.load_raw(), ensure_ascii=False, indent=2))
+        # CLI has no trusted host attestation verifier, so status is informational.
+        return 1
+    print("usage: accept prepare|record|status <task_id> [result=/path/to/reviewer-result.json]")
+    return 2
 
 
 def cmd_wrapup(task_id: str) -> int:
     runtime = _runtime(False, {})
     task = runtime.load(task_id)
-    if any(step.status != StepStatus.DONE for step in task.steps):
-        print(render("blocked", "仍有未完成步骤，禁止收口"))
+    try:
+        runtime.complete(task)
+    except ValueError as error:
+        print(render("blocked", str(error)))
         return 1
-    if task.acceptance and cmd_accept(task_id) != 0:
-        return 1
-    runtime.complete(task)
     dashboard = runtime.write_dashboard(task_id)
+    record_dir = runtime.data_dir / "records"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    record = record_dir / f"{task.id}.json"
+    record.write_text(json.dumps({
+        "task": runtime.load(task.id).to_dict(),
+        "case": Case.load(task.case_path).to_dict(),
+        "evidence": [item.to_dict() for item in runtime.evidence(task.id)],
+        "dashboard": dashboard,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(render("wrapup", f"task={task.id} 已收口", result=f"看板={dashboard}"))
     return 0
+
+
+def cmd_context(action: str) -> int:
+    memory = ProjectMemory(_data_dir())
+    if action != "manifest":
+        print("usage: context manifest")
+        return 2
+    print(json.dumps(memory.context_manifest(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_constitution(action: str, rest: list[str]) -> int:
+    project_root = os.environ.get("ILOOP_PROJECT_ROOT") or str(Path.cwd())
+    memory = ProjectMemory(_data_dir(project_root), project_root=project_root)
+    if action == "list":
+        print(json.dumps(memory.constitution(), ensure_ascii=False, indent=2))
+        return 0
+    if action == "add":
+        values = _parse_kv(rest)
+        try:
+            row = memory.add_constitution(
+                values.get("rule", ""),
+                source=values.get("source", ""),
+                evidence_path=values.get("evidence_path", ""),
+            )
+        except ValueError as error:
+            print(render("blocked", str(error)))
+            return 1
+        print(json.dumps(row, ensure_ascii=False, indent=2))
+        return 0
+    print(
+        "usage: constitution list | constitution add rule=... "
+        "source=project-file evidence_path=..."
+    )
+    return 2
+
+
+def cmd_blocker(task_id: str, rest: list[str]) -> int:
+    values = _parse_kv(rest)
+    try:
+        path = ProjectMemory(_data_dir()).emit_blocker(
+            task_id,
+            reason=values.get("reason", ""),
+            evidence=_split(values.get("evidence", "")),
+            options=_split(values.get("options", "")),
+            recommendation=values.get("recommendation", ""),
+        )
+    except ValueError as error:
+        print(render("blocked", str(error)))
+        return 1
+    print(render("blocked", f"结构化 blocker 已落盘: {path}"))
+    return 0
+
+
+def cmd_ui_flow(action: str, rest: list[str]) -> int:
+    store = UIFlowStore(_data_dir())
+    if action == "new":
+        values = _parse_kv(rest)
+        name = values.get("name", "")
+        goal = values.get("goal", "")
+        if not name or not goal:
+            print("usage: ui-flow new name=... goal=... [device=auto]")
+            return 2
+        flow = store.create(name, goal, values.get("device", "auto"))
+        print(json.dumps(flow.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if action == "list":
+        print(json.dumps([flow.to_dict() for flow in store.list()], ensure_ascii=False, indent=2))
+        return 0
+    if not rest:
+        print("usage: ui-flow show|verify|to-task <flow-id>")
+        return 2
+    flow_id = rest[0]
+    if action == "show":
+        print(json.dumps(store.load(flow_id).to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if action == "verify":
+        values = _parse_kv(rest[1:])
+        flow = store.load(flow_id)
+        flow.task_id = values.get("task_id", flow.task_id)
+        flow.verification_run_id = values.get("flow_run_id", flow.verification_run_id)
+        flow.device_id = values.get("device_id", flow.device_id)
+        store.save(flow)
+        evidence_by_id = {}
+        for path in _data_dir().glob("runtime/*/evidence.jsonl"):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    row = json.loads(line)
+                    evidence_by_id[row["id"]] = EvidenceArtifact(**row)
+        try:
+            flow = store.verify(flow_id, evidence_by_id)
+        except ValueError as error:
+            print(render("blocked", str(error)))
+            return 1
+        print(render("verify", f"UI Flow {flow.id} 已由节点证据验证"))
+        return 0
+    if action == "to-task":
+        flow = store.load(flow_id)
+        runtime = _runtime(False, {})
+        task = runtime.start(
+            f"验证 UI 路径 {flow.name}",
+            acceptance=[flow.goal],
+        )
+        task.steps = [
+            TaskStep(
+                title=f"{node.action}: {node.target}",
+                capability=ACTION_CAPABILITY[node.action],
+                summary=f"ui-flow={flow.id} node={node.id}",
+            )
+            for node in flow.nodes
+        ]
+        runtime.tasks.save(task)
+        _print_resume_card(runtime, task)
+        return 0
+    print("usage: ui-flow new|list|show|verify|to-task ...")
+    return 2
 
 
 def _registry() -> FlowRegistry:
@@ -279,13 +660,20 @@ def _registry() -> FlowRegistry:
 
 
 def cmd_plan(task: str) -> int:
-    flow = _registry().plan(task)
+    decision = _registry().plan_details(task)
+    flow = decision["flow"]
     if not flow:
         print(render("plan", f"命中flow=none · 任务=<{task}> · 请澄清方向"))
         return 0
     print(render("plan", f"命中flow={flow.flow_id}（{flow.name}）· 自治档={flow.autonomy.value}",
                  basis=", ".join(flow.when_keywords), result=flow.evidence_strategy))
     print(f"  required_docs={flow.required_docs} · 升级条件={flow.escalate_when}")
+    active_gates = [
+        name for name in ("complexity_gate", "lessons_gate",
+                          "global_review_gate", "acceptance_gate")
+        if decision[name]
+    ]
+    print(f"  active_gates={active_gates}")
     if flow.next_suggest:
         print(render("wrapup", f"🧭 下一步预备：{flow.next_suggest}"))
     return 0
@@ -337,18 +725,71 @@ def cmd_oncall_demo() -> int:
     notifier = StdoutNotifier()
     for ev in src.poll():
         print(render("connect", f"收到事件 {ev.id}: {ev.title}"))
-        case = Case(ev.id, ev.title)
-        h = case.add_hypothesis("客户端代码路径触发崩溃")
-        obs = EvidenceArtifact(capability="crash", source="oncall.demo",
-                               kind="observed", summary="堆栈指向订单详情控制器")
-        case.attach(h.id, obs, gate="mechanism")
-        for g in ("time", "scope", "counter_evidence"):
-            case.bind_gate(g, EvidenceArtifact(capability="logs", source="oncall.demo",
-                                               kind="observed", summary=f"{g} 证据"))
-        ok, msg = case.try_resolve()
+        attested_receipts = set()
+
+        def demo_host_verifier(kind, path, row):
+            return (
+                kind == "evidence"
+                and hashlib.sha256(path.read_bytes()).hexdigest()
+                in attested_receipts
+            )
+
+        data_dir = _data_dir()
+        runtime = Runtime(
+            data_dir,
+            _registry(),
+            IOSNativePlugin(
+                mode="simulator",
+                data_dir=str(data_dir / "platform"),
+            ),
+            attestation_verifier=demo_host_verifier,
+        )
+        task = runtime.start(f"oncall 诊断：{ev.title}")
+        case = Case.load(task.case_path)
+        hypothesis = case.hypotheses["h1"]
+        hypothesis.text = "客户端代码路径触发崩溃"
+        for gate, capability, summary in (
+            ("mechanism", "crash", "堆栈指向订单详情控制器"),
+            ("time", "logs", "告警窗口内崩溃聚类上涨"),
+            ("scope", "logs", "影响范围仅 iOS 6.3.0 订单详情"),
+            ("counter_evidence", "logs", "其他版本同入口无同类堆栈"),
+        ):
+            artifact = runtime._task_dir(task.id) / f"oncall-{gate}.log"
+            artifact.write_text(summary, encoding="utf-8")
+            evidence = EvidenceArtifact(
+                capability=capability,
+                source="oncall.demo",
+                kind="observed",
+                outcome="success",
+                summary=summary,
+                path=str(artifact),
+                metadata={
+                    "task_id": task.id,
+                    "run_id": f"{task.id}:demo:{gate}",
+                    "flow_id": task.flow_id,
+                    "flow_run_id": "",
+                    "device": "ios-device",
+                    "device_id": "demo-device",
+                    "subjects": ["订单详情崩溃链路"],
+                    "gates": [gate],
+                    "trusted_producer": True,
+                },
+            )
+            runtime._seal_trusted_evidence(task, evidence)
+            receipt_path = Path(evidence.metadata["producer_receipt_path"])
+            attested_receipts.add(hashlib.sha256(receipt_path.read_bytes()).hexdigest())
+            runtime._append_evidence(task.id, evidence)
+            task.evidence_ids.append(evidence.id)
+            case.attach(hypothesis.id, evidence, gate=gate)
+        ok, msg = case.try_resolve(
+            lambda path, row: demo_host_verifier("evidence", path, row),
+            expected_bindings={"task_id": task.id, "flow_id": task.flow_id}
+        )
+        case.save(task.case_path)
+        runtime.tasks.save(task)
         print(render("verify" if ok else "blocked", msg))
         notifier.send(f"[iLoop] {ev.title} 诊断结论", msg)
-    return 0
+    return 0 if ok else 1
 
 
 def cmd_selftest() -> int:
@@ -417,14 +858,31 @@ def main(argv: list[str]) -> int:
         return cmd_task(rest[0], rest[1:])
     if cmd == "case":
         if len(rest) < 2:
-            print("usage: case show|tick|resolve <task_id>")
+            print("usage: case show|tick|evidence|gate|resolve <task_id>")
             return 2
+        if rest[0] in ("evidence", "gate"):
+            return cmd_case_write(rest[0], rest[1], rest[2:])
         return cmd_case(rest[0], rest[1])
-    if cmd == "accept":
+    if cmd == "next":
         if not rest:
-            print("usage: accept <task_id>")
+            print("usage: next <task_id>")
             return 2
-        return cmd_accept(rest[0])
+        return cmd_next(rest[0])
+    if cmd == "capability":
+        if len(rest) < 2:
+            print("usage: capability require|complete|cancel|status <task_id> ...")
+            return 2
+        return cmd_capability_gate(rest[0], rest[1], rest[2:])
+    if cmd == "global-review":
+        if len(rest) < 2:
+            print("usage: global-review prepare|show|record <task_id> ...")
+            return 2
+        return cmd_global_review(rest[0], rest[1], rest[2:])
+    if cmd == "accept":
+        if len(rest) < 2:
+            print("usage: accept prepare|record|status <task_id> ...")
+            return 2
+        return cmd_accept(rest[0], rest[1], rest[2:])
     if cmd == "wrapup":
         if not rest:
             print("usage: wrapup <task_id>")
@@ -435,6 +893,23 @@ def main(argv: list[str]) -> int:
             print("usage: lessons search <query> | lessons add key=value ...")
             return 2
         return cmd_lessons(rest[0], rest[1:])
+    if cmd == "context":
+        return cmd_context(rest[0] if rest else "")
+    if cmd == "constitution":
+        if not rest:
+            print("usage: constitution list|add ...")
+            return 2
+        return cmd_constitution(rest[0], rest[1:])
+    if cmd == "blocker":
+        if not rest:
+            print("usage: blocker <task_id> reason=... evidence=... options=... recommendation=...")
+            return 2
+        return cmd_blocker(rest[0], rest[1:])
+    if cmd == "ui-flow":
+        if not rest:
+            print("usage: ui-flow new|list|show|verify|to-task ...")
+            return 2
+        return cmd_ui_flow(rest[0], rest[1:])
     if cmd == "round":
         if len(rest) < 2:
             print("usage: round start|end <task_id> [goal|status]")

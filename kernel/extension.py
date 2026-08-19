@@ -9,12 +9,14 @@ extension_validate 检查：越界改核心、flow 命名空间冲突、manifest
 from __future__ import annotations
 
 import json
+import importlib.util
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 from .flow import Flow, FlowRegistry
+from .capability import Plugin
 
 MANIFEST_NAME = "manifest.json"
 FLOWS_NAME = "flows.json"
@@ -94,6 +96,13 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
                     f"flow_id '{fid}' 必须以扩展名 '{ext.name}.' 为前缀（防覆盖核心）"))
             if fid in core_flow_ids:
                 issues.append(ValidationIssue("error", f"flow_id '{fid}' 与核心 flow 冲突"))
+    plugin_path = ext.manifest.get("provides", {}).get("plugin")
+    if plugin_path:
+        candidate = (ext.root / plugin_path).resolve()
+        if ext.root.resolve() not in candidate.parents:
+            issues.append(ValidationIssue("error", "plugin path escapes extension root"))
+        elif not candidate.is_file() or candidate.suffix != ".py":
+            issues.append(ValidationIssue("error", f"plugin file missing or not Python: {plugin_path}"))
     return issues
 
 
@@ -144,3 +153,42 @@ def load_installed_extensions(reg: FlowRegistry, base_dir: str | Path) -> tuple[
 
 def has_errors(issues: List[ValidationIssue]) -> bool:
     return any(i.level == "error" for i in issues)
+
+
+def load_extension_plugin(ext: Extension, config: Optional[dict] = None) -> Optional[Plugin]:
+    """Load an explicitly declared plugin factory from a validated extension."""
+    relative = ext.manifest.get("provides", {}).get("plugin")
+    if not relative:
+        return None
+    issues = validate_extension(ext)
+    if has_errors(issues):
+        raise ValueError("; ".join(issue.message for issue in issues))
+    path = (ext.root / relative).resolve()
+    spec = importlib.util.spec_from_file_location(
+        f"iloop_extension_{ext.name.replace('.', '_')}", path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load extension plugin: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    factory = getattr(module, "create_plugin", None)
+    if not callable(factory):
+        raise TypeError(f"{path} must export create_plugin(config)")
+    plugin = factory(config or {})
+    if not isinstance(plugin, Plugin):
+        raise TypeError(f"{path} create_plugin did not return a Plugin")
+    return plugin
+
+
+def load_installed_plugins(base_dir: str | Path, config: Optional[dict] = None) -> List[Plugin]:
+    base = Path(base_dir).expanduser()
+    if not base.exists():
+        return []
+    plugins = []
+    for root in sorted(path for path in base.iterdir() if path.is_dir()):
+        if not (root / MANIFEST_NAME).exists():
+            continue
+        plugin = load_extension_plugin(load_extension(root), config)
+        if plugin is not None:
+            plugins.append(plugin)
+    return plugins

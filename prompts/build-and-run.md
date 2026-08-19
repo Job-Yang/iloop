@@ -32,10 +32,11 @@
 
 ## 真机执行（含真机 UI 自动化——VDD 一等能力）
 - 标准链路：`resume <task_id> --real caps=run,... workspace=... scheme=... device_udid=...`。
-- **执行栈全开源**：build/install/launch 走 XcodeBuildMCP device workflow；真机 UI（截图/点击/滑动/输入/UI 层级树）走 Appium 社区版 **WebDriverAgent**（内核 `plugins/ios_native/wda_client.py`），经 `iproxy` 转发到 127.0.0.1:8100。
+- **执行栈全开源**：build/install/launch 走 XcodeBuildMCP device workflow；真机 UI 走固定版本 Appium **WebDriverAgent**。先 `invoke ui_prepare --real device_udid=... team_id=...`，iLoop 会下载固定公开版本、用 XcodeBuildMCP 启动并托管 `iproxy`；`ui_status/ui_stop` 查询和关闭本次托管进程。
 - **签名**：使用工程在本机 Xcode 中已有的签名配置，无任何私有签名服务。
 - 首装/首启遇登录/验证码/隐私/权限/证书信任等人工卡口，第一时间让用户处理并记 `asked_human=true`。
-- **诚实缺口**：真机 crash 已通过 `devicectl` 拉取；WDA 生命周期仍需外部启动，真机不提供模拟器那套语义 elementRef。没有在线 WDA 时必须明确失败，别假装完整。
+- **诚实边界**：真机 crash 通过 `devicectl` 拉取；WDA 首次签名仍依赖本机有效开发团队和设备信任。真机动作当前使用坐标，尚未与模拟器 elementRef 统一；没有在线 WDA 时必须明确失败。
+- **动态日志必须绑定本次运行**：`logs` 只读取最近一次 `run` 保存的 runtime log path，找不到就失败；禁止扫描 XcodeBuildMCP 全局“最新日志”冒充当前任务证据。
 
 ## UI 验证决策表（改了任何 UI，先查这张表用对工具"看到渲染结果"再核对——禁止只 grep 源码）
 > 铁律：UI 改动的真值源是**渲染出来的画面**，不是源码里有没有那行 CSS/DOM/约束。改完必须"渲染→亲眼看/客观测→对照目标"再宣布完成。用错验证方式=没验证。

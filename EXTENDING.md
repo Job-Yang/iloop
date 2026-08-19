@@ -46,6 +46,7 @@ python3 -m cli extension-init team.oncall
 ~/.iloop/extensions/team.oncall/
 ├── manifest.json
 └── flows.json
+└── plugin.py              # 可选：manifest.provides.plugin 声明 Capability Plugin
 ```
 
 从这一刻起：
@@ -86,6 +87,8 @@ flow 至少写清：
 ### 平台插件负责“怎么执行”
 
 平台插件只负责接真实能力，例如 logs、metrics、build、screenshot、crash。它返回统一结果和证据，不负责决定病例是否收敛。
+
+需要运行时代码时，在 `manifest.json` 设置 `"provides": {"plugin": "plugin.py"}`，并导出 `create_plugin(config)`。返回对象必须满足 `Plugin` 协议；调用时通过 `platform=<platform_id>` 选择。加载器会拒绝路径逃逸、缺文件和不符合契约的返回值。
 
 如果能力不支持，返回 `unsupported`；不要假装成功。
 

@@ -13,6 +13,7 @@
 - **推断不许当观测**：证据分 observed / inferred，宁可标"这条是推的"，也不许把推断当成看到的。
 - **搞不定就升级用户，不傻干**：命中环境/权限/缺输入卡口，产出结构化 blocker 并提问，不反复试同一根因。
 - **改完先回看整体**：收口前检查 diff 的全局影响，删/改公共逻辑必须查清原本服务谁、谁受影响。整体立得住才算完成。
+- **全局视角不是一句提醒**：L2/L3 任务必须绑定工程根；收口前执行 `global-review prepare` 读取完整 diff、公共定义、删除逻辑与仓内调用方。每个影响项必须绑定验证证据或显式说明接受风险；重构/高影响改动还必须有外部独立验收。未完成时 `wrapup` 必须拒绝。
 
 ## 工具入口（开源版命令）
 
@@ -24,9 +25,12 @@ python3 -m cli run "<任务>" [caps=build,run,logs] [k=v ...]  # 建任务并按
 python3 -m cli resume <task_id> [caps=...] [k=v ...]         # 从磁盘断点继续
 python3 -m cli tasks                # 未完成任务恢复卡（阶段/约束/下一步）
 python3 -m cli task show|step|complete ...                   # 推进结构化任务计划
-python3 -m cli case show|tick|resolve <task_id>              # 病例续诊
+python3 -m cli case show|tick|evidence|gate|resolve <task_id> # 病例续诊与证据绑定
+python3 -m cli next <task_id>                                # 按当前证据缺口给下一探针
+python3 -m cli global-review prepare|show|record <task_id>   # 全局影响复核
+python3 -m cli capability require|complete|status <task_id>  # 必需平台操作 Gate
 python3 -m cli lessons search|add ...                        # 错题本召回/沉淀
-python3 -m cli accept <task_id>                              # 独立验收入口
+python3 -m cli accept prepare|record|status <task_id>        # 外部独立验收包与回写
 python3 -m cli wrapup <task_id>                              # 验收、完成、生成看板
 python3 -m cli flows                # 列出已加载 flow
 python3 -m cli experts "<任务>"     # 诊断方法专家路由
@@ -68,8 +72,8 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 ## 澄清 gate + 验收标准（所有任务都用，敏捷度不同）
 
 - **模糊先澄清**：目标有歧义/缺关键输入（设备 sim/real、验收口径、接口/PRD）时，先给候选点选澄清，不带歧义开干。
-- **开工前定验收标准**：动手前对齐"怎么算完成"，写成可验证硬指标（编译通过/拉起无 crash/指定字段正确渲染）。收口逐条核对。
-- **独立验收按风险触发**：低影响面主 Agent 自核；跨模块/改公共逻辑建议上验收；风险极高（支付/下单/鉴权/崩溃热点/数据写入/签名）必须起独立挑错角色（内核 `IndependentReviewer` + `agents/iloop-acceptance.md`）。防踢皮球三约束：只认证据判 fail、needs_more_context≠fail、一次性判定不无限往返。
+- **开工前定验收标准**：动手前对齐"怎么算完成"，写成可验证硬指标。步骤不能裸改成 done；Plugin receipt 仍须由进程外宿主 verifier 复验，`trusted_producer` 不是凭证。用户确认、Task 创建策略和 Capability requirements 同属宿主信任边界，普通 CLI 无权伪造或自行收口。
+- **独立验收按风险触发**：高影响改动先 `accept prepare`，把验收包交给外部只读 Agent；宿主在进程外验证身份后，通过 `AcceptanceStore.record_file(verifier)` API 回写。普通 CLI 默认拒绝 `accept record`，环境变量和 reviewer 字符串都不能充当身份证明。
 
 ## 反循环（防死循环）
 

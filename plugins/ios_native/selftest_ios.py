@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -16,6 +18,12 @@ sys.path.insert(0, str(ROOT))
 from kernel.capability import Capability, CapabilityStatus  # noqa: E402
 from kernel.runner import CommandOutput  # noqa: E402
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
+from plugins.ios_native.wda_manager import (  # noqa: E402
+    WDAManager,
+    WDA_COMMIT,
+    WDA_REPOSITORY,
+    WDA_VERSION,
+)
 
 
 class FakeRunner:
@@ -156,6 +164,346 @@ def test_xcodebuildmcp_json_artifact_path() -> None:
         check("截图: 从 XcodeBuildMCP JSON 解析含空格产物路径", found == png)
 
 
+def test_runtime_logs_are_bound_to_latest_run() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        runtime_log = Path(d) / "App runtime.log"
+        runtime_log.write_text("line1\nline2\n", encoding="utf-8")
+        fake = FakeRunner(
+            stdout=f"Build succeeded. App launched. Runtime log: {runtime_log}\n",
+            returncode=0,
+        )
+        config = {"scheme": "App", "sim_udid": "SIM-1"}
+        plugin = IOSNativePlugin("simulator", data_dir=d, runner=fake, config=config)
+        run = plugin.invoke(Capability.RUN, task_id="task-a", run_id="run-a")
+        logs = plugin.invoke(Capability.LOGS, task_id="task-a", run_id="run-a")
+        stale_run_logs = plugin.invoke(
+            Capability.LOGS, task_id="task-a", run_id="run-b"
+        )
+        other_logs = plugin.invoke(
+            Capability.LOGS, task_id="task-b", run_id="run-a"
+        )
+        fake.stdout = "build failed"
+        fake.returncode = 1
+        failed_run = plugin.invoke(
+            Capability.RUN, task_id="task-a", run_id="run-b"
+        )
+        failed_run_logs = plugin.invoke(
+            Capability.LOGS, task_id="task-a", run_id="run-b"
+        )
+        same_id_failed_run = plugin.invoke(
+            Capability.RUN, task_id="task-a", run_id="run-a"
+        )
+        same_id_logs = plugin.invoke(
+            Capability.LOGS, task_id="task-a", run_id="run-a"
+        )
+        check("动态日志: run 成功后记录本次日志路径", run.status == CapabilityStatus.SUCCESS)
+        check("动态日志: logs 只读取本次 run 绑定文件",
+              logs.status == CapabilityStatus.SUCCESS and "2 行" in logs.summary)
+        check("动态日志: 其他 Task 不能复用上一任务日志",
+              other_logs.status == CapabilityStatus.ERROR)
+        check("动态日志: 同一 Task 的其他 run 不能复用成功日志",
+              stale_run_logs.status == CapabilityStatus.ERROR)
+        check("动态日志: 失败 run 不会覆盖或产出可用日志绑定",
+              failed_run.status == CapabilityStatus.ERROR
+              and failed_run_logs.status == CapabilityStatus.ERROR)
+        check("动态日志: 同 run_id 后续失败会清理旧成功绑定",
+              same_id_failed_run.status == CapabilityStatus.ERROR
+              and same_id_logs.status == CapabilityStatus.ERROR)
+
+
+def test_wda_actions_share_managed_endpoint() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        plugin = IOSNativePlugin(
+            "real",
+            data_dir=d,
+            runner=FakeRunner(),
+            config={"device_udid": "DEVICE-1", "wda_port": 8200},
+        )
+        manager = plugin._wda_manager()
+        check("WDA: 健康检查和实际动作共享同一自定义端点",
+              manager.client is plugin.wda
+              and plugin.wda.base == "http://127.0.0.1:8200")
+
+
+def test_wda_manager_uses_pinned_source_and_managed_command() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        manager = WDAManager(
+            d, device_udid="DEVICE-1", team_id="TEAM123",
+            xcodebuildmcp="/usr/local/bin/xcodebuildmcp",
+        )
+        manager._process_identity = lambda pid: {
+            "sha256": f"process-{pid}",
+            "command": f"fake process {pid}",
+        }
+        manager._source_identity = lambda: {
+            "tag": WDA_VERSION,
+            "commit": WDA_COMMIT,
+            "origin": WDA_REPOSITORY,
+            "worktree_valid": True,
+        }
+        project = Path(d) / WDA_VERSION / "WebDriverAgent.xcodeproj"
+        project.mkdir(parents=True)
+        block = (
+            "\t\tABCDEF1234567890ABCDEF12 /* {name} */ = {{\n"
+            "\t\t\tbaseConfigurationReference = IOSSettings.xcconfig;\n"
+            "\t\t\tbuildSettings = {{\n"
+            "\t\t\t\tINFOPLIST_FILE = WebDriverAgentRunner/Info.plist;\n"
+            "\t\t\t\tUSES_XCTRUNNER = YES;\n"
+            "\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER = WebDriverAgentRunner;\n"
+            "\t\t\t}};\n"
+            "\t\t}};\n"
+        )
+        (project / "project.pbxproj").write_text(
+            block.format(name="Debug") + block.replace(
+                "ABCDEF1234567890ABCDEF12", "ABCDEF1234567890ABCDEF13"
+            ).format(name="Release"),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q"], cwd=manager.source, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=manager.source, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"],
+                       cwd=manager.source, check=True)
+        subprocess.run(["git", "add", "."], cwd=manager.source, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=manager.source, check=True)
+        command = manager.command()
+        payload = " ".join(command)
+        check("WDA: 使用固定公开版本源码目录", WDA_VERSION in payload)
+        check("WDA: 通过 XcodeBuildMCP device test 启动",
+              command[:3] == ["/usr/local/bin/xcodebuildmcp", "device", "test"])
+        check("WDA: 命令包含目标设备", "DEVICE-1" in payload)
+        project_text = (project / "project.pbxproj").read_text(encoding="utf-8")
+        check("WDA: 签名只补到 runner 配置而非全局 extraArgs",
+              project_text.count("ILOOP_WDA_SIGNING_BEGIN") == 2
+              and "DEVELOPMENT_TEAM=TEAM123" not in payload)
+        fake_manager = WDAManager(Path(d) / "fake")
+        fake_project = (
+            Path(d) / "fake" / WDA_VERSION / "WebDriverAgent.xcodeproj"
+        )
+        fake_project.mkdir(parents=True)
+        fake_source_rejected = False
+        try:
+            fake_manager.install_source()
+        except RuntimeError:
+            fake_source_rejected = True
+        check("WDA: 仅伪造 xcodeproj 目录不能冒充固定官方源码",
+              fake_source_rejected)
+        dirty_root = Path(d) / "dirty"
+        dirty_manager = WDAManager(dirty_root, team_id="TEAM123")
+        dirty_source = dirty_root / WDA_VERSION
+        (dirty_source / "WebDriverAgent.xcodeproj").mkdir(parents=True)
+        (dirty_source / "WebDriverAgent.xcodeproj" / "project.pbxproj").write_text(
+            "base\n", encoding="utf-8"
+        )
+        (dirty_source / "source.m").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=dirty_source, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=dirty_source, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"],
+                       cwd=dirty_source, check=True)
+        subprocess.run(["git", "remote", "add", "origin", WDA_REPOSITORY],
+                       cwd=dirty_source, check=True)
+        subprocess.run(["git", "add", "."], cwd=dirty_source, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=dirty_source, check=True)
+        subprocess.run(["git", "tag", WDA_VERSION], cwd=dirty_source, check=True)
+        (dirty_source / "source.m").write_text("malicious\n", encoding="utf-8")
+        check("WDA: 固定 tag/commit 元数据不能掩盖 dirty 源文件",
+              dirty_manager._source_identity()["worktree_valid"] is False)
+
+
+def test_wda_prepare_failure_cleans_processes() -> None:
+    class FakeProcess:
+        _next_pid = 100
+        def __init__(self):
+            self.pid = FakeProcess._next_pid
+            FakeProcess._next_pid += 1
+            self.terminated = False
+        def poll(self):
+            return 0 if self.terminated else None
+        def terminate(self):
+            self.terminated = True
+        def wait(self, timeout=None):
+            return 0
+        def kill(self):
+            self.terminated = True
+
+    with tempfile.TemporaryDirectory() as d:
+        manager = WDAManager(
+            d, device_udid="DEVICE-1", team_id="TEAM123",
+            xcodebuildmcp="/usr/local/bin/xcodebuildmcp",
+        )
+        manager._process_identity = lambda pid: {
+            "sha256": f"process-{pid}",
+            "command": f"fake process {pid}",
+        }
+        manager._source_identity = lambda: {
+            "tag": WDA_VERSION,
+            "commit": WDA_COMMIT,
+            "origin": WDA_REPOSITORY,
+            "worktree_valid": True,
+        }
+        manager._configure_runner_signing = lambda: None
+        project = Path(d) / WDA_VERSION / "WebDriverAgent.xcodeproj"
+        project.mkdir(parents=True)
+        block = (
+            "\t\tABCDEF1234567890ABCDEF12 /* {name} */ = {{\n"
+            "\t\t\tbaseConfigurationReference = IOSSettings.xcconfig;\n"
+            "\t\t\tbuildSettings = {{\n"
+            "\t\t\t\tINFOPLIST_FILE = WebDriverAgentRunner/Info.plist;\n"
+            "\t\t\t\tUSES_XCTRUNNER = YES;\n"
+            "\t\t\t\tPRODUCT_BUNDLE_IDENTIFIER = WebDriverAgentRunner;\n"
+            "\t\t\t}};\n\t\t}};\n"
+        )
+        (project / "project.pbxproj").write_text(
+            block.format(name="Debug") + block.replace(
+                "ABCDEF1234567890ABCDEF12", "ABCDEF1234567890ABCDEF13"
+            ).format(name="Release"),
+            encoding="utf-8",
+        )
+        manager.install_source = lambda: project
+        processes = [FakeProcess(), FakeProcess()]
+        with mock.patch.object(manager, "status", return_value={"ready": False}), \
+             mock.patch("plugins.ios_native.wda_manager.shutil.which", return_value="/usr/bin/iproxy"), \
+             mock.patch("plugins.ios_native.wda_manager.subprocess.Popen", side_effect=processes):
+            failed = False
+            try:
+                manager.prepare(timeout=0)
+            except RuntimeError:
+                failed = True
+        check("WDA: prepare 超时明确失败", failed)
+        check("WDA: prepare 失败清理 runner 与 iproxy",
+              all(process.terminated for process in processes))
+        state_processes = [FakeProcess(), FakeProcess()]
+        with mock.patch.object(manager, "status", return_value={"ready": False}), \
+             mock.patch.object(manager, "_write_state", side_effect=OSError("disk full")), \
+             mock.patch("plugins.ios_native.wda_manager.shutil.which", return_value="/usr/bin/iproxy"), \
+             mock.patch("plugins.ios_native.wda_manager.subprocess.Popen", side_effect=state_processes):
+            state_failed = False
+            try:
+                manager.prepare(timeout=10)
+            except OSError:
+                state_failed = True
+        check("WDA: state 落盘失败向上返回", state_failed)
+        check("WDA: state 落盘失败同样清理两个进程",
+              all(process.terminated for process in state_processes))
+        interrupted_processes = [FakeProcess(), FakeProcess()]
+        with mock.patch.object(
+            manager, "status",
+            side_effect=[{"ready": False}, KeyboardInterrupt()],
+        ), mock.patch(
+            "plugins.ios_native.wda_manager.shutil.which",
+            return_value="/usr/bin/iproxy",
+        ), mock.patch(
+            "plugins.ios_native.wda_manager.subprocess.Popen",
+            side_effect=interrupted_processes,
+        ):
+            interrupted = False
+            try:
+                manager.prepare(timeout=10)
+            except KeyboardInterrupt:
+                interrupted = True
+        check("WDA: 等待阶段中断向上返回", interrupted)
+        check("WDA: KeyboardInterrupt 也清理两个进程",
+              all(process.terminated for process in interrupted_processes))
+        old_device_processes = [FakeProcess(), FakeProcess()]
+        with mock.patch.object(
+            manager, "status",
+            return_value={
+                "ready": True,
+                "runtime": {"device_udid": "OLD-DEVICE", "version": WDA_VERSION},
+            },
+        ), mock.patch.object(manager, "stop", return_value={"stopped": [1, 2]}) as stop_mock, \
+             mock.patch("plugins.ios_native.wda_manager.shutil.which", return_value="/usr/bin/iproxy"), \
+             mock.patch("plugins.ios_native.wda_manager.subprocess.Popen", side_effect=old_device_processes):
+            try:
+                manager.prepare(timeout=0)
+            except RuntimeError:
+                pass
+        check("WDA: 切换设备时不会复用旧设备 ready 状态", stop_mock.called)
+        startup_process = FakeProcess()
+        with mock.patch.object(manager, "status", return_value={"ready": False}), \
+             mock.patch("plugins.ios_native.wda_manager.shutil.which", return_value="/usr/bin/iproxy"), \
+             mock.patch(
+                 "plugins.ios_native.wda_manager.subprocess.Popen",
+                 side_effect=[startup_process, KeyboardInterrupt()],
+             ):
+            startup_interrupted = False
+            try:
+                manager.prepare(timeout=10)
+            except KeyboardInterrupt:
+                startup_interrupted = True
+        check("WDA: 第二进程启动中断向上返回", startup_interrupted)
+        check("WDA: 第二进程启动中断清理已启动 runner", startup_process.terminated)
+
+
+def test_wda_status_binds_endpoint_to_managed_processes() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        manager = WDAManager(d, device_udid="DEVICE-1", team_id="TEAM123")
+        state = {
+            "wda_pid": 101,
+            "proxy_pid": 102,
+            "wda_identity_sha256": "wda-sha",
+            "proxy_identity_sha256": "proxy-sha",
+            "device_udid": "DEVICE-1",
+            "version": WDA_VERSION,
+            "local_port": 8100,
+            "source_commit": WDA_COMMIT,
+        }
+        with mock.patch.object(manager, "_read_state", return_value=state), \
+             mock.patch.object(manager.client, "status", return_value={"value": {"ready": True}}), \
+             mock.patch.object(manager, "_pid_matches", side_effect=[True, True]), \
+             mock.patch.object(manager, "_source_identity",
+                               return_value={"tag": WDA_VERSION, "commit": WDA_COMMIT,
+                                             "origin": WDA_REPOSITORY,
+                                             "worktree_valid": True}), \
+             mock.patch.object(manager, "_port_owner_pid", return_value=102):
+            ready = manager.status()
+        with mock.patch.object(manager, "_read_state", return_value=state), \
+             mock.patch.object(manager.client, "status", return_value={"value": {"ready": True}}), \
+             mock.patch.object(manager, "_pid_matches", side_effect=[False, True]), \
+             mock.patch.object(manager, "_source_identity",
+                               return_value={"tag": WDA_VERSION, "commit": WDA_COMMIT,
+                                             "origin": WDA_REPOSITORY,
+                                             "worktree_valid": True}), \
+             mock.patch.object(manager, "_port_owner_pid", return_value=102):
+            stale = manager.status()
+        with mock.patch.object(manager, "_read_state", return_value=state), \
+             mock.patch.object(manager.client, "status", return_value={"value": {"ready": True}}), \
+             mock.patch.object(manager, "_pid_matches", side_effect=[True, True]), \
+             mock.patch.object(manager, "_source_identity",
+                               return_value={"tag": WDA_VERSION, "commit": WDA_COMMIT,
+                                             "origin": WDA_REPOSITORY,
+                                             "worktree_valid": True}), \
+             mock.patch.object(manager, "_port_owner_pid", return_value=999):
+            wrong_listener = manager.status()
+        with mock.patch.object(manager, "_read_state", return_value=state), \
+             mock.patch.object(manager.client, "status", return_value={"value": {"ready": True}}), \
+             mock.patch.object(manager, "_pid_matches", side_effect=[True, True]), \
+             mock.patch.object(manager, "_source_identity",
+                               return_value={"tag": WDA_VERSION, "commit": "evil-commit",
+                                             "origin": WDA_REPOSITORY,
+                                             "worktree_valid": True}), \
+             mock.patch.object(manager, "_port_owner_pid", return_value=102):
+            wrong_commit = manager.status()
+        with mock.patch.object(manager, "_read_state", return_value=state), \
+             mock.patch.object(manager.client, "status", return_value={"value": {"ready": True}}), \
+             mock.patch.object(manager, "_pid_matches", side_effect=[True, True]), \
+             mock.patch.object(manager, "_source_identity",
+                               return_value={"tag": WDA_VERSION, "commit": WDA_COMMIT,
+                                             "origin": WDA_REPOSITORY,
+                                             "worktree_valid": False}), \
+             mock.patch.object(manager, "_port_owner_pid", return_value=102):
+            dirty_source = manager.status()
+        check("WDA: endpoint 与托管 runner/proxy 同时存活才 ready", ready["ready"])
+        check("WDA: endpoint 存活但托管进程不匹配时拒绝 ready", not stale["ready"])
+        check("WDA: 监听端口不属于托管 iproxy 时拒绝 ready",
+              not wrong_listener["ready"])
+        check("WDA: 同名 tag 但非固定 upstream commit 时拒绝 ready",
+              not wrong_commit["ready"])
+        check("WDA: 固定 commit 但 worktree 被额外修改时拒绝 ready",
+              not dirty_source["ready"])
+
+
 def run() -> int:
     for fn in [
         test_sim_build_command_and_success_marker,
@@ -168,6 +516,11 @@ def run() -> int:
         test_real_crash_needs_udid,
         test_plugin_never_crashes_kernel,
         test_xcodebuildmcp_json_artifact_path,
+        test_runtime_logs_are_bound_to_latest_run,
+        test_wda_actions_share_managed_endpoint,
+        test_wda_manager_uses_pinned_source_and_managed_command,
+        test_wda_prepare_failure_cleans_processes,
+        test_wda_status_binds_endpoint_to_managed_processes,
     ]:
         fn()
     passed = sum(1 for _, ok in _checks if ok)

@@ -16,8 +16,11 @@
 - 用户要"记住/沉淀"时：工程规范红线→constitution，复现坑+解法→lessons，业务知识→inputs。同一条别塞多层。
 
 ## 收口标准
+- **先看整体，再判局部**：L2/L3 收口前必须执行 `global-review prepare <task_id> project_root=<工程根>`。它读取完整 diff，枚举改动公共定义、仓内调用方、共享边界与删除逻辑；再用 `global-review record` 为每个影响项绑定回归/测试证据，或由用户显式接受风险。任何 pending 项都会让 `wrapup` 失败。删/改公共逻辑必须回答“原来服务谁、现在哪条路径替代、哪些调用方已验证”。
+- **复核结论绑定完整 diff fingerprint**：全局复核和独立验收完成后如果又改了代码，旧结论自动失效，必须基于新 diff 重跑；禁止“先验收、后补丁、沿用绿灯”。
+- **收口是代码 Gate，不是荣誉制**：`wrapup` 同时检查 Task 步骤证据、Capability Gate 回读、Case resolved、时间/范围/机制/反证四关、全局复核和必要的外部验收；缺任何一项都拒绝。
 - Feature：编译 + 关键路径运行态证据 + 截图/日志 + 边界。Bugfix：复现 + 根因 + 修复 diff + 修复后证据。Runtime Debug：证据目录 + 结论（client/server/config/env/needs_more）。Refactor：行为基线 + 编译/测试 + 关键入口回归。Environment：doctor + 修复 + 避免方式。
-- 独立验收**按改动影响面/风险触发**（不按任务大小）：低影响面（文案/局部 UI）主 Agent 自核；拿不准建议用户上验收；风险极高（支付/鉴权/崩溃/数据/签名）必须起独立子 Agent（内核 `assess_risk` + `IndependentReviewer` + `agents/iloop-acceptance.md`）。防踢皮球三约束：只认证据判 fail、`needs_more_context`≠fail（退回补一次）、一次性判定不无限往返。全过才算完成。
+- 独立验收**按改动影响面/风险触发**：先 `accept prepare` 生成验收包；外部结果必须带 package_id、case_id、challenge token、diff fingerprint、reviewer、verdict 和 reasons。普通 CLI 无权回写；宿主必须在进程外验证身份，再调用 `AcceptanceStore.record_file(..., verify_attestation=...)`。没有受信回调就 fail closed，结果文件被改/删、跨 Task 复制或 package 变化都会失效。
 - **验收全程必须外显**（别让子 Agent 那步变黑盒）：三段都带 `【iLoop】✅ 验收` 前缀——①开场宣告（先亮客观风险分再决定）；②起子 Agent 这一跳（起之前说"正在起独立验收子 Agent，只喂验收包+证据"，回来说"子 Agent 复查完毕，结论=..."）；③结论（pass/fail/needs_more）。
   - **归属边界**：宿主子 Agent 只是执行载体；验收包、判定口径、防踢皮球规则、结论回写都是 iLoop。若宿主未加载自定义验收 Agent，用通用只读 Agent fallback，并如实外显 `执行器=宿主通用 Agent(fallback)`，可信度如实降低，禁止冒充 iLoop 自带 Agent。
 

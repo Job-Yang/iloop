@@ -13,9 +13,14 @@
 
 from __future__ import annotations
 
+import json
+import hashlib
+import secrets
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from pathlib import Path
+from typing import Callable, List, Optional
 
 from .evidence import EvidenceArtifact
 
@@ -97,6 +102,39 @@ class AcceptancePackage:
     goal: str
     criteria: List[str]                       # 可验证硬指标
     evidence: List[EvidenceArtifact] = field(default_factory=list)
+    subject_fingerprint: str = ""
+    review_token: str = ""
+    package_id: str = ""
+    status: str = "prepared"
+    created_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.package_id:
+            self.package_id = f"accept-{self.case_id}-{int(self.created_at)}"
+        if not self.review_token:
+            self.review_token = secrets.token_hex(16)
+        if not self.expires_at:
+            self.expires_at = self.created_at + 3600
+
+    def to_dict(self) -> dict:
+        return {
+            "package_id": self.package_id,
+            "case_id": self.case_id,
+            "goal": self.goal,
+            "criteria": list(self.criteria),
+            "evidence": [item.to_dict() for item in self.evidence],
+            "subject_fingerprint": self.subject_fingerprint,
+            "review_token": self.review_token,
+            "status": self.status,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "review_rules": [
+                "Only observed evidence can justify pass or fail.",
+                "Missing context is needs_more_context, not fail.",
+                "Do not modify implementation files.",
+            ],
+        }
 
 
 @dataclass
@@ -104,9 +142,21 @@ class AcceptanceResult:
     verdict: Verdict
     reasons: List[str] = field(default_factory=list)
     context_bounces: int = 0
+    reviewer: str = ""
+    reviewed_at: float = field(default_factory=time.time)
+    artifact_path: str = ""
+    artifact_sha256: str = ""
 
     def to_dict(self) -> dict:
-        return {"verdict": self.verdict.value, "reasons": self.reasons, "context_bounces": self.context_bounces}
+        return {
+            "verdict": self.verdict.value,
+            "reasons": self.reasons,
+            "context_bounces": self.context_bounces,
+            "reviewer": self.reviewer,
+            "reviewed_at": self.reviewed_at,
+            "artifact_path": self.artifact_path,
+            "artifact_sha256": self.artifact_sha256,
+        }
 
 
 class IndependentReviewer:
@@ -114,12 +164,19 @@ class IndependentReviewer:
 
     MAX_BOUNCES = 1
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        verify_attestation: Optional[Callable[[Path, dict], bool]] = None,
+    ) -> None:
         self._bounces = 0
+        self.verify_attestation = verify_attestation
 
     def review(self, pkg: AcceptancePackage) -> AcceptanceResult:
         # 每条验收标准都必须有至少一条 observed 证据支撑
-        observed = [e for e in pkg.evidence if e.is_observed()]
+        observed = [
+            e for e in pkg.evidence
+            if e.supports_success(self.verify_attestation)
+        ]
         if not observed:
             if self._bounces < self.MAX_BOUNCES:
                 self._bounces += 1
@@ -139,3 +196,129 @@ class IndependentReviewer:
             return AcceptanceResult(Verdict.FAIL,
                                     [f"验收标准未被证据覆盖：{c}" for c in uncovered], self._bounces)
         return AcceptanceResult(Verdict.PASS, ["全部验收标准均有 observed 证据支撑"], self._bounces)
+
+
+class AcceptanceStore:
+    """Persist packages and external reviewer verdicts.
+
+    The main agent may prepare a package, but only an explicitly named external
+    reviewer may record the verdict used by wrap-up.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+
+    def prepare(self, package: AcceptancePackage) -> AcceptancePackage:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps({"package": package.to_dict(), "result": None},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return package
+
+    def record_file(
+        self,
+        result_path: str | Path,
+        *,
+        verify_attestation: Optional[Callable[[Path, dict], bool]] = None,
+    ) -> AcceptanceResult:
+        data = self.load_raw()
+        package = data.get("package")
+        if not package:
+            raise ValueError("acceptance package has not been prepared")
+        if float(package.get("expires_at", 0)) <= time.time():
+            raise ValueError("acceptance package has expired; prepare a new challenge")
+        path = Path(result_path)
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ValueError("independent reviewer result file is missing or empty")
+        row = json.loads(path.read_text(encoding="utf-8"))
+        if verify_attestation is None or not verify_attestation(path, row):
+            raise ValueError(
+                "independent review requires a trusted host attestation verifier"
+            )
+        for key in ("package_id", "case_id", "review_token", "subject_fingerprint",
+                    "reviewer", "verdict", "reasons", "expires_at"):
+            if key not in row:
+                raise ValueError(f"review result missing {key}")
+        if row["package_id"] != package["package_id"]:
+            raise ValueError("review result package_id mismatch")
+        if row["case_id"] != package["case_id"]:
+            raise ValueError("review result case_id mismatch")
+        if row["review_token"] != package["review_token"]:
+            raise ValueError("review result challenge token mismatch")
+        if row["subject_fingerprint"] != package.get("subject_fingerprint", ""):
+            raise ValueError("review result subject fingerprint mismatch")
+        if float(row["expires_at"]) <= time.time():
+            raise ValueError("review result attestation has expired")
+        reviewer = str(row["reviewer"]).strip()
+        if not reviewer:
+            raise ValueError("review result requires reviewer identity")
+        reasons = list(row["reasons"])
+        if not reasons:
+            raise ValueError("review result requires reasons")
+        result = AcceptanceResult(
+            Verdict(row["verdict"]),
+            reasons,
+            reviewer=reviewer,
+            reviewed_at=float(row.get("reviewed_at", time.time())),
+            artifact_path=str(path),
+            artifact_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        data["result"] = result.to_dict()
+        data["package"]["status"] = "reviewed"
+        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result
+
+    def load_raw(self) -> dict:
+        if not self.path.exists():
+            return {}
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def result(
+        self,
+        verify_attestation: Optional[Callable[[Path, dict], bool]] = None,
+        *,
+        expected_case_id: str = "",
+    ) -> AcceptanceResult | None:
+        data = self.load_raw()
+        row = data.get("result")
+        if not row:
+            return None
+        result = AcceptanceResult(
+            verdict=Verdict(row["verdict"]),
+            reasons=list(row.get("reasons", [])),
+            context_bounces=int(row.get("context_bounces", 0)),
+            reviewer=row.get("reviewer", ""),
+            reviewed_at=float(row.get("reviewed_at", time.time())),
+            artifact_path=row.get("artifact_path", ""),
+            artifact_sha256=row.get("artifact_sha256", ""),
+        )
+        artifact = Path(result.artifact_path)
+        if not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != result.artifact_sha256:
+            return None
+        try:
+            artifact_row = json.loads(artifact.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if verify_attestation is None or not verify_attestation(artifact, artifact_row):
+            return None
+        package = data.get("package") or {}
+        if (
+            float(package.get("expires_at", 0)) <= time.time()
+            or (
+                bool(expected_case_id)
+                and package.get("case_id") != expected_case_id
+            )
+            or float(artifact_row.get("reviewed_at", result.reviewed_at))
+            > float(package.get("expires_at", 0))
+            or artifact_row.get("package_id") != package.get("package_id")
+            or artifact_row.get("case_id") != package.get("case_id")
+            or artifact_row.get("review_token") != package.get("review_token")
+            or artifact_row.get("subject_fingerprint") != package.get("subject_fingerprint")
+            or artifact_row.get("reviewer") != result.reviewer
+            or artifact_row.get("verdict") != result.verdict.value
+            or float(artifact_row.get("expires_at", 0)) <= time.time()
+        ):
+            return None
+        return result

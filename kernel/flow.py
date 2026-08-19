@@ -12,6 +12,11 @@ from enum import Enum
 from pathlib import Path
 from typing import List, Optional
 
+SCALE_SIGNALS = (
+    "二期", "三期", "多轮", "跨模块", "大规模", "成体系", "批量",
+    "全量", "整个模块", "大改造", "端到端", "一整套", "分阶段", "长期",
+)
+
 
 class Autonomy(str, Enum):
     L1 = "L1"  # 只看不改
@@ -75,3 +80,16 @@ class FlowRegistry:
         if ranked and ranked[0].score(task) > 0:
             return ranked[0]
         return None
+
+    def plan_details(self, task: str) -> dict:
+        """Return the domain flow plus orthogonal gates that apply to all flows."""
+        flow = self.plan(task)
+        complex_task = any(signal in task for signal in SCALE_SIGNALS)
+        refactor = bool(flow and flow.flow_id == "core.refactor")
+        return {
+            "flow": flow,
+            "complexity_gate": complex_task,
+            "lessons_gate": True,
+            "global_review_gate": refactor or complex_task,
+            "acceptance_gate": refactor or complex_task,
+        }

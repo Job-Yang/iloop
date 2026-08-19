@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -25,6 +26,7 @@ from kernel.runner import CommandRunner
 from kernel.evidence import EvidenceKind
 from .evidence_writer import EvidenceWriter
 from .wda_client import WDAClient
+from .wda_manager import WDAManager
 
 PLATFORM_ID = "ios_native"
 
@@ -44,7 +46,15 @@ class IOSNativePlugin:
         self.config = config or {}
         self.runner = runner or CommandRunner()
         self.writer = EvidenceWriter(data_dir)
-        self.wda = wda or WDAClient()
+        self.state_dir = Path(data_dir) / "state"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        wda_port = int(self.config.get("wda_port", 8100))
+        expected_wda_url = f"http://127.0.0.1:{wda_port}"
+        if wda is not None and getattr(wda, "base", expected_wda_url) != expected_wda_url:
+            raise ValueError(
+                f"WDA client endpoint {wda.base} does not match managed endpoint {expected_wda_url}"
+            )
+        self.wda = wda or WDAClient(expected_wda_url)
 
     # ---- 契约声明 ----
     def capabilities(self) -> List[Capability]:
@@ -53,6 +63,7 @@ class IOSNativePlugin:
             Capability.LAUNCH, Capability.SCREENSHOT, Capability.VIEW_TREE,
             Capability.LOGS, Capability.PROBE, Capability.CRASH,
             Capability.TAP, Capability.SWIPE, Capability.TYPE_TEXT,
+            Capability.UI_PREPARE, Capability.UI_STATUS, Capability.UI_STOP,
         ]
         return caps
 
@@ -73,6 +84,9 @@ class IOSNativePlugin:
             Capability.TAP: self._tap,
             Capability.SWIPE: self._swipe,
             Capability.TYPE_TEXT: self._type_text,
+            Capability.UI_PREPARE: self._ui_prepare,
+            Capability.UI_STATUS: self._ui_status,
+            Capability.UI_STOP: self._ui_stop,
         }[capability]
         # 只透传 handler 真正接受的关键字；其余（如 sim_udid）已进 self.config
         import inspect
@@ -86,15 +100,30 @@ class IOSNativePlugin:
     # ---- helpers ----
     def _ok(self, cap: Capability, summary: str, evidence_dir: str = "", artifacts=None) -> CapabilityResult:
         return CapabilityResult(self.platform_id, cap.value, CapabilityStatus.SUCCESS,
-                                summary, evidence_dir, artifacts or [])
+                                summary, evidence_dir, artifacts or [],
+                                metadata={"device": "ios-device" if self.mode == "real"
+                                          else "ios-simulator"})
 
     def _err(self, cap: Capability, summary: str, evidence_dir: str = "", artifacts=None) -> CapabilityResult:
         return CapabilityResult(self.platform_id, cap.value, CapabilityStatus.ERROR,
-                                summary, evidence_dir, artifacts or [])
+                                summary, evidence_dir, artifacts or [],
+                                metadata={"device": "ios-device" if self.mode == "real"
+                                          else "ios-simulator"})
 
     def _has_full_xcode(self) -> bool:
         # 不只信全局 xcode-select：runner 已通过 discover_developer_dir 自愈到已装 Xcode
         return getattr(self.runner, "developer_dir", None) is not None
+
+    def _wda_manager(self) -> WDAManager:
+        manager = WDAManager(
+            self.state_dir / "wda",
+            device_udid=self.config.get("device_udid", ""),
+            team_id=self.config.get("team_id", ""),
+            xcodebuildmcp=self._xb(),
+            local_port=int(self.config.get("wda_port", 8100)),
+        )
+        manager.client = self.wda
+        return manager
 
     def _xb(self) -> str:
         return self.config.get("xcodebuildmcp") or shutil.which("xcodebuildmcp") or "xcodebuildmcp"
@@ -130,6 +159,15 @@ class IOSNativePlugin:
                 path = Path(value)
                 if path.exists():
                     return path
+        line_match = re.search(
+            rf"(?:runtime\s+log|log\s+path|path)\s*[:=]\s*(.+{re.escape(suffix)})\s*$",
+            text or "",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if line_match:
+            path = Path(line_match.group(1).strip().strip("'\""))
+            if path.exists():
+                return path
         candidates = re.findall(r"(?:/[^ \n]+)+" + re.escape(suffix), text or "")
         return next((Path(candidate) for candidate in reversed(candidates)
                      if Path(candidate).exists()), None)
@@ -180,7 +218,8 @@ class IOSNativePlugin:
         return self._err(Capability.BUILD, f"[{self.mode}] {scheme} 构建失败（见 cmd.log）", edir, [ev.id])
 
     def _run(self, *, scheme: str = "", configuration: str = "Debug",
-             derived_data: str = "") -> CapabilityResult:
+             derived_data: str = "", task_id: str = "direct",
+             run_id: str = "direct") -> CapabilityResult:
         scheme = scheme or self.config.get("scheme", "")
         if not scheme:
             return self._err(Capability.RUN, "缺少 scheme")
@@ -193,10 +232,35 @@ class IOSNativePlugin:
             argv += ["--derived-data-path", derived_data]
         argv += ["--output", "text"]
         out = self.runner.run(argv, timeout=1800)
+        runtime_log = self._artifact_path(out.stdout or out.combined, ".log")
+        succeeded = out.returncode == 0 and bool(
+            re.search(r"build succeeded|BUILD SUCCEEDED|launch(?:ed)?|running", out.combined, re.I)
+        )
+        if succeeded:
+            state = {
+                "captured_at": time.time(),
+                "status": "success",
+                "task_id": task_id,
+                "run_id": run_id,
+                "mode": self.mode,
+                "scheme": scheme,
+                "project": self.config.get("project", ""),
+                "workspace": self.config.get("workspace", ""),
+                "runtime_log": str(runtime_log) if runtime_log else "",
+            }
+            (self.state_dir / f"last-run-{task_id}.json").write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        else:
+            state_path = self.state_dir / f"last-run-{task_id}.json"
+            if state_path.is_file():
+                previous = json.loads(state_path.read_text(encoding="utf-8"))
+                if previous.get("run_id") == run_id:
+                    state_path.unlink()
         ev, edir = self.writer.from_command(
             capability="run", source=f"{self.platform_id}.xcodebuildmcp", out=out,
-            summary=("构建并拉起成功" if out.ok() else "构建或拉起失败"))
-        if out.ok():
+            summary=("构建并拉起成功" if succeeded else "构建或拉起失败"))
+        if succeeded:
             return self._ok(Capability.RUN, f"[{self.mode}] 构建、安装、拉起完成；运行日志路径见证据",
                             edir, [ev.id])
         return self._err(Capability.RUN, f"[{self.mode}] build-and-run 失败", edir, [ev.id])
@@ -273,6 +337,13 @@ class IOSNativePlugin:
                                          out=out, summary="截图失败")
                 return self._err(Capability.SCREENSHOT, "[simulator] 截图失败", str(edir))
         else:
+            ready = self._wda_manager().status()
+            if not ready["ready"]:
+                return self._err(
+                    Capability.SCREENSHOT,
+                    "[real] managed WDA is not ready for the selected device",
+                    str(edir),
+                )
             # 真机走 WDA 截图（Appium 社区版）
             data = self.wda.screenshot_png()
             if not data:
@@ -309,6 +380,13 @@ class IOSNativePlugin:
                              "[simulator] XcodeBuildMCP UI 树抓取失败",
                              str(edir), [ev.id])
         else:
+            ready = self._wda_manager().status()
+            if not ready["ready"]:
+                return self._err(
+                    Capability.VIEW_TREE,
+                    "[real] managed WDA is not ready for the selected device",
+                    str(edir),
+                )
             import json as _json
             tree = self.wda.source()
             tree_file.write_text(_json.dumps(tree, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -318,20 +396,29 @@ class IOSNativePlugin:
             return self._ok(Capability.VIEW_TREE, "[real] WDA UI 树已抓取", str(edir), [ev.id])
 
     # ---- LOGS ----
-    def _logs(self, *, udid: str = "", predicate: str = "", limit: int = 200) -> CapabilityResult:
+    def _logs(self, *, udid: str = "", predicate: str = "", limit: int = 200,
+              task_id: str = "direct", run_id: str = "direct") -> CapabilityResult:
         log_path = self.config.get("log_path", "")
         candidates = []
-        if log_path:
+        if log_path and task_id == "direct":
             candidates = [Path(log_path)]
         else:
-            root = Path.home() / "Library" / "Developer" / "XcodeBuildMCP"
-            candidates = sorted(root.glob("workspaces/*/logs/*.log"),
-                                key=lambda p: p.stat().st_mtime, reverse=True)
+            state_path = self.state_dir / f"last-run-{task_id}.json"
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if (
+                    state.get("status") == "success"
+                    and state.get("task_id") == task_id
+                    and state.get("run_id") == run_id
+                    and state.get("mode") == self.mode
+                    and state.get("runtime_log")
+                ):
+                    candidates = [Path(state["runtime_log"])]
         source = next((p for p in candidates if p.exists() and p.is_file()), None)
         if source is None:
             return self._err(
                 Capability.LOGS,
-                f"[{self.mode}] 未找到 XcodeBuildMCP 动态日志；先执行 run/launch，或传 log_path",
+                f"[{self.mode}] 本次 run 未绑定可用动态日志；先执行 run，或显式传 log_path",
             )
         lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
         if predicate:
@@ -353,6 +440,8 @@ class IOSNativePlugin:
     def _tap(self, *, udid: str = "", element_ref: str = "",
              x: float = -1, y: float = -1) -> CapabilityResult:
         if self.mode == "real":
+            if not self._wda_manager().status()["ready"]:
+                return self._err(Capability.TAP, "[real] managed WDA is not ready")
             x, y = float(x), float(y)
             if x < 0 or y < 0:
                 return self._err(Capability.TAP, "真机 WDA tap 需要 x + y")
@@ -367,6 +456,8 @@ class IOSNativePlugin:
                x1: float = -1, y1: float = -1,
                x2: float = -1, y2: float = -1) -> CapabilityResult:
         if self.mode == "real":
+            if not self._wda_manager().status()["ready"]:
+                return self._err(Capability.SWIPE, "[real] managed WDA is not ready")
             x1, y1, x2, y2 = map(float, (x1, y1, x2, y2))
             if min(x1, y1, x2, y2) < 0:
                 return self._err(Capability.SWIPE, "真机 WDA swipe 需要 x1/y1/x2/y2")
@@ -380,6 +471,8 @@ class IOSNativePlugin:
     def _type_text(self, *, udid: str = "", element_ref: str = "",
                    text: str = "") -> CapabilityResult:
         if self.mode == "real":
+            if not self._wda_manager().status()["ready"]:
+                return self._err(Capability.TYPE_TEXT, "[real] managed WDA is not ready")
             if not text:
                 return self._err(Capability.TYPE_TEXT, "真机 type_text 需要 text")
             result = self.wda.type_text(text)
@@ -387,6 +480,32 @@ class IOSNativePlugin:
         args = ["--element-ref", element_ref, "--text", text] if element_ref and text else []
         return self._sim_ui_action(Capability.TYPE_TEXT, "type-text", udid, args,
                                    required="element_ref + text")
+
+    def _ui_prepare(self, **_) -> CapabilityResult:
+        if self.mode != "real":
+            return self._ok(Capability.UI_PREPARE,
+                            "[simulator] XcodeBuildMCP UI automation requires no WDA preparation")
+        try:
+            status = self._wda_manager().prepare(
+                timeout=float(self.config.get("wda_timeout", 120))
+            )
+        except Exception as error:
+            return self._err(Capability.UI_PREPARE, f"[real] WDA prepare failed: {error}")
+        return self._ok(Capability.UI_PREPARE, f"[real] WDA ready: {status.get('ready')}")
+
+    def _ui_status(self, **_) -> CapabilityResult:
+        if self.mode != "real":
+            return self._ok(Capability.UI_STATUS, "[simulator] XcodeBuildMCP UI automation")
+        status = self._wda_manager().status()
+        if status["ready"]:
+            return self._ok(Capability.UI_STATUS, "[real] WDA ready")
+        return self._err(Capability.UI_STATUS, "[real] WDA is not ready")
+
+    def _ui_stop(self, **_) -> CapabilityResult:
+        if self.mode != "real":
+            return self._ok(Capability.UI_STOP, "[simulator] no managed WDA runtime")
+        stopped = self._wda_manager().stop()
+        return self._ok(Capability.UI_STOP, f"[real] WDA runtime stopped: {stopped['stopped']}")
 
     def _sim_ui_action(self, capability: Capability, command: str, udid: str,
                        args: List[str], *, required: str) -> CapabilityResult:

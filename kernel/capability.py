@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Protocol, runtime_checkable
+from typing import Dict, List, Protocol, runtime_checkable
 
 
 class Capability(str, Enum):
@@ -25,6 +25,9 @@ class Capability(str, Enum):
     TAP = "tap"
     SWIPE = "swipe"
     TYPE_TEXT = "type_text"
+    UI_PREPARE = "ui_prepare"
+    UI_STATUS = "ui_status"
+    UI_STOP = "ui_stop"
 
 
 class CapabilityStatus(str, Enum):
@@ -41,6 +44,7 @@ class CapabilityResult:
     summary: str
     evidence_dir: str = ""
     artifacts: List[str] = field(default_factory=list)
+    metadata: Dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if isinstance(self.status, str):
@@ -59,6 +63,7 @@ class CapabilityResult:
             "summary": self.summary,
             "evidence_dir": self.evidence_dir,
             "artifacts": list(self.artifacts),
+            "metadata": dict(self.metadata),
         }
 
 

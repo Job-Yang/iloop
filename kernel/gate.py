@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
 
 from .evidence import EvidenceArtifact
 
@@ -46,10 +47,17 @@ class FourGate:
             raise ValueError(f"unknown gate '{gate}'; expected one of {GATES}")
         self._bind[gate].append(evidence)
 
-    def evaluate(self) -> GateResult:
+    def evaluate(
+        self,
+        verify_attestation: Optional[Callable[[Path, dict], bool]] = None,
+        expected_bindings: Optional[dict] = None,
+    ) -> GateResult:
         detail = {}
         for g in GATES:
-            detail[g] = any(e.is_observed() for e in self._bind[g])
+            detail[g] = any(
+                e.supports_gate(g, verify_attestation, expected_bindings)
+                for e in self._bind[g]
+            )
         missing = [g for g in GATES if not detail[g]]
         return GateResult(passed=not missing, detail=detail, missing=missing)
 

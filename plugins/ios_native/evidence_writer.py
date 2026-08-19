@@ -33,10 +33,12 @@ class EvidenceWriter:
             encoding="utf-8",
         )
         ev = EvidenceArtifact(capability=capability, source=source, kind=kind,
-                              summary=summary, path=str(log))
+                              summary=summary, path=str(log),
+                              outcome="success" if out.ok() else "failure")
         return ev, str(d)
 
     def register_file(self, *, capability: str, source: str, file_path: str,
                       summary: str) -> EvidenceArtifact:
         return EvidenceArtifact(capability=capability, source=source,
-                                kind=EvidenceKind.OBSERVED, summary=summary, path=file_path)
+                                kind=EvidenceKind.OBSERVED, summary=summary,
+                                path=file_path, outcome="success")
