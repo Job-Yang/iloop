@@ -44,7 +44,8 @@
 - 入口提示词 `AGENT_PROMPT.md` + 分片提示词 `prompts/`
 - `SPEC.md`（四协议）/ `DESIGN.md`（设计）/ `EXTENDING.md`（二开）/ `docs/VDD.md`（方法论）
 - README 与 DESIGN 按“程序员反馈循环 → 长任务问题 → 架构设计”重写；二次开发改为 Agent 执行协议
-- selftest 173 断言（内核 125 + iOS 插件 48），包含自签 receipt、策略降级、跨任务验收、伪造用户确认、consumer 漏验、跨 run 日志、WDA 假 tag 与 dirty worktree 等反向绕过测试
+- 全局视角固定 Task 起始 Git commit，补齐行为配置文件、Objective-C selector、动态路由/DI、显式 evidence subjects 与受影响测试建议
+- selftest 185 断言（内核 137 + iOS 插件 48），包含提交后空审、旧 Task 基线缺失、行为文件漏检、动态入口漏检、subjects 断链、Objective-C selector 误报和测试夹具误报等反向测试
 
 ### 已知缺口（诚实标注）
 - WDA 托管仍需更多签名环境与真机版本 E2E，真机语义 elementRef 操作不与模拟器混用

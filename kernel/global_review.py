@@ -26,12 +26,25 @@ SOURCE_SUFFIXES = {
     ".js", ".jsx", ".ts", ".tsx", ".go", ".java", ".kt", ".kts",
     ".rs", ".rb",
 }
+BEHAVIOR_SUFFIXES = {
+    ".json", ".yaml", ".yml", ".plist", ".podspec", ".sh", ".bash",
+    ".xcconfig", ".entitlements", ".toml", ".ini", ".xml", ".pbxproj",
+    ".resolved", ".lock", ".gradle", ".properties", ".strings",
+    ".stringsdict", ".storyboard", ".xib", ".bazel",
+}
+BEHAVIOR_FILENAMES = {
+    "Dockerfile", "Makefile", "Podfile", "Gemfile", "BUILD", "WORKSPACE",
+    "CMakeLists.txt",
+}
 DEFINITION_RE = re.compile(
     r"^[+-]\s*(?:def|class|func|protocol|interface|public\s+(?:class|func|struct|enum))\s+([A-Za-z_]\w*)",
     re.MULTILINE,
 )
 SOURCE_DEFINITION_RE = re.compile(
-    r"^\s*(?:def|class|func|protocol|interface|public\s+(?:class|func|struct|enum))\s+([A-Za-z_]\w*)",
+    r"^\s*(?:(?:@\w+(?:\([^)]*\))?|public|private|internal|open|final|"
+    r"static|override|dynamic|mutating|nonmutating)\s+)*"
+    r"(?:def|class|func|protocol|interface|struct|enum|extension)\s+"
+    r"([A-Za-z_]\w*)",
     re.MULTILINE,
 )
 PUBLIC_ASSIGNMENT_RE = re.compile(
@@ -43,6 +56,21 @@ EXPORT_ASSIGNMENT_RE = re.compile(
     re.MULTILINE,
 )
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+OBJC_METHOD_RE = re.compile(
+    r"^\s*[+-]\s*\([^)]*\)\s*([^;{]+)(?=[;{])",
+    re.MULTILINE,
+)
+DYNAMIC_ENTRY_RE = re.compile(
+    r"(?:(?:"
+    r"(?:register\w*|openurl|subscribe|postnotification|eventname|"
+    r"jsb\w*|bridge\w*)\s*(?:\(\s*|:\s*)@?"
+    r"|[\"']?(?:route|router|scheme|service|protocol|notification|eventname)"
+    r"[\"']?\s*:\s*"
+    r")[\"']([^\"'\n]{2,160})[\"']"
+    r"|[\"']?(?:route|router|scheme|service|protocol|notification|eventname)"
+    r"[\"']?\s*:\s*([^\s#,\]}]{2,160}))",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -51,6 +79,8 @@ class ImpactItem:
     target: str
     reason: str
     consumers: List[str] = field(default_factory=list)
+    entry_points: List[str] = field(default_factory=list)
+    suggested_tests: List[str] = field(default_factory=list)
     evidence_ids: List[str] = field(default_factory=list)
     status: str = "pending"  # pending | verified | accepted
     resolution: str = ""
@@ -155,22 +185,372 @@ def _numstat(root: Path, base: str) -> tuple[int, int]:
     return additions, deletions
 
 
-def _consumers(root: Path, symbol: str, excluded_files: set[str]) -> List[str]:
+def _objc_message_has_selector(text: str, selector_parts: List[str]) -> bool:
+    messages: List[List[str]] = []
+    for char in text:
+        if char == "[":
+            if messages:
+                messages[-1].append(" ")
+            messages.append([])
+            continue
+        if char == "]":
+            if not messages:
+                continue
+            message = "".join(messages.pop())
+            position = 0
+            for part in selector_parts:
+                match = re.search(
+                    rf"\b{re.escape(part)}\s*:",
+                    message[position:],
+                )
+                if not match:
+                    break
+                position += match.end()
+            else:
+                return True
+            continue
+        if messages:
+            messages[-1].append(char)
+    return False
+
+
+def _consumers(
+    root: Path,
+    symbol: str,
+    excluded_files: set[str],
+    definition_file: str,
+) -> List[str]:
     hits = []
-    token = re.compile(rf"\b{re.escape(symbol)}\b")
+    selector_parts = [part for part in symbol.split(":") if part]
+    token = re.compile(rf"\b{re.escape(symbol)}\b") if symbol.isidentifier() else None
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix not in SOURCE_SUFFIXES:
             continue
         rel = str(path.relative_to(root))
-        if rel.startswith((".git/", "Pods/", "DerivedData/")) or rel in excluded_files:
+        if (
+            rel.startswith((".git/", "Pods/", "DerivedData/"))
+            or rel in excluded_files
+            or _is_test_path(rel)
+        ):
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        if token.search(text):
+        search_text = (
+            OBJC_METHOD_RE.sub("", text)
+            if Path(definition_file).suffix in {".m", ".mm", ".h"}
+            and path.suffix in {".m", ".mm", ".h"}
+            else text
+        )
+        selector_match = False
+        if ":" in symbol and selector_parts:
+            selector_match = _objc_message_has_selector(
+                search_text,
+                selector_parts,
+            )
+        matched = (
+            bool(token and token.search(search_text))
+            or selector_match
+            or (token is None and ":" not in symbol and symbol in search_text)
+        )
+        definition_suffix = Path(definition_file).suffix
+        if matched and definition_suffix == ".py" and path.suffix == ".py":
+            matched = bool(re.search(
+                rf"^\s*(?:from\s+[\w.]+\s+import\s+[^\n]*\b{re.escape(symbol)}\b"
+                rf"|import\s+[^\n]*\b{re.escape(Path(definition_file).stem)}\b)",
+                text,
+                re.MULTILINE,
+            ))
+        if (
+            matched
+            and definition_suffix in {".js", ".jsx", ".ts", ".tsx"}
+            and path.suffix in {".js", ".jsx", ".ts", ".tsx"}
+        ):
+            matched = bool(re.search(
+                rf"^\s*(?:import|require)[^\n]*\b{re.escape(symbol)}\b",
+                text,
+                re.MULTILINE,
+            ))
+        if matched:
             hits.append(rel)
     return hits
+
+
+def _objc_selectors(text: str) -> List[tuple[int, str]]:
+    selectors = []
+    for match in OBJC_METHOD_RE.finditer(text):
+        declaration = match.group(1)
+        parts = re.findall(r"([A-Za-z_]\w*)\s*:", declaration)
+        selector = "".join(f"{part}:" for part in parts)
+        if not selector:
+            plain = re.match(r"([A-Za-z_]\w*)", declaration.strip())
+            selector = plain.group(1) if plain else ""
+        if selector:
+            selectors.append(
+                (text.count("\n", 0, match.start()) + 1, selector)
+            )
+    return selectors
+
+
+def _definitions(text: str, suffix: str = "") -> List[tuple[int, str]]:
+    if suffix == ".swift":
+        definitions = _swift_definitions(text)
+    else:
+        definitions = [
+            (text.count("\n", 0, match.start()) + 1, match.group(1))
+            for match in SOURCE_DEFINITION_RE.finditer(text)
+        ]
+        definitions.extend(_objc_selectors(text))
+    definitions.extend(
+        (text.count("\n", 0, match.start()) + 1, match.group(1))
+        for match in PUBLIC_ASSIGNMENT_RE.finditer(text)
+    )
+    definitions.extend(
+        (text.count("\n", 0, match.start()) + 1, match.group(1))
+        for match in EXPORT_ASSIGNMENT_RE.finditer(text)
+    )
+    return sorted(set(definitions))
+
+
+def _swift_structure_line(line: str, state: dict) -> str:
+    output = []
+    index = 0
+    in_string = False
+    while index < len(line):
+        if state["block_comment_depth"]:
+            if line.startswith("/*", index):
+                state["block_comment_depth"] += 1
+                index += 2
+                continue
+            if line.startswith("*/", index):
+                state["block_comment_depth"] -= 1
+                index += 2
+                continue
+            index += 1
+            continue
+        if state["triple_string"]:
+            end = line.find('"""', index)
+            if end < 0:
+                return "".join(output)
+            state["triple_string"] = False
+            index = end + 3
+            continue
+        if not in_string and line.startswith("//", index):
+            break
+        if not in_string and line.startswith("/*", index):
+            state["block_comment_depth"] = 1
+            index += 2
+            continue
+        if not in_string and line.startswith('"""', index):
+            state["triple_string"] = True
+            index += 3
+            continue
+        char = line[index]
+        if char == '"' and (index == 0 or line[index - 1] != "\\"):
+            in_string = not in_string
+            index += 1
+            continue
+        if not in_string:
+            output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _swift_structure_text(text: str) -> str:
+    state = {"block_comment_depth": 0, "triple_string": False}
+    return "\n".join(
+        _swift_structure_line(line, state)
+        for line in text.splitlines()
+    )
+
+
+def _swift_definitions(text: str) -> List[tuple[int, str]]:
+    definitions = []
+    property_pattern = re.compile(
+        r"^\s*(?:(?:@\w+(?:\([^)]*\))?|public|open|final|"
+        r"(?:private|fileprivate|internal|package)(?:\s*\(\s*set\s*\))?|"
+        r"static|override|dynamic|lazy|weak|unowned)\s+)*"
+        r"(?:var|let)\s+([A-Za-z_]\w*)"
+    )
+    type_pattern = re.compile(
+        r"^\s*(?:(?:@\w+(?:\([^)]*\))?|public|private|internal|open|final|"
+        r"fileprivate|package|static)\s+)*"
+        r"(?:class|struct|enum|extension|protocol|actor)\s+([A-Za-z_]\w*)"
+    )
+    function_pattern = re.compile(
+        r"^\s*(?:(?:@\w+(?:\([^)]*\))?|public|private|internal|open|final|"
+        r"fileprivate|package|static|override|dynamic|mutating|nonmutating)\s+)*"
+        r"func\s+([A-Za-z_]\w*)"
+    )
+    type_scope = re.compile(
+        r"\b(?:class|struct|enum|extension|protocol|actor)\s+[A-Za-z_]\w*"
+    )
+    function_scope = re.compile(
+        r"\b(?:func|init|deinit|subscript)\b"
+    )
+    scopes: List[str] = []
+    pending_scope = ""
+    lexical_state = {"block_comment_depth": 0, "triple_string": False}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        code_line = _swift_structure_line(line, lexical_state)
+        stripped = code_line.lstrip()
+        leading_closes = len(stripped) - len(stripped.lstrip("}"))
+        for _ in range(min(leading_closes, len(scopes))):
+            scopes.pop()
+        is_local = any(scope in {"function", "other"} for scope in scopes)
+        for pattern in (type_pattern, function_pattern, property_pattern):
+            match = pattern.match(code_line)
+            if match and not is_local:
+                definitions.append((line_number, match.group(1)))
+                break
+        opens = code_line.count("{")
+        closes = max(0, code_line.count("}") - leading_closes)
+        declaration_scope = (
+            "type" if type_scope.search(code_line)
+            else "function" if function_scope.search(code_line)
+            else ""
+        )
+        first_scope = declaration_scope or pending_scope or "other"
+        if opens:
+            pending_scope = ""
+        elif declaration_scope:
+            pending_scope = declaration_scope
+        for index in range(opens):
+            scopes.append(first_scope if index == 0 else "other")
+        for _ in range(min(closes, len(scopes))):
+            scopes.pop()
+    return definitions
+
+
+def _yaml_mapping_entries(text: str) -> List[str]:
+    entries = []
+    container_indent = None
+    container = re.compile(
+        r"^(\s*)(?:routes?|routers?|schemes?|services?|protocols?|"
+        r"notifications?|eventnames?)\s*:\s*(?:#.*)?$",
+        re.IGNORECASE,
+    )
+    for line in text.splitlines():
+        match = container.match(line)
+        if match:
+            container_indent = len(match.group(1))
+            continue
+        if container_indent is None or not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= container_indent:
+            container_indent = None
+            continue
+        key_match = re.match(r"^\s*(.+):\s+\S", line)
+        if key_match:
+            key = key_match.group(1).strip().strip("\"'")
+            if len(key) >= 2:
+                entries.append(key)
+    return entries
+
+
+def _entry_points(text: str, suffix: str = "") -> List[str]:
+    entries = {
+        (match.group(1) or match.group(2)).strip()
+        for match in DYNAMIC_ENTRY_RE.finditer(text)
+        if match.group(1) or match.group(2)
+    }
+    if suffix in {".yaml", ".yml"}:
+        entries.update(_yaml_mapping_entries(text))
+    return sorted(entries)
+
+
+def _is_test_path(path: str | Path) -> bool:
+    relative = str(path).replace("\\", "/")
+    name = Path(relative).name.lower()
+    parts = {part.lower() for part in Path(relative).parts}
+    return (
+        bool(parts & {
+            "test", "tests", "fixture", "fixtures", "testfixtures",
+            "mock", "mocks", "stub", "stubs", "fake", "fakes",
+            "snapshot", "snapshots",
+        })
+        or name.startswith("test_")
+        or "_test." in name
+        or name.endswith("tests.swift")
+        or "fixture" in name
+        or "mock" in name
+        or name in {"selftest.py", "selftest_ios.py"}
+    )
+
+
+def _literal_consumers(
+    root: Path,
+    token: str,
+    excluded_files: set[str],
+) -> List[str]:
+    hits = []
+    relevant_suffixes = SOURCE_SUFFIXES | BEHAVIOR_SUFFIXES
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix not in relevant_suffixes and path.name not in BEHAVIOR_FILENAMES:
+            continue
+        relative = str(path.relative_to(root))
+        if (
+            relative.startswith((".git/", "Pods/", "DerivedData/"))
+            or relative in excluded_files
+            or _is_test_path(relative)
+        ):
+            continue
+        try:
+            if token in path.read_text(encoding="utf-8", errors="replace"):
+                hits.append(relative)
+        except OSError:
+            continue
+    return hits
+
+
+def _suggested_tests(
+    root: Path,
+    target: str,
+    tokens: List[str],
+    consumers: List[str],
+) -> List[str]:
+    candidates = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if not _is_test_path(path.relative_to(root)):
+            continue
+        if path.suffix not in SOURCE_SUFFIXES:
+            continue
+        candidates.append(path)
+    direct_needles = {
+        Path(target).stem,
+        *tokens,
+    }
+    consumer_needles = {Path(item).stem for item in consumers}
+
+    def contains(text: str, needle: str) -> bool:
+        if not needle:
+            return False
+        if needle.isidentifier():
+            return bool(re.search(rf"\b{re.escape(needle)}\b", text))
+        return needle in text
+
+    def select(needles: set[str]) -> List[str]:
+        selected = []
+        for path in candidates:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            haystack = f"{path.relative_to(root)}\n{text}"
+            if any(contains(haystack, needle) for needle in needles):
+                selected.append(str(path.relative_to(root)))
+        return selected
+
+    selected = select(direct_needles)
+    if not selected:
+        selected = select(consumer_needles)
+    return sorted(selected) or ["<full-suite>"]
 
 
 def _changed_symbols(root: Path, base: str, changed: List[str]) -> dict[str, List[str]]:
@@ -256,19 +636,7 @@ def _changed_symbols(root: Path, base: str, changed: List[str]) -> dict[str, Lis
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        definitions = [
-            (text.count("\n", 0, match.start()) + 1, match.group(1))
-            for match in SOURCE_DEFINITION_RE.finditer(text)
-        ]
-        definitions.extend(
-            (text.count("\n", 0, match.start()) + 1, match.group(1))
-            for match in PUBLIC_ASSIGNMENT_RE.finditer(text)
-        )
-        definitions.extend(
-            (text.count("\n", 0, match.start()) + 1, match.group(1))
-            for match in EXPORT_ASSIGNMENT_RE.finditer(text)
-        )
-        definitions.sort()
+        definitions = _definitions(text, path.suffix)
         if relative in untracked:
             symbols_by_file.setdefault(relative, set()).update(
                 name for _, name in definitions if not name.startswith("_")
@@ -279,6 +647,8 @@ def _changed_symbols(root: Path, base: str, changed: List[str]) -> dict[str, Lis
             if preceding:
                 symbols_by_file.setdefault(relative, set()).add(preceding[-1][1])
     for relative, names in deleted_symbols.items():
+        if Path(relative).suffix == ".swift":
+            continue
         symbols_by_file.setdefault(relative, set()).update(names)
     for relative, lines in deleted_lines.items():
         if not lines:
@@ -287,19 +657,7 @@ def _changed_symbols(root: Path, base: str, changed: List[str]) -> dict[str, Lis
             old_text = _git(root, "show", f"{base}:{relative}")
         except RuntimeError:
             continue
-        old_definitions = [
-            (old_text.count("\n", 0, match.start()) + 1, match.group(1))
-            for match in SOURCE_DEFINITION_RE.finditer(old_text)
-        ]
-        old_definitions.extend(
-            (old_text.count("\n", 0, match.start()) + 1, match.group(1))
-            for match in PUBLIC_ASSIGNMENT_RE.finditer(old_text)
-        )
-        old_definitions.extend(
-            (old_text.count("\n", 0, match.start()) + 1, match.group(1))
-            for match in EXPORT_ASSIGNMENT_RE.finditer(old_text)
-        )
-        old_definitions.sort()
+        old_definitions = _definitions(old_text, Path(relative).suffix)
         for line_number in lines:
             preceding = [entry for entry in old_definitions if entry[0] <= line_number]
             if preceding:
@@ -313,18 +671,55 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
     additions, deletions = _numstat(root, base)
     symbols_by_file = _changed_symbols(root, base, changed)
     symbols = sorted({name for names in symbols_by_file.values() for name in names})
+    entry_points_by_file = {}
+    for relative in changed:
+        path = root / relative
+        texts = []
+        if path.is_file():
+            try:
+                texts.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+        try:
+            texts.append(_git(root, "show", f"{base}:{relative}"))
+        except RuntimeError:
+            pass
+        entries = (
+            []
+            if _is_test_path(relative)
+            else sorted({
+                entry
+                for text in texts
+                for entry in _entry_points(text, path.suffix)
+            })
+        )
+        if entries:
+            entry_points_by_file[relative] = entries
     impacts: List[ImpactItem] = []
     for relative, file_symbols in sorted(symbols_by_file.items()):
         consumers = sorted({
             consumer
             for symbol in file_symbols
-            for consumer in _consumers(root, symbol, {relative})
+            for consumer in _consumers(root, symbol, {relative}, relative)
+        })
+        entries = entry_points_by_file.get(relative, [])
+        consumers = sorted({
+            *consumers,
+            *(
+                consumer
+                for entry in entries
+                for consumer in _literal_consumers(root, entry, {relative})
+            ),
         })
         impacts.append(ImpactItem(
             kind="changed_surface",
             target=relative,
-            reason="改动定义或行为：" + ", ".join(file_symbols),
+            reason=(
+                "改动定义或行为：" + ", ".join(file_symbols)
+                + (f"；动态入口：{', '.join(entries)}" if entries else "")
+            ),
             consumers=consumers,
+            entry_points=entries,
         ))
     # A changed consumer can alter how an unchanged public surface is used.
     for relative in changed:
@@ -338,6 +733,7 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
                 kind="deleted_source",
                 target=relative,
                 reason="源码文件被删除，需要确认其顶层副作用、入口和替代路径",
+                entry_points=entry_points_by_file.get(relative, []),
             ))
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -345,6 +741,12 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
         for symbol in symbols:
             if re.search(rf"\b{re.escape(symbol)}\b", text):
                 referenced.append(symbol)
+        entries = entry_points_by_file.get(relative, [])
+        consumers = sorted({
+            consumer
+            for entry in entries
+            for consumer in _literal_consumers(root, entry, {relative})
+        })
         impacts.append(ImpactItem(
             kind="changed_consumer",
             target=relative,
@@ -353,6 +755,33 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
                 if referenced
                 else "源文件行为发生变化，需要确认其入口和下游影响"
             ),
+            consumers=consumers,
+            entry_points=entries,
+        ))
+    represented = {item.target for item in impacts}
+    for relative in changed:
+        path = root / relative
+        is_behavior = (
+            path.suffix in BEHAVIOR_SUFFIXES
+            or path.name in BEHAVIOR_FILENAMES
+        )
+        if not is_behavior or relative in represented:
+            continue
+        entries = entry_points_by_file.get(relative, [])
+        consumers = sorted({
+            consumer
+            for entry in entries
+            for consumer in _literal_consumers(root, entry, {relative})
+        })
+        impacts.append(ImpactItem(
+            kind="behavioral_file",
+            target=relative,
+            reason=(
+                "路由/构建/配置等行为文件发生变化"
+                + (f"；动态入口：{', '.join(entries)}" if entries else "")
+            ),
+            consumers=consumers,
+            entry_points=entries,
         ))
     represented = {item.target for item in impacts}
     for relative in changed:
@@ -380,12 +809,23 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
             target="deleted-lines",
             reason=f"删除 {deletions} 行，必须说明原逻辑服务对象及替代路径",
         ))
-    if not impacts:
+    if changed and not impacts:
         impacts.append(ImpactItem(
             kind="diff_scope",
             target="changed-files",
             reason="确认完整 diff 与任务目标一致，且无意外文件",
         ))
+    for item in impacts:
+        tokens = [
+            *symbols_by_file.get(item.target, []),
+            *item.entry_points,
+        ]
+        item.suggested_tests = _suggested_tests(
+            root,
+            item.target,
+            tokens,
+            item.consumers,
+        )
 
     score = additions // 40 + deletions // 20 + len(changed) * 3 + len(symbols) * 2
     if any(item.kind == "shared_surface" for item in impacts):
@@ -396,6 +836,7 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
         path = root / relative.strip()
         if path.is_file():
             untracked_hashes[relative.strip()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    no_changes = not changed
     return GlobalReview(
         project_root=str(root),
         base=base,
@@ -420,9 +861,13 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
                         "target": item.target,
                         "reason": item.reason,
                         "consumers": item.consumers,
+                        "entry_points": item.entry_points,
+                        "suggested_tests": item.suggested_tests,
                     }
                     for item in impacts
                 ],
             }, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest(),
+        status="completed" if no_changes else "pending",
+        completed_at=time.time() if no_changes else 0.0,
     )

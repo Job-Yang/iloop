@@ -695,6 +695,15 @@ def test_policy_and_constitution_cannot_be_forged_by_cli_state() -> None:
             )
 
     with tempfile.TemporaryDirectory() as d:
+        import subprocess
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=d, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"],
+                       cwd=d, check=True)
+        (Path(d) / "base.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=d, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=d, check=True)
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
         runtime = Runtime(d, registry, FakePlugin(), project_root=d)
@@ -1036,6 +1045,333 @@ def test_global_review_finds_shared_consumers_and_requires_record() -> None:
               GlobalReview.load(path).fingerprint == "")
 
 
+def test_global_review_uses_task_base_and_explicit_subjects() -> None:
+    import json
+    import subprocess
+    from kernel import (
+        CapabilityResult,
+        CapabilityStatus,
+        Runtime,
+        analyze_global_impact,
+    )
+
+    class FakePlugin:
+        platform_id = "fake"
+        def capabilities(self):
+            return list(Capability)
+        def invoke(self, capability, **kwargs):
+            return CapabilityResult(
+                "fake", capability.value, CapabilityStatus.SUCCESS,
+                "verified", str(evidence_dir), [],
+            )
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "repo"
+        data = Path(d) / "data"
+        evidence_dir = Path(d) / "evidence"
+        root.mkdir()
+        evidence_dir.mkdir()
+        (evidence_dir / "result.log").write_text("ok", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"],
+                       cwd=root, check=True)
+        source = root / "feature.py"
+        source.write_text("def feature():\n    return 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+        base_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        no_diff_review = analyze_global_impact(root, base=base_commit)
+
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        subject_attestation = {"allowed": False}
+
+        def verifier(kind, path, row):
+            return (
+                subject_attestation["allowed"]
+                if kind == "evidence_subjects"
+                else True
+            )
+
+        runtime = Runtime(
+            data, registry, FakePlugin(), project_root=root,
+            attestation_verifier=verifier,
+        )
+        task = runtime.start(
+            "重构公共模块",
+            capabilities=["build"],
+        )
+        source.write_text("def feature():\n    return 2\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "task change"],
+                       cwd=root, check=True)
+        task.project_root = str(data)
+        task.base_commit = "HEAD"
+        review = runtime.prepare_global_review(task, root)
+        task = runtime.execute_capabilities(
+            task,
+            ["build"],
+            subjects="feature.py;tests/test_feature.py",
+        )
+        denied_evidence = runtime.evidence(task.id)[0]
+        subject_attestation["allowed"] = True
+        task = runtime.execute_capabilities(
+            task,
+            ["screenshot"],
+            subjects="feature.py;tests/test_feature.py",
+        )
+        evidence = runtime.evidence(task.id)[-1]
+        wrong_base_rejected = False
+        try:
+            runtime.prepare_global_review(task, root, base="HEAD")
+        except ValueError:
+            wrong_base_rejected = True
+        review.base = "HEAD"
+        review.status = "completed"
+        review.save(task.global_review_path)
+        _, forged_review_blockers = runtime.can_wrapup(task)
+        check("全局复核: Task 创建时固定 Git base_commit",
+              task.base_commit == base_commit
+              and no_diff_review.status == "completed"
+              and no_diff_review.impacts == [])
+        check("全局复核: 改动提交后仍按任务起点发现完整 diff",
+              "feature.py" in review.changed_files)
+        check("全局复核: prepare 和最终 Gate 都不能偷换 base 或伪造完成",
+              wrong_base_rejected
+              and "global review base does not match task base_commit"
+              in forged_review_blockers
+              and any("global review incomplete:" in item
+                      for item in forged_review_blockers))
+        check("全局复核: Capability 显式 subjects 必须经宿主证明",
+              denied_evidence.metadata["subjects"] == []
+              and evidence.metadata["subjects"]
+              == ["feature.py", "tests/test_feature.py"])
+        policy_path = runtime._task_policy_path(task.id)
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        policy.pop("base_commit")
+        policy_path.write_text(json.dumps(policy), encoding="utf-8")
+        task.base_commit = ""
+        Path(task.global_review_path).unlink()
+        _, legacy_blockers = runtime.can_wrapup(task)
+        check("全局复核: 旧 Task 缺不可变基线时结构化阻塞而非抛异常",
+              any("task has no immutable Git base_commit" in item
+                  for item in legacy_blockers))
+
+
+def test_global_review_covers_behavior_dynamic_entries_and_tests() -> None:
+    import subprocess
+    from kernel import analyze_global_impact
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"],
+                       cwd=root, check=True)
+        (root / "Router.m").write_text(
+            '- (void)refreshData { [router registerRoute:@"app://detail"]; }\n',
+            encoding="utf-8",
+        )
+        (root / "Caller.m").write_text(
+            '[router refreshData]; [app openURL:@"app://detail"];\n',
+            encoding="utf-8",
+        )
+        (root / "Unrelated.m").write_text(
+            "- (void)refreshData { NSLog(@\"unrelated\"); }\n",
+            encoding="utf-8",
+        )
+        (root / "Wrapper.m").write_text(
+            "- (void)wrapper { [router refreshData]; }\n",
+            encoding="utf-8",
+        )
+        (root / "Loader.m").write_text(
+            "- (void)load:(id)value\n"
+            "    completion:(id)block\n"
+            "{ return; }\n",
+            encoding="utf-8",
+        )
+        (root / "RealLoaderCaller.m").write_text(
+            "[loader load:value completion:block];\n",
+            encoding="utf-8",
+        )
+        (root / "NestedLoaderCaller.m").write_text(
+            "[loader load:[factory value] completion:block];\n",
+            encoding="utf-8",
+        )
+        (root / "SplitSelector.m").write_text(
+            "[first load:value]; [second completion:block];\n",
+            encoding="utf-8",
+        )
+        (root / "routes.json").write_text(
+            '{"route":"app://detail","enabled":true}\n',
+            encoding="utf-8",
+        )
+        (root / "routes.yaml").write_text(
+            'route: "app://yaml"\n',
+            encoding="utf-8",
+        )
+        (root / "BUILD").write_text(
+            'swift_library(name = "Feature")\n',
+            encoding="utf-8",
+        )
+        (root / "Main.storyboard").write_text(
+            '<view restorationIdentifier="app://detail"/>\n',
+            encoding="utf-8",
+        )
+        tests = root / "tests"
+        tests.mkdir()
+        (tests / "RouterTests.swift").write_text(
+            'func testRefreshData() { refreshData() }\n',
+            encoding="utf-8",
+        )
+        (root / "Feature.swift").write_text(
+            "final class Feature\n"
+            "{\n"
+            "    let title = \"old\"\n"
+            "    let template = \"{ not a scope }\"\n"
+            "    fileprivate var token = \"old\"\n"
+            "    public private(set) var state = 1\n"
+            "    func compute()\n"
+            "    {\n"
+            "        /* outer {\n"
+            "           func phantom() {}\n"
+            "           /* nested } */\n"
+            "           } */\n"
+            "        func helper() -> Int { return 1 }\n"
+            "        let result = 1\n"
+            "        print(result)\n"
+            "    }\n"
+            "}\n"
+            "func topLevel() {\n"
+            "    let localValue = 1\n"
+            "    print(localValue)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        fixtures = root / "Fixtures"
+        fixtures.mkdir()
+        (fixtures / "RouterFixture.m").write_text(
+            'registerRoute(@"app://fixture");\n',
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+        (root / "Router.m").write_text(
+            '- (void)refreshData { [router registerRoute:@"app://detail-v2"]; }\n',
+            encoding="utf-8",
+        )
+        (root / "Caller.m").write_text(
+            '[router refreshData]; [app openURL:@"app://detail-v2"]; '
+            '[app openURL:@"app://yaml-v2"];\n',
+            encoding="utf-8",
+        )
+        (root / "Loader.m").write_text(
+            "- (void)load:(id)value\n"
+            "    completion:(id)block\n"
+            "{ NSLog(@\"v2\"); }\n",
+            encoding="utf-8",
+        )
+        (root / "routes.json").write_text(
+            '{"route":"app://detail-v2","enabled":true}\n',
+            encoding="utf-8",
+        )
+        (root / "routes.yaml").write_text(
+            "route: app://yaml-v2\n",
+            encoding="utf-8",
+        )
+        (root / "BUILD").write_text(
+            'swift_library(name = "FeatureV2")\n',
+            encoding="utf-8",
+        )
+        (root / "Main.storyboard").write_text(
+            '<view restorationIdentifier="app://detail-v2"/>\n',
+            encoding="utf-8",
+        )
+        (root / "Feature.swift").write_text(
+            "final class Feature\n"
+            "{\n"
+            "    let title = \"new\"\n"
+            "    let template = \"{ not a scope }\"\n"
+            "    fileprivate var token = \"new\"\n"
+            "    public private(set) var state = 2\n"
+            "    func compute()\n"
+            "    {\n"
+            "        /* outer {\n"
+            "           func phantom() {}\n"
+            "           /* nested } */\n"
+            "           } */\n"
+            "        func helper() -> Int { return 2 }\n"
+            "        let result = 2\n"
+            "        print(result)\n"
+            "    }\n"
+            "}\n"
+            "func topLevel() {\n"
+            "    let localValue = 2\n"
+            "    print(localValue)\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (fixtures / "RouterFixture.m").write_text(
+            'registerRoute(@"app://fixture-v2");\n',
+            encoding="utf-8",
+        )
+        review = analyze_global_impact(root)
+        router = next(item for item in review.impacts
+                      if item.target == "Router.m")
+        loader = next(item for item in review.impacts
+                      if item.target == "Loader.m")
+        routes = next(item for item in review.impacts
+                      if item.target == "routes.json")
+        yaml_routes = next(item for item in review.impacts
+                           if item.target == "routes.yaml")
+        build_file = next(item for item in review.impacts
+                          if item.target == "BUILD")
+        storyboard = next(item for item in review.impacts
+                          if item.target == "Main.storyboard")
+        check("全局复核: Objective-C selector 和消息式入口找到调用方",
+              "refreshData" in review.changed_symbols
+              and "app://detail-v2" in router.entry_points
+              and "Caller.m" in router.consumers
+              and "Wrapper.m" in router.consumers
+              and "Unrelated.m" not in router.consumers)
+        check("全局复核: Objective-C 多段 selector 限定同一条消息",
+              "load:completion:" in review.changed_symbols
+              and "RealLoaderCaller.m" in loader.consumers
+              and "NestedLoaderCaller.m" in loader.consumers
+              and "SplitSelector.m" not in loader.consumers)
+        check("全局复核: 字符串路由形成动态入口和调用方",
+              "app://detail-v2" in router.entry_points
+              and "routes.json" in router.consumers
+              and "app://yaml-v2" in yaml_routes.entry_points
+              and "Caller.m" in yaml_routes.consumers)
+        check("全局复核: 配置与 iOS 界面行为文件逐项建 impact",
+              routes.kind == "behavioral_file"
+              and storyboard.kind == "behavioral_file"
+              and build_file.kind == "behavioral_file")
+        check("全局复核: 影响项给出确定性测试建议",
+              "tests/RouterTests.swift" in router.suggested_tests)
+        fixture = next(item for item in review.impacts
+                       if item.target == "Fixtures/RouterFixture.m")
+        check("全局复核: Swift 成员属性保留并过滤注释定义与局部变量",
+              "title" in review.changed_symbols
+              and "token" in review.changed_symbols
+              and "state" in review.changed_symbols
+              and "compute" in review.changed_symbols
+              and "phantom" not in review.changed_symbols
+              and "helper" not in review.changed_symbols
+              and "result" not in review.changed_symbols
+              and "localValue" not in review.changed_symbols)
+        check("全局复核: Fixtures/Mocks 不冒充生产动态入口",
+              fixture.entry_points == []
+              and "Fixtures/RouterFixture.m" not in router.consumers)
+
+
 def test_global_review_requires_consumer_evidence() -> None:
     import subprocess
     from kernel import CapabilityResult, CapabilityStatus, GlobalReview, Runtime
@@ -1256,6 +1592,8 @@ def run() -> int:
         test_failure_observation_does_not_pass_gate,
         test_external_acceptance_is_persistent_and_not_self_reviewed,
         test_global_review_finds_shared_consumers_and_requires_record,
+        test_global_review_uses_task_base_and_explicit_subjects,
+        test_global_review_covers_behavior_dynamic_entries_and_tests,
         test_global_review_requires_consumer_evidence,
         test_ui_flow_verification_requires_evidence,
     ]:

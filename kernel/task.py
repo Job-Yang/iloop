@@ -61,6 +61,7 @@ class TaskRecord:
     global_review_path: str = ""
     acceptance_path: str = ""
     project_root: str = ""
+    base_commit: str = ""
     global_review_required: bool = False
     independent_acceptance_required: bool = False
     global_review_status: str = "not_required"

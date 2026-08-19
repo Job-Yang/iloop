@@ -153,7 +153,8 @@ python3 -m cli run "帮我修复下单页崩溃" \
 # 中断或换会话后恢复
 python3 -m cli tasks
 python3 -m cli resume <task_id> caps=build,run,logs \
-  workspace=App.xcworkspace scheme=App sim_udid=<simulator-id>
+  workspace=App.xcworkspace scheme=App sim_udid=<simulator-id> \
+  subjects=Sources/Feature.swift,Tests/FeatureTests.swift
 
 # 查看证据缺口给出的下一动作；重构收口前逐项复核完整 diff
 python3 -m cli next <task_id>
@@ -214,11 +215,11 @@ Agent 会按入口协议自动完成：
 
 版本 `0.0.1`，首发范围是**平台无关内核 + iOS 官方插件**。
 
-- selftest 173 条断言全绿：内核 125 + iOS 插件 48。
+- selftest 185 条断言全绿：内核 137 + iOS 插件 48。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
-- 全局视角读取完整 Git diff，识别公共定义及仓内调用方、共享模块和删除逻辑；L2/L3 改动逐项覆盖定义与调用方，后续补丁会自动让旧结论失效。
-- 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 不能自行伪造可信结论。
+- 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
+- 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 传入的 `subjects` 还需宿主单独证明，不能自行伪造覆盖范围。
 - inputs manifest、Constitution、结构化 blocker、records 和 UI Flow 已进入工程数据层。
 - 模拟器 build/run/install/launch/UI tree/tap/swipe/type/screenshot/probe 统一走 XcodeBuildMCP CLI。
 - `logs` 只归档本次 `run` 绑定的动态日志；没有真实日志时明确失败。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import subprocess
 import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
@@ -106,6 +107,18 @@ class Runtime:
             steps=steps,
         )
         task.project_root = self.project_root
+        if self.project_root:
+            result = subprocess.run(
+                ["git", "-C", self.project_root, "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode:
+                raise ValueError(
+                    "project_root must be a Git worktree for L2/L3 global review"
+                )
+            task.base_commit = result.stdout.strip()
         task.global_review_required = decision["global_review_gate"]
         task.global_review_status = "pending" if task.global_review_required else "not_required"
         task.independent_acceptance_required = decision["acceptance_gate"]
@@ -125,6 +138,7 @@ class Runtime:
                 "flow_id": task.flow_id,
                 "autonomy": task.autonomy,
                 "project_root": task.project_root,
+                "base_commit": task.base_commit,
                 "global_review_required": bool(task.global_review_required),
                 "independent_acceptance_required": bool(
                     task.independent_acceptance_required
@@ -181,6 +195,7 @@ class Runtime:
                     "flow_id": task.flow_id,
                     "autonomy": task.autonomy,
                     "project_root": task.project_root,
+                    "base_commit": task.base_commit,
                     "global_review_required": bool(task.global_review_required),
                     "independent_acceptance_required": bool(
                         task.independent_acceptance_required
@@ -194,7 +209,9 @@ class Runtime:
         if policy.get("task_id") != task.id:
             raise ValueError("task policy task_id mismatch")
         changed = False
-        for field_name in ("title", "flow_id", "autonomy", "project_root"):
+        for field_name in (
+            "title", "flow_id", "autonomy", "project_root", "base_commit"
+        ):
             expected = policy.get(field_name, "")
             if getattr(task, field_name) != expected:
                 setattr(task, field_name, expected)
@@ -383,6 +400,41 @@ class Runtime:
             invoke_kwargs["run_id"] = source_run_id or run_id
             result = self.plugin.invoke(capability, **invoke_kwargs)
             gate_hint = CAPABILITY_GATE_HINT.get(capability)
+            explicit_subjects = kwargs.get("subjects", [])
+            if isinstance(explicit_subjects, str):
+                explicit_subjects = [
+                    item.strip()
+                    for item in explicit_subjects.replace(",", ";").split(";")
+                    if item.strip()
+                ]
+            producer_subjects = [
+                str(item) for item in result.metadata.get("subjects", [])
+            ]
+            attested_subjects = []
+            if explicit_subjects:
+                subject_claim = {
+                    "task_id": task.id,
+                    "run_id": run_id,
+                    "capability": capability.value,
+                    "subjects": sorted(str(item) for item in explicit_subjects),
+                    "evidence_dir": result.evidence_dir,
+                    "status": result.status.value,
+                }
+                claim_dir = self._task_dir(task.id) / "subject-claims"
+                claim_dir.mkdir(parents=True, exist_ok=True)
+                claim_path = claim_dir / f"{len(ledger.rounds)}-{capability.value}.json"
+                claim_path.write_text(
+                    json.dumps(subject_claim, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                if (
+                    self.attestation_verifier is not None
+                    and self.attestation_verifier(
+                        "evidence_subjects", claim_path, subject_claim
+                    )
+                ):
+                    attested_subjects = subject_claim["subjects"]
+            subjects = sorted({*producer_subjects, *attested_subjects})
             evidence = EvidenceArtifact(
                 capability=capability.value,
                 source=result.platform,
@@ -396,7 +448,7 @@ class Runtime:
                     "task_id": task.id,
                     "run_id": run_id,
                     "source_run_id": source_run_id,
-                    "subjects": list(result.metadata.get("subjects", [])),
+                    "subjects": subjects,
                     "device_id": kwargs.get("device_udid") or kwargs.get("sim_udid") or "",
                     "gates": [gate_hint] if gate_hint else [],
                     "flow_id": task.flow_id,
@@ -468,8 +520,22 @@ class Runtime:
         ).hexdigest()
 
     def prepare_global_review(self, task: TaskRecord, project_root: str | Path,
-                              *, base: str = "HEAD") -> GlobalReview:
-        review = analyze_global_impact(project_root, base=base)
+                              *, base: str = "") -> GlobalReview:
+        if self._enforce_policy(task):
+            self.tasks.save(task)
+        resolved_root = str(Path(project_root).resolve())
+        if not task.project_root or resolved_root != task.project_root:
+            raise ValueError(
+                f"global review project_root must match task: {task.project_root}"
+            )
+        expected_base = task.base_commit
+        if not expected_base:
+            raise ValueError("task has no immutable Git base_commit")
+        if base and base != expected_base:
+            raise ValueError(
+                f"global review base must match task base_commit: {expected_base}"
+            )
+        review = analyze_global_impact(resolved_root, base=expected_base)
         review.save(task.global_review_path)
         task.global_review_required = True
         task.global_review_status = review.status
@@ -509,7 +575,19 @@ class Runtime:
             return {"kind": "task_step", "target": next_step.title,
                     "capability": next_step.capability}
         if task.global_review_required and task.global_review_status != "completed":
-            return {"kind": "global_review", "target": task.global_review_path}
+            suggested_tests = []
+            if Path(task.global_review_path).is_file():
+                review = GlobalReview.load(task.global_review_path)
+                suggested_tests = sorted({
+                    test
+                    for impact in review.pending()
+                    for test in impact.suggested_tests
+                })
+            return {
+                "kind": "global_review",
+                "target": task.global_review_path,
+                "suggested_tests": suggested_tests,
+            }
         if task.independent_acceptance_required and task.acceptance_status != "pass":
             return {"kind": "independent_acceptance", "target": task.acceptance_path}
         return {"kind": "wrapup", "target": task.id}
@@ -553,7 +631,7 @@ class Runtime:
                     review.save(task.global_review_path)
                     task.global_review_status = "completed"
                     self.tasks.save(task)
-            except (RuntimeError, OSError) as error:
+            except (RuntimeError, OSError, ValueError) as error:
                 blockers.append(f"global review preparation failed: {error}")
         for index, step in enumerate(task.steps, 1):
             if step.status != StepStatus.DONE:
@@ -642,18 +720,41 @@ class Runtime:
                 blockers.append("global review has not been prepared")
             else:
                 review = GlobalReview.load(task.global_review_path)
+                expected_root = str(Path(task.project_root).resolve())
+                if review.project_root != expected_root:
+                    blockers.append(
+                        "global review project_root does not match task"
+                    )
+                if review.base != task.base_commit:
+                    blockers.append(
+                        "global review base does not match task base_commit"
+                    )
                 try:
                     current_review = analyze_global_impact(
-                        task.project_root or review.project_root, base=review.base
+                        expected_root, base=task.base_commit
                     )
                     if current_review.fingerprint != review.fingerprint:
                         blockers.append("global review is stale: project diff changed after review")
                     current_scope = [
-                        (item.kind, item.target, item.reason, tuple(item.consumers))
+                        (
+                            item.kind,
+                            item.target,
+                            item.reason,
+                            tuple(item.consumers),
+                            tuple(item.entry_points),
+                            tuple(item.suggested_tests),
+                        )
                         for item in current_review.impacts
                     ]
                     saved_scope = [
-                        (item.kind, item.target, item.reason, tuple(item.consumers))
+                        (
+                            item.kind,
+                            item.target,
+                            item.reason,
+                            tuple(item.consumers),
+                            tuple(item.entry_points),
+                            tuple(item.suggested_tests),
+                        )
                         for item in review.impacts
                     ]
                     if current_scope != saved_scope:
@@ -662,7 +763,7 @@ class Runtime:
                         )
                 except (RuntimeError, OSError) as error:
                     blockers.append(f"cannot refresh global review fingerprint: {error}")
-                if review.status != "completed":
+                if review.status != "completed" or review.pending():
                     blockers.append(
                         "global review incomplete: " +
                         ", ".join(item.target for item in review.pending())

@@ -16,7 +16,7 @@
 - 用户要"记住/沉淀"时：工程规范红线→constitution，复现坑+解法→lessons，业务知识→inputs。同一条别塞多层。
 
 ## 收口标准
-- **先看整体，再判局部**：L2/L3 收口前必须执行 `global-review prepare <task_id> project_root=<工程根>`。它读取完整 diff，枚举改动公共定义、仓内调用方、共享边界与删除逻辑；再用 `global-review record` 为每个影响项绑定回归/测试证据，或由用户显式接受风险。任何 pending 项都会让 `wrapup` 失败。删/改公共逻辑必须回答“原来服务谁、现在哪条路径替代、哪些调用方已验证”。
+- **先看整体，再判局部**：L2/L3 的 Task 创建时固定 Git commit；收口前执行 `global-review prepare <task_id> project_root=<工程根>`，且不得偷换 base。它读取任务期完整 diff，枚举公共定义、Objective-C selector、动态入口、行为配置、仓内调用方、共享边界与删除逻辑，并给出受影响测试建议；再用 `global-review record` 为每个影响项绑定带宿主证明 `subjects` 的回归/测试证据，或由用户显式接受风险。任何 pending 项都会让 `wrapup` 失败。
 - **复核结论绑定完整 diff fingerprint**：全局复核和独立验收完成后如果又改了代码，旧结论自动失效，必须基于新 diff 重跑；禁止“先验收、后补丁、沿用绿灯”。
 - **收口是代码 Gate，不是荣誉制**：`wrapup` 同时检查 Task 步骤证据、Capability Gate 回读、Case resolved、时间/范围/机制/反证四关、全局复核和必要的外部验收；缺任何一项都拒绝。
 - Feature：编译 + 关键路径运行态证据 + 截图/日志 + 边界。Bugfix：复现 + 根因 + 修复 diff + 修复后证据。Runtime Debug：证据目录 + 结论（client/server/config/env/needs_more）。Refactor：行为基线 + 编译/测试 + 关键入口回归。Environment：doctor + 修复 + 避免方式。

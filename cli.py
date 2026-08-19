@@ -407,7 +407,11 @@ def cmd_global_review(action: str, task_id: str, rest: list[str]) -> int:
         if not project_root:
             print("global-review prepare requires project_root=... or ILOOP_PROJECT_ROOT")
             return 2
-        review = runtime.prepare_global_review(task, project_root, base=values.get("base", "HEAD"))
+        review = runtime.prepare_global_review(
+            task,
+            project_root,
+            base=values.get("base", ""),
+        )
     else:
         if not Path(task.global_review_path).exists():
             print(render("blocked", "global review has not been prepared"))
