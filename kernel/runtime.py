@@ -61,6 +61,7 @@ class Runtime:
         self.tasks = TaskStore(self.data_dir)
 
     def _task_dir(self, task_id: str) -> Path:
+        TaskStore.validate_id(task_id)
         path = self.data_dir / "runtime" / task_id
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -88,7 +89,8 @@ class Runtime:
 
     def start(self, title: str, *, constraints: Optional[list[str]] = None,
               acceptance: Optional[list[str]] = None,
-              capabilities: Optional[Iterable[str]] = None) -> TaskRecord:
+              capabilities: Optional[Iterable[str]] = None,
+              executor_id: str = "") -> TaskRecord:
         decision = self.registry.plan_details(title)
         flow = decision["flow"]
         if flow is None:
@@ -107,6 +109,7 @@ class Runtime:
             steps=steps,
         )
         task.project_root = self.project_root
+        task.executor_id = executor_id.strip()
         if self.project_root:
             result = subprocess.run(
                 ["git", "-C", self.project_root, "rev-parse", "HEAD"],
@@ -139,6 +142,7 @@ class Runtime:
                 "autonomy": task.autonomy,
                 "project_root": task.project_root,
                 "base_commit": task.base_commit,
+                "executor_id": task.executor_id,
                 "global_review_required": bool(task.global_review_required),
                 "independent_acceptance_required": bool(
                     task.independent_acceptance_required
@@ -196,6 +200,7 @@ class Runtime:
                     "autonomy": task.autonomy,
                     "project_root": task.project_root,
                     "base_commit": task.base_commit,
+                    "executor_id": task.executor_id,
                     "global_review_required": bool(task.global_review_required),
                     "independent_acceptance_required": bool(
                         task.independent_acceptance_required
@@ -210,7 +215,8 @@ class Runtime:
             raise ValueError("task policy task_id mismatch")
         changed = False
         for field_name in (
-            "title", "flow_id", "autonomy", "project_root", "base_commit"
+            "title", "flow_id", "autonomy", "project_root", "base_commit",
+            "executor_id",
         ):
             expected = policy.get(field_name, "")
             if getattr(task, field_name) != expected:
@@ -782,6 +788,15 @@ class Runtime:
                     if invalid:
                         blockers.append(
                             f"global review {impact.target} has invalid evidence: {invalid}"
+                        )
+                    stale = [
+                        item for item in impact.evidence_ids
+                        if item in evidence_by_id
+                        and evidence_by_id[item].created_at < review.created_at
+                    ]
+                    if stale:
+                        blockers.append(
+                            f"global review {impact.target} uses evidence older than the review: {stale}"
                         )
                     if impact.status == "verified":
                         subjects = {

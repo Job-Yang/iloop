@@ -294,7 +294,7 @@ class WDAManager:
             if pid > 0 and self._pid_matches(
                 pid, marker, str(state.get(identity_key, ""))
             ):
-                os.kill(pid, signal.SIGTERM)
+                self._terminate_pid_tree(pid)
                 stopped.append(pid)
         self._write_state({})
         return {"stopped": stopped}
@@ -411,7 +411,46 @@ class WDAManager:
     def _terminate_process(process: subprocess.Popen | None) -> None:
         if process is None or process.poll() is not None:
             return
-        process.terminate()
+        WDAManager._terminate_pid_tree(process.pid, process)
+
+    @staticmethod
+    def _terminate_pid_tree(
+        pid: int,
+        process: subprocess.Popen | None = None,
+    ) -> None:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                if process is not None:
+                    process.kill()
+            if process is not None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            return
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            if process is not None:
+                process.terminate()
+        if process is not None:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            return
+        if process is None:
+            return
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:

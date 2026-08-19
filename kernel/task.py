@@ -60,6 +60,7 @@ class TaskRecord:
     capability_gate_path: str = ""
     global_review_path: str = ""
     acceptance_path: str = ""
+    executor_id: str = ""
     project_root: str = ""
     base_commit: str = ""
     global_review_required: bool = False
@@ -118,7 +119,15 @@ class TaskStore:
         return record
 
     def path_for(self, task_id: str) -> Path:
+        self.validate_id(task_id)
         return self.root / f"{task_id}.json"
+
+    @staticmethod
+    def validate_id(task_id: str) -> str:
+        value = str(task_id)
+        if not re.fullmatch(r"[\w-]{1,160}", value):
+            raise ValueError("task_id must contain only word characters, '_' or '-'")
+        return value
 
     def save(self, task: TaskRecord) -> Path:
         task.updated_at = time.time()

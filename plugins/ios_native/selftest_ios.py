@@ -25,6 +25,7 @@ from plugins.ios_native.wda_manager import (  # noqa: E402
     WDA_REPOSITORY,
     WDA_VERSION,
 )
+from plugins.ios_native.evidence_writer import EvidenceWriter  # noqa: E402
 
 
 class FakeRunner:
@@ -427,6 +428,17 @@ def test_screenshot_accepts_structured_success_and_keeps_evidence_dir() -> None:
         )
 
 
+def test_evidence_directories_do_not_collide() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        writer = EvidenceWriter(d)
+        first = writer._dir("tap")
+        second = writer._dir("tap")
+        check(
+            "证据: 同秒重复能力调用使用不同目录",
+            first != second and first.is_dir() and second.is_dir(),
+        )
+
+
 def test_runtime_logs_are_bound_to_latest_run() -> None:
     with tempfile.TemporaryDirectory() as d:
         runtime_log = Path(d) / "App runtime.log"
@@ -699,6 +711,34 @@ def test_wda_prepare_failure_cleans_processes() -> None:
         check("WDA: 第二进程启动中断清理已启动 runner", startup_process.terminated)
 
 
+def test_wda_cleanup_targets_process_group() -> None:
+    class FakeProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            raise AssertionError("process-group cleanup should be preferred")
+
+        def kill(self):
+            raise AssertionError("process-group cleanup should be preferred")
+
+    signals = []
+    with mock.patch(
+        "plugins.ios_native.wda_manager.os.killpg",
+        side_effect=lambda pid, signal_value: signals.append((pid, signal_value)),
+    ):
+        WDAManager._terminate_process(FakeProcess())
+    check(
+        "WDA: cleanup terminates the dedicated process group",
+        signals == [(4321, __import__("signal").SIGTERM), (4321, __import__("signal").SIGKILL)],
+    )
+
+
 def test_wda_status_binds_endpoint_to_managed_processes() -> None:
     with tempfile.TemporaryDirectory() as d:
         manager = WDAManager(d, device_udid="DEVICE-1", team_id="TEAM123")
@@ -785,10 +825,12 @@ def run() -> int:
         test_plugin_never_crashes_kernel,
         test_xcodebuildmcp_json_artifact_path,
         test_screenshot_accepts_structured_success_and_keeps_evidence_dir,
+        test_evidence_directories_do_not_collide,
         test_runtime_logs_are_bound_to_latest_run,
         test_wda_actions_share_managed_endpoint,
         test_wda_manager_uses_pinned_source_and_managed_command,
         test_wda_prepare_failure_cleans_processes,
+        test_wda_cleanup_targets_process_group,
         test_wda_status_binds_endpoint_to_managed_processes,
     ]:
         fn()

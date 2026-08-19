@@ -103,6 +103,7 @@ class AcceptancePackage:
     criteria: List[str]                       # 可验证硬指标
     evidence: List[EvidenceArtifact] = field(default_factory=list)
     subject_fingerprint: str = ""
+    executor_id: str = ""
     review_token: str = ""
     package_id: str = ""
     status: str = "prepared"
@@ -125,6 +126,7 @@ class AcceptancePackage:
             "criteria": list(self.criteria),
             "evidence": [item.to_dict() for item in self.evidence],
             "subject_fingerprint": self.subject_fingerprint,
+            "executor_id": self.executor_id,
             "review_token": self.review_token,
             "status": self.status,
             "created_at": self.created_at,
@@ -254,6 +256,11 @@ class AcceptanceStore:
         reviewer = str(row["reviewer"]).strip()
         if not reviewer:
             raise ValueError("review result requires reviewer identity")
+        executor_id = str(package.get("executor_id", "")).strip()
+        if not executor_id:
+            raise ValueError("acceptance package lacks a host-attested executor identity")
+        if reviewer == executor_id:
+            raise ValueError("independent reviewer must differ from task executor")
         reasons = list(row["reasons"])
         if not reasons:
             raise ValueError("review result requires reasons")
@@ -317,6 +324,8 @@ class AcceptanceStore:
             or artifact_row.get("review_token") != package.get("review_token")
             or artifact_row.get("subject_fingerprint") != package.get("subject_fingerprint")
             or artifact_row.get("reviewer") != result.reviewer
+            or not str(package.get("executor_id", "")).strip()
+            or artifact_row.get("reviewer") == package.get("executor_id")
             or artifact_row.get("verdict") != result.verdict.value
             or float(artifact_row.get("expires_at", 0)) <= time.time()
         ):

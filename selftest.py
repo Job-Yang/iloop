@@ -42,6 +42,7 @@ from kernel import (  # noqa: E402
     StdoutNotifier,
     Event,
     CapabilityGate,
+    TaskStore,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
 
@@ -198,6 +199,17 @@ def test_lesson_recall() -> None:
         hits = book.search("index.lock")
         check("错题本: 关键词召回命中", len(hits) == 1)
         check("错题本: 未命中查询返回空", book.search("完全无关xyz") == [])
+
+
+def test_task_ids_cannot_escape_data_dir() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        store = TaskStore(d)
+        rejected = False
+        try:
+            store.path_for("../../outside")
+        except ValueError:
+            rejected = True
+        check("任务: task_id 不能越出 data 目录", rejected)
 
 
 def test_four_gate() -> None:
@@ -426,7 +438,7 @@ def test_channel_and_gate() -> None:
 def test_extension_mechanism() -> None:
     from kernel import (scaffold_extension, load_extension, validate_extension,
                         has_errors, merge_into_registry, FlowRegistry,
-                        load_extension_plugin)
+                        load_extension_plugin, load_installed_plugins)
     with tempfile.TemporaryDirectory() as d:
         ext = scaffold_extension("team.oncall", d)
         loaded = load_extension(ext.root)
@@ -456,6 +468,14 @@ def test_extension_mechanism() -> None:
         plugin = load_extension_plugin(load_extension(ext.root))
         check("扩展: 声明式 Capability Plugin 可动态加载",
               plugin is not None and plugin.platform_id == "team_demo")
+        bad = Path(d) / "team.bad"
+        bad.mkdir()
+        (bad / "manifest.json").write_text("{broken", encoding="utf-8")
+        plugins = load_installed_plugins(d)
+        check(
+            "扩展: 损坏相邻扩展不阻断合法插件加载",
+            any(item.platform_id == "team_demo" for item in plugins),
+        )
 
 
 def test_extension_cannot_clobber_core() -> None:
@@ -1023,6 +1043,7 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
         package = store.prepare(AcceptancePackage(
             "case-a", "目标", ["标准"],
             [observed("标准通过", capability="build")],
+            executor_id="main-agent",
         ))
         result_path = Path(d) / "review.json"
         result_row = {
@@ -1043,6 +1064,15 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
             rejected = True
         result_row["review_token"] = package.review_token
         result_path.write_text(__import__("json").dumps(result_row), encoding="utf-8")
+        self_review_rejected = False
+        try:
+            result_row["reviewer"] = "main-agent"
+            result_path.write_text(__import__("json").dumps(result_row), encoding="utf-8")
+            store.record_file(result_path, verify_attestation=lambda path, row: True)
+        except ValueError:
+            self_review_rejected = True
+        result_row["reviewer"] = "external-agent"
+        result_path.write_text(__import__("json").dumps(result_row), encoding="utf-8")
         no_attestation = False
         try:
             store.record_file(result_path)
@@ -1057,6 +1087,7 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
         )
         check("独立验收: 无 challenge token 的伪回写被拒绝", rejected)
         check("独立验收: 无可信宿主 attestation 时 fail closed", no_attestation)
+        check("独立验收: 执行者不能给自己验收", self_review_rejected)
         check("独立验收: 外部结果文件及哈希持久化",
               result.verdict == Verdict.PASS and restored is not None
               and restored.reviewer == "external-agent"
@@ -1079,6 +1110,7 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
         expired_package = AcceptancePackage(
             "case-expired", "目标", ["标准"],
             [observed("标准通过")],
+            executor_id="main-agent",
             expires_at=time.time() - 1,
         )
         expired_store.prepare(expired_package)
@@ -1575,6 +1607,14 @@ def test_global_review_requires_consumer_evidence() -> None:
         check("全局复核: 只验证定义文件不能跳过调用方",
               any("app/use.py" in blocker and "uncovered subjects" in blocker
                   for blocker in blockers))
+        evidence.created_at = review.created_at - 1
+        runtime._append_evidence(task.id, evidence)
+        _, stale_blockers = runtime.can_wrapup(task)
+        check(
+            "全局复核: 改动前证据不能关闭当前 review",
+            any("uses evidence older than the review" in blocker
+                for blocker in stale_blockers),
+        )
         tampered_review = GlobalReview.load(task.global_review_path)
         tampered_review.impacts.pop()
         tampered_review.save(task.global_review_path)
@@ -1701,6 +1741,7 @@ def run() -> int:
         test_flow_no_clobber,
         test_flow_plan_routing,
         test_lesson_recall,
+        test_task_ids_cannot_escape_data_dir,
         test_four_gate,
         test_experts_are_platform_free,
         test_expert_routing,

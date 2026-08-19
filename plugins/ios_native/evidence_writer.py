@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -19,7 +20,9 @@ class EvidenceWriter:
         self.root = Path(data_dir) / "evidence"
 
     def _dir(self, capability: str) -> Path:
-        d = self.root / f"{capability}-{time.strftime('%Y%m%d-%H%M%S')}"
+        d = self.root / (
+            f"{capability}-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:12]}"
+        )
         d.mkdir(parents=True, exist_ok=True)
         return d
 

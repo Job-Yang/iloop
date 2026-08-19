@@ -47,8 +47,8 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "name": name,
-        "version": "0.1.0",
-        "iloop_kernel": ">=0.1.0",
+        "version": "0.1.1",
+        "iloop_kernel": ">=0.1.1",
         "description": f"{name} iLoop extension",
         "provides": {"flows": FLOWS_NAME, "plugin": None},
     }
@@ -188,7 +188,10 @@ def load_installed_plugins(base_dir: str | Path, config: Optional[dict] = None) 
     for root in sorted(path for path in base.iterdir() if path.is_dir()):
         if not (root / MANIFEST_NAME).exists():
             continue
-        plugin = load_extension_plugin(load_extension(root), config)
+        try:
+            plugin = load_extension_plugin(load_extension(root), config)
+        except Exception:
+            continue
         if plugin is not None:
             plugins.append(plugin)
     return plugins

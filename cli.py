@@ -110,6 +110,7 @@ def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
         constraints=_split(kwargs.pop("constraints", "")),
         acceptance=_split(kwargs.pop("acceptance", "")),
         capabilities=capabilities,
+        executor_id=kwargs.pop("executor_id", ""),
     )
     if capabilities:
         task = runtime.execute_capabilities(task, capabilities, **kwargs)
@@ -169,6 +170,11 @@ def cmd_lessons(action: str, rest: list[str]) -> int:
 
 
 def cmd_round(action: str, task_id: str, text: str = "") -> int:
+    try:
+        TaskStore.validate_id(task_id)
+    except ValueError as error:
+        print(render("blocked", str(error)))
+        return 1
     runtime_dir = _data_dir() / "runtime" / task_id
     ledger = Ledger.load(runtime_dir)
     if action == "start":
@@ -255,6 +261,11 @@ def cmd_task(action: str, rest: list[str]) -> int:
 
 
 def cmd_case(action: str, task_id: str) -> int:
+    try:
+        TaskStore.validate_id(task_id)
+    except ValueError as error:
+        print(render("blocked", str(error)))
+        return 1
     path = _data_dir() / "runtime" / task_id / "case.json"
     case = Case.load(path)
     if action == "show":
@@ -431,6 +442,16 @@ def cmd_global_review(action: str, task_id: str, rest: list[str]) -> int:
             if invalid:
                 print(render("blocked", f"全局复核只接受成功 observed evidence: {invalid}"))
                 return 1
+            stale = [
+                item for item in evidence_ids
+                if evidence_by_id[item].created_at < review.created_at
+            ]
+            if stale:
+                print(render(
+                    "blocked",
+                    f"全局复核证据必须生成于本次 review 之后: {stale}",
+                ))
+                return 1
             unrelated = [
                 item for item in evidence_ids
                 if values.get("target", "")
@@ -490,6 +511,7 @@ def cmd_accept(action: str, task_id: str, rest: list[str]) -> int:
             criteria=task.acceptance or ["目标与完整 diff 一致", "关键路径有成功 observed 证据"],
             evidence=runtime.evidence(task.id),
             subject_fingerprint=fingerprint,
+            executor_id=task.executor_id,
         )
         store.prepare(package)
         task.independent_acceptance_required = True

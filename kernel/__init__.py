@@ -91,4 +91,4 @@ __all__ = [
     "UIFlow", "UINode", "UIFlowStore", "ACTION_CAPABILITY",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

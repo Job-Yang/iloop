@@ -1,5 +1,9 @@
 # iLoop
 
+<p align="center">
+  <img src="assets/iloop-mascot.png" alt="iLoop mascot: an agent that verifies work through feedback loops" width="960">
+</p>
+
 > 让 AI 像程序员一样，在真实反馈里一轮轮修正；说“完成”之前，先拿证据自证。
 
 iLoop 是一层给研发 Agent 使用的**反馈闭环底座**。
@@ -49,7 +53,7 @@ iLoop 不是另一个更会生成代码的模型。它给现有 Agent 补上研�
 - 模拟器与真机的 build / install / launch
 - 截图、UI 层级树、日志和 crash report
 - 基于 Appium WebDriverAgent 的真机 UI 自动化
-- 可复用 UI Flow，以及 Task/Case/Capability Gate/独立验收/全局复核的硬收口
+- 可复用 UI Flow（`verified` 由宿主证明的运行态证据写入），以及 Task/Case/Capability Gate/独立验收/全局复核的硬收口
 - 本机 Xcode 自动发现，不依赖全局 `xcode-select`
 
 ---
@@ -164,7 +168,7 @@ python3 -m cli global-review prepare <task_id> project_root=$ILOOP_PROJECT_ROOT
 python3 -m cli accept prepare <task_id>
 ```
 
-独立验收身份属于宿主信任边界。普通 CLI 进程不可信，`accept record` 默认拒绝回写；宿主必须在进程外验证 reviewer 身份，再通过 `AcceptanceStore.record_file(..., verify_attestation=...)` API 写入。仅填写 reviewer 名称或设置环境变量都不算独立验收。
+独立验收身份属于宿主信任边界。普通 CLI 进程不可信，`accept record` 默认拒绝回写；宿主必须在创建任务时提供并证明执行者身份，另行证明 reviewer 身份不同于执行者后，才能通过 `AcceptanceStore.record_file(..., verify_attestation=...)` API 写入。仅填写 reviewer 名称或设置环境变量都不算独立验收。
 
 同理，CLI 不能手工写 observed evidence、用户确认、平台完成/取消。`trusted_producer` 只是来源声明，不是身份证明；Plugin receipt、Task 创建策略和 Capability requirements 都必须由进程外宿主 verifier 复验。未接入受信宿主回调时可以执行和取证，但 `wrapup` 保持 blocked。
 
@@ -213,9 +217,9 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.1.0`，首发范围是**平台无关内核 + iOS 官方插件**。
+版本 `0.1.1`，首发范围是**平台无关内核 + iOS 官方插件**。
 
-- selftest 200 条断言全绿：内核 144 + iOS 插件 56。
+- selftest 206 条断言全绿：内核 148 + iOS 插件 58。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
 - 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
@@ -225,6 +229,6 @@ Agent 会按入口协议自动完成：
 - 已用 XcodeBuildMCP 生成公开结构的 SwiftUI fixture，真实跑通模拟器 build-and-run、UI tree、截图、tap 和本次 run 绑定日志。
 - `logs` 只归档本次 `run` 绑定的动态日志；没有真实日志时明确失败。
 - 真机 build/install/launch 走 XcodeBuildMCP；固定版本、官方 commit 与 origin 的公开 WDA 由 `ui_prepare/ui_status/ui_stop` 管理；crash 走 `devicectl`。
-- 已知缺口：当前验收机未连接可用 iPhone，WDA 真机 E2E 尚待设备与签名环境；真机语义 elementRef 尚未与模拟器统一。
+- 真机已发现并验证到一台已配对的 iPhone；设备构建已进入 provisioning 阶段。完整真机 build/install/launch/WDA E2E 仍等待有效 Apple Developer 登录态创建 `dev.iloop.e2e` 的 development profile；真机动作目前使用 WDA 坐标，不与模拟器的语义 `elementRef` 冒充一致。
 
 MIT License。欢迎使用、修改和二次开发。
