@@ -33,7 +33,7 @@ from .channel import (
     Event, EventSource, Notifier, StdoutNotifier, WebhookNotifier, StaticEventSource,
 )
 from .gate_capability import CapabilityGate, RequiredOperation, OpStatus
-from .runner import CommandRunner, CommandOutput, discover_developer_dir
+from .runner import CommandRunner, CommandOutput
 from .extension import (
     Extension, scaffold_extension, load_extension, validate_extension,
     merge_into_registry, load_installed_extensions, load_extension_plugin,
@@ -48,6 +48,22 @@ from .runtime import Runtime
 from .global_review import GlobalReview, ImpactItem, analyze_global_impact
 from .project import ProjectMemory
 from .ui_flow import UIFlow, UINode, UIFlowStore, ACTION_CAPABILITY
+
+
+def discover_developer_dir():
+    """Deprecated compatibility facade for the former kernel export."""
+    import warnings
+    warnings.warn(
+        "kernel.discover_developer_dir is deprecated; use "
+        "plugins.ios_native.environment.discover_developer_dir",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    from plugins.ios_native.environment import (
+        discover_developer_dir as discover,
+    )
+    return discover()
+
 
 __all__ = [
     "EvidenceArtifact", "EvidenceKind",
@@ -75,4 +91,4 @@ __all__ = [
     "UIFlow", "UINode", "UIFlowStore", "ACTION_CAPABILITY",
 ]
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"

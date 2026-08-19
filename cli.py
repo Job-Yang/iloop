@@ -700,7 +700,10 @@ def cmd_experts(task: str) -> int:
 
 
 def cmd_doctor(real: bool) -> int:
-    plugin = IOSNativePlugin(mode="real" if real else "simulator")
+    plugin = IOSNativePlugin(
+        mode="real" if real else "simulator",
+        data_dir=str(_data_dir() / "platform"),
+    )
     res = plugin.invoke(Capability.DOCTOR)
     icon = "✅" if res.ok() else "⛔"
     print(render("connect", f"{icon} [{res.platform}] {res.summary}"))
@@ -713,7 +716,12 @@ def cmd_invoke(cap_name: str, real: bool, kwargs: dict) -> int:
     except ValueError:
         print(f"unknown capability: {cap_name}；可选: {[c.value for c in Capability]}")
         return 2
-    plugin = IOSNativePlugin(mode="real" if real else "simulator", config=kwargs)
+    project_root = kwargs.get("project_root", "")
+    plugin = IOSNativePlugin(
+        mode="real" if real else "simulator",
+        data_dir=str(_data_dir(project_root) / "platform"),
+        config=kwargs,
+    )
     res = plugin.invoke(cap, **kwargs)
     icon = {"success": "✅", "unsupported": "⚠️", "error": "⛔"}[res.status.value]
     print(render("build" if cap == Capability.BUILD else "evidence",

@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from kernel.capability import Capability, CapabilityResult, CapabilityStatus, unsupported
-from kernel.runner import CommandRunner
+from kernel.runner import CommandOutput, CommandRunner
 from kernel.evidence import EvidenceKind
+from .environment import discover_developer_dir
 from .evidence_writer import EvidenceWriter
 from .wda_client import WDAClient
 from .wda_manager import WDAManager
@@ -44,7 +45,24 @@ class IOSNativePlugin:
                  wda: Optional[WDAClient] = None) -> None:
         self.mode = mode  # "simulator" | "real"
         self.config = config or {}
-        self.runner = runner or CommandRunner()
+        runner_environment = (
+            getattr(runner, "environment_overrides", {})
+            if runner is not None
+            else {}
+        )
+        self.developer_dir = (
+            getattr(runner, "developer_dir", None)
+            or runner_environment.get("DEVELOPER_DIR")
+            if runner is not None
+            else discover_developer_dir()
+        )
+        self.runner = runner or CommandRunner(
+            environment_overrides=(
+                {"DEVELOPER_DIR": self.developer_dir}
+                if self.developer_dir
+                else {}
+            )
+        )
         self.writer = EvidenceWriter(data_dir)
         self.state_dir = Path(data_dir) / "state"
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -111,8 +129,7 @@ class IOSNativePlugin:
                                           else "ios-simulator"})
 
     def _has_full_xcode(self) -> bool:
-        # 不只信全局 xcode-select：runner 已通过 discover_developer_dir 自愈到已装 Xcode
-        return getattr(self.runner, "developer_dir", None) is not None
+        return self.developer_dir is not None
 
     def _wda_manager(self) -> WDAManager:
         manager = WDAManager(
@@ -156,21 +173,86 @@ class IOSNativePlugin:
             elif isinstance(value, list):
                 stack.extend(value)
             elif isinstance(value, str) and value.endswith(suffix):
-                path = Path(value)
+                path = Path(value).expanduser()
                 if path.exists():
                     return path
         line_match = re.search(
-            rf"(?:runtime\s+log|log\s+path|path)\s*[:=]\s*(.+{re.escape(suffix)})\s*$",
+            rf"(?:runtime\s+logs?|log\s+path|path)\s*[:=]\s*"
+            rf"([^\n]+{re.escape(suffix)})\s*$",
             text or "",
             re.IGNORECASE | re.MULTILINE,
         )
         if line_match:
-            path = Path(line_match.group(1).strip().strip("'\""))
+            path = Path(
+                line_match.group(1).strip().strip("'\"")
+            ).expanduser()
             if path.exists():
                 return path
-        candidates = re.findall(r"(?:/[^ \n]+)+" + re.escape(suffix), text or "")
-        return next((Path(candidate) for candidate in reversed(candidates)
-                     if Path(candidate).exists()), None)
+        candidates = re.findall(
+            r"(?:~|/)[^\s\"']*?" + re.escape(suffix),
+            text or "",
+        )
+        return next(
+            (
+                Path(candidate).expanduser()
+                for candidate in reversed(candidates)
+                if Path(candidate).expanduser().exists()
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _structured_success(text: str) -> bool:
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return (
+            isinstance(payload, dict)
+            and payload.get("didError") is False
+            and payload.get("data", {}).get("summary", {}).get("status")
+            == "SUCCEEDED"
+        )
+
+    @staticmethod
+    def _snapshot_targets(text: str) -> dict[str, str]:
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        targets = payload.get("data", {}).get("capture", {}).get("targets", [])
+        result = {}
+        for target in targets:
+            if not isinstance(target, str) or "|" not in target:
+                continue
+            reference, signature = target.split("|", 1)
+            if reference and signature:
+                result[reference] = signature
+        return result
+
+    def _snapshot_state_path(self, udid: str) -> Path:
+        safe_udid = re.sub(r"[^A-Za-z0-9_.-]", "_", udid)
+        return self.state_dir / f"snapshot-{safe_udid}.json"
+
+    def _save_snapshot_targets(self, udid: str, text: str) -> None:
+        targets = self._snapshot_targets(text)
+        if targets:
+            self._snapshot_state_path(udid).write_text(
+                json.dumps({"udid": udid, "targets": targets}, indent=2),
+                encoding="utf-8",
+            )
+
+    def _load_snapshot_targets(self, udid: str) -> dict[str, str]:
+        path = self._snapshot_state_path(udid)
+        if not path.is_file():
+            return {}
+        row = json.loads(path.read_text(encoding="utf-8"))
+        if row.get("udid") != udid:
+            return {}
+        return {
+            str(reference): str(signature)
+            for reference, signature in row.get("targets", {}).items()
+        }
 
     # ---- DOCTOR ----
     def _doctor(self, **_) -> CapabilityResult:
@@ -320,23 +402,52 @@ class IOSNativePlugin:
     # ---- SCREENSHOT ----
     def _screenshot(self, *, udid: str = "", out_path: str = "") -> CapabilityResult:
         edir = self.writer._dir("screenshot")
-        png = out_path or str(Path(edir) / "shot.png")
+        image_path = Path(out_path) if out_path else None
         if self.mode == "simulator":
             udid = udid or self.config.get("sim_udid", "booted")
             out = self.runner.run(
                 [self._xb(), "ui-automation", "screenshot", "--simulator-id", udid,
                  "--return-format", "path", "--output", "json"],
-                timeout=60,
+                timeout=120,
             )
-            source = self._artifact_path(out.stdout or out.combined, ".png")
+            output = out.stdout or out.combined
+            source = next(
+                (
+                    found
+                    for suffix in (".png", ".jpg", ".jpeg")
+                    if (found := self._artifact_path(output, suffix))
+                ),
+                None,
+            )
             if source:
-                shutil.copy2(source, png)
-            success = out.ok() and Path(png).exists()
+                if image_path is None:
+                    image_path = Path(edir) / f"shot{source.suffix.lower()}"
+                elif image_path.suffix.lower() != source.suffix.lower():
+                    image_path = image_path.with_suffix(source.suffix.lower())
+                shutil.copy2(source, image_path)
+            success = bool(
+                source
+                and image_path
+                and image_path.exists()
+                and (out.ok() or self._structured_success(output))
+            )
             if not success:
-                self.writer.from_command(capability="screenshot", source=f"{self.platform_id}.simulator",
-                                         out=out, summary="截图失败")
-                return self._err(Capability.SCREENSHOT, "[simulator] 截图失败", str(edir))
+                ev, _ = self.writer.from_command(
+                    capability="screenshot",
+                    source=f"{self.platform_id}.simulator",
+                    out=out,
+                    summary="截图失败",
+                    directory=edir,
+                )
+                return self._err(
+                    Capability.SCREENSHOT,
+                    "[simulator] 截图失败",
+                    str(edir),
+                    [ev.id],
+                )
         else:
+            if image_path is None:
+                image_path = Path(edir) / "shot.png"
             ready = self._wda_manager().status()
             if not ready["ready"]:
                 return self._err(
@@ -348,11 +459,16 @@ class IOSNativePlugin:
             data = self.wda.screenshot_png()
             if not data:
                 return self._err(Capability.SCREENSHOT, "[real] WDA 截图为空（WDA 是否在线？）", str(edir))
-            Path(png).write_bytes(data)
+            image_path.write_bytes(data)
         ev = self.writer.register_file(capability="screenshot",
                                        source=f"{self.platform_id}.{self.mode}",
-                                       file_path=png, summary="截图产物")
-        return self._ok(Capability.SCREENSHOT, f"[{self.mode}] 截图成功 -> {png}", str(edir), [ev.id])
+                                       file_path=str(image_path), summary="截图产物")
+        return self._ok(
+            Capability.SCREENSHOT,
+            f"[{self.mode}] 截图成功 -> {image_path}",
+            str(edir),
+            [ev.id],
+        )
 
     # ---- VIEW_TREE ----
     def _view_tree(self, *, udid: str = "") -> CapabilityResult:
@@ -366,6 +482,8 @@ class IOSNativePlugin:
                 timeout=60,
             )
             tree_file.write_text(out.stdout or out.combined, encoding="utf-8")
+            if out.ok():
+                self._save_snapshot_targets(udid, out.stdout or out.combined)
             ev = self.writer.register_file(
                 capability="view_tree",
                 source=f"{self.platform_id}.xcodebuildmcp",
@@ -512,11 +630,83 @@ class IOSNativePlugin:
         if not args:
             return self._err(capability, f"{command} 需要 {required}")
         udid = udid or self.config.get("sim_udid", "booted")
-        out = self.runner.run(
-            [self._xb(), "ui-automation", command, "--simulator-id", udid, *args,
-             "--output", "text"],
-            timeout=60,
-        )
+        argv = [
+            self._xb(), "ui-automation", command, "--simulator-id", udid,
+            *args, "--output", "text",
+        ]
+        out = self.runner.run(argv, timeout=60)
+        if not out.ok() and any(
+            code in out.combined
+            for code in ("SNAPSHOT_EXPIRED", "SNAPSHOT_MISSING")
+        ):
+            refresh = self.runner.run(
+                [
+                    self._xb(), "simulator", "snapshot-ui",
+                    "--simulator-id", udid, "--output", "json",
+                ],
+                timeout=60,
+            )
+            if refresh.ok():
+                reference_flags = {
+                    "--element-ref",
+                    "--within-element-ref",
+                }
+                old_reference = next(
+                    (
+                        args[index + 1]
+                        for index, item in enumerate(args[:-1])
+                        if item in reference_flags
+                    ),
+                    "",
+                )
+                old_signature = self._load_snapshot_targets(udid).get(
+                    old_reference, ""
+                )
+                refreshed_targets = self._snapshot_targets(refresh.combined)
+                rebound_references = [
+                    reference
+                    for reference, signature in refreshed_targets.items()
+                    if old_signature and signature == old_signature
+                ]
+                if len(rebound_references) == 1:
+                    rebound_reference = rebound_references[0]
+                    retry_argv = list(argv)
+                    for index, item in enumerate(retry_argv[:-1]):
+                        if (
+                            item in reference_flags
+                            and retry_argv[index + 1] == old_reference
+                        ):
+                            retry_argv[index + 1] = rebound_reference
+                            break
+                    retry = self.runner.run(retry_argv, timeout=60)
+                    out = CommandOutput(
+                        argv=retry.argv,
+                        returncode=retry.returncode,
+                        stdout=(
+                            "--- snapshot refresh ---\n"
+                            f"{refresh.combined}\n"
+                            "--- action retry ---\n"
+                            f"{retry.stdout}"
+                        ),
+                        stderr=retry.stderr,
+                        duration=(
+                            out.duration + refresh.duration + retry.duration
+                        ),
+                    )
+                elif len(rebound_references) > 1:
+                    out = CommandOutput(
+                        argv=argv,
+                        returncode=1,
+                        stdout=refresh.combined,
+                        stderr=(
+                            "snapshot rebind is ambiguous: "
+                            f"{len(rebound_references)} targets match "
+                            f"{old_signature!r}; fetch a new view_tree"
+                        ),
+                        duration=out.duration + refresh.duration,
+                    )
+        if out.ok():
+            self._snapshot_state_path(udid).unlink(missing_ok=True)
         ev, edir = self.writer.from_command(
             capability=capability.value,
             source=f"{self.platform_id}.xcodebuildmcp",
@@ -534,7 +724,10 @@ class IOSNativePlugin:
             argv = [self._xb(), "simulator", "list", "--output", "text"]
         else:
             argv = [self._xb(), "device", "list", "--output", "text"]
-        out = self.runner.run(argv, timeout=60)
+        out = self.runner.run(
+            argv,
+            timeout=float(self.config.get("probe_timeout", 120)),
+        )
         ev, edir = self.writer.from_command(capability="probe",
                                             source=f"{self.platform_id}.xcodebuildmcp", out=out,
                                             summary=("探测完成" if out.ok() else "探测失败"))

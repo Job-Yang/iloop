@@ -529,9 +529,146 @@ def test_redline_guards() -> None:
 
 def test_runner_blocks_dangerous_by_default() -> None:
     from kernel import CommandRunner
-    r = CommandRunner(auto_developer_dir=False)
+    r = CommandRunner()
     out = r.run(["sudo", "whoami"])
     check("红线: runner 默认拦截危险命令", out.returncode == 126 and "redline" in out.stderr)
+
+
+def test_runner_does_not_wait_for_detached_child_output() -> None:
+    import time
+    from kernel import CommandRunner
+
+    runner = CommandRunner()
+    start = time.time()
+    out = runner.run([
+        "/bin/sh",
+        "-c",
+        "(sleep 3; echo child) & echo parent",
+    ])
+    check(
+        "运行器: 主进程退出后不被继承输出句柄的后台子进程阻塞",
+        out.returncode == 0
+        and "parent" in out.stdout
+        and time.time() - start < 2,
+    )
+
+
+def test_runner_timeout_kills_remaining_process_group() -> None:
+    import os
+    import time
+    from kernel import CommandRunner
+
+    with tempfile.TemporaryDirectory() as d:
+        child_pid_path = Path(d) / "child.pid"
+        runner = CommandRunner()
+        out = runner.run(
+            [
+                "/bin/sh",
+                "-c",
+                (
+                    "(trap '' TERM; sleep 30) & "
+                    f"echo $! > {child_pid_path}; wait"
+                ),
+            ],
+            timeout=2,
+        )
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        time.sleep(0.1)
+        try:
+            os.kill(child_pid, 0)
+            child_alive = True
+        except ProcessLookupError:
+            child_alive = False
+        check(
+            "运行器: 超时后回收忽略 TERM 的剩余进程组成员",
+            out.returncode == 124 and not child_alive,
+        )
+
+
+def test_runner_legacy_constructor_and_cross_platform_cleanup() -> None:
+    import kernel
+    import warnings
+    from kernel import CommandRunner
+    from unittest import mock
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        positional = CommandRunner(False)
+        keyword = CommandRunner(auto_developer_dir=False)
+    check(
+        "运行器: 旧 auto_developer_dir 构造方式保持兼容",
+        positional.environment_overrides == {}
+        and keyword.environment_overrides == {},
+    )
+    check(
+        "内核兼容层: discover_developer_dir 顶层导出仍可调用",
+        callable(kernel.discover_developer_dir),
+    )
+
+    process = mock.Mock()
+    process.pid = 42
+    process.poll.return_value = None
+    with mock.patch("kernel.runner.os.name", "nt"), mock.patch(
+        "kernel.runner.subprocess.run"
+    ) as taskkill:
+        CommandRunner._stop_process_group(process)
+    check(
+        "运行器: Windows 清理使用进程树回收而非 POSIX killpg",
+        taskkill.call_args.args[0]
+        == ["taskkill", "/PID", "42", "/T", "/F"],
+    )
+
+
+def test_runner_cleanup_ignores_second_interrupt() -> None:
+    import signal
+    from kernel import CommandRunner
+    from unittest import mock
+
+    process = mock.Mock()
+    process.pid = 42
+    process.poll.side_effect = [None, None, 0, 0]
+    process.wait.side_effect = [KeyboardInterrupt(), 0]
+    with mock.patch("kernel.runner.os.name", "posix"), mock.patch(
+        "kernel.runner.os.killpg"
+    ) as killpg:
+        CommandRunner._stop_process_group(process)
+    signals = [call.args[1] for call in killpg.call_args_list]
+    check(
+        "运行器: 清理期间二次中断不跳过 SIGKILL",
+        signal.SIGTERM in signals and signal.SIGKILL in signals,
+    )
+
+
+def test_direct_cli_uses_project_data_dir() -> None:
+    import os
+    import cli
+    from unittest import mock
+    from kernel import CapabilityResult, CapabilityStatus
+
+    captured = []
+
+    class FakePlugin:
+        def __init__(self, *args, **kwargs):
+            captured.append(kwargs.get("data_dir", ""))
+
+        def invoke(self, capability, **kwargs):
+            return CapabilityResult(
+                "fake",
+                capability.value,
+                CapabilityStatus.SUCCESS,
+                "ok",
+            )
+
+    with tempfile.TemporaryDirectory() as d, mock.patch.dict(
+        os.environ,
+        {"ILOOP_DATA_DIR": d},
+    ), mock.patch.object(cli, "IOSNativePlugin", FakePlugin):
+        cli.cmd_doctor(False)
+        cli.cmd_invoke("probe", False, {})
+        check(
+            "CLI: direct doctor/invoke 证据统一写项目数据目录",
+            captured == [str(Path(d) / "platform")] * 2,
+        )
 
 
 def test_dashboard_metrics_and_render() -> None:
@@ -1581,6 +1718,11 @@ def run() -> int:
         test_extension_auto_loads_into_plan,
         test_redline_guards,
         test_runner_blocks_dangerous_by_default,
+        test_runner_does_not_wait_for_detached_child_output,
+        test_runner_timeout_kills_remaining_process_group,
+        test_runner_legacy_constructor_and_cross_platform_cleanup,
+        test_runner_cleanup_ignores_second_interrupt,
+        test_direct_cli_uses_project_data_dir,
         test_dashboard_metrics_and_render,
         test_flow_next_suggest,
         test_case_and_ledger_resume,

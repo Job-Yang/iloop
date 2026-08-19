@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与语义化版本。
 
-## [0.0.1] - 未发布
+## [0.1.0] - 2026-08-19
 
 首个开源版本：**验证驱动闭环内核 + iOS 官方插件**。
 
@@ -39,14 +39,17 @@
 - 固定 Appium WDA `v16.1.1` 及官方 commit/origin，新增 `ui_prepare/ui_status/ui_stop` 管理源码、XcodeBuildMCP runner 与 iproxy 生命周期
 - 本机 Xcode 自动发现（不依赖全局 `xcode-select`），本地签名无私有服务
 - 真机 crash 本地采集（`devicectl` 拉取）；模拟器 crash 扫 DiagnosticReports
+- 真实模拟器 E2E 跑通 build/run/UI tree/screenshot/tap/logs；修复 snapshot 过期恢复、截图结构化成功判定和 runtime log 路径解析
+- CommandRunner 改为跨平台进程树托管，超时/中断回收子进程，长期日志 helper 不再阻塞主命令返回
+- direct `doctor/invoke` 证据统一进入项目数据目录；Xcode 环境发现下沉到 iOS adapter，并保留旧公开 API 兼容层
 
 ### 文档与工程
 - 入口提示词 `AGENT_PROMPT.md` + 分片提示词 `prompts/`
 - `SPEC.md`（四协议）/ `DESIGN.md`（设计）/ `EXTENDING.md`（二开）/ `docs/VDD.md`（方法论）
 - README 与 DESIGN 按“程序员反馈循环 → 长任务问题 → 架构设计”重写；二次开发改为 Agent 执行协议
 - 全局视角固定 Task 起始 Git commit，补齐行为配置文件、Objective-C selector、动态路由/DI、显式 evidence subjects 与受影响测试建议
-- selftest 185 断言（内核 137 + iOS 插件 48），包含提交后空审、旧 Task 基线缺失、行为文件漏检、动态入口漏检、subjects 断链、Objective-C selector 误报和测试夹具误报等反向测试
+- selftest 200 断言（内核 144 + iOS 插件 56），包含提交后空审、旧 Task 基线缺失、进程树泄漏、snapshot 误重绑、业务文本防误改、运行日志解析和宿主尾部错误等反向测试
 
 ### 已知缺口（诚实标注）
-- WDA 托管仍需更多签名环境与真机版本 E2E，真机语义 elementRef 操作不与模拟器混用
-- iOS build/run 仍需在一个公开样例工程上补持续 E2E
+- 当前验收机未连接可用 iPhone，WDA 真机 E2E 仍待设备与签名环境；真机语义 elementRef 操作不与模拟器混用
+- 本地生成式 fixture 已完成模拟器 E2E，仍需把该链路固化为公开 CI E2E

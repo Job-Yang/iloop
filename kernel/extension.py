@@ -47,8 +47,8 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "name": name,
-        "version": "0.0.1",
-        "iloop_kernel": ">=0.0.1",
+        "version": "0.1.0",
+        "iloop_kernel": ">=0.1.0",
         "description": f"{name} iLoop extension",
         "provides": {"flows": FLOWS_NAME, "plugin": None},
     }

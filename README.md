@@ -213,17 +213,18 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.0.1`，首发范围是**平台无关内核 + iOS 官方插件**。
+版本 `0.1.0`，首发范围是**平台无关内核 + iOS 官方插件**。
 
-- selftest 185 条断言全绿：内核 137 + iOS 插件 48。
+- selftest 200 条断言全绿：内核 144 + iOS 插件 56。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
 - 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
 - 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 传入的 `subjects` 还需宿主单独证明，不能自行伪造覆盖范围。
 - inputs manifest、Constitution、结构化 blocker、records 和 UI Flow 已进入工程数据层。
 - 模拟器 build/run/install/launch/UI tree/tap/swipe/type/screenshot/probe 统一走 XcodeBuildMCP CLI。
+- 已用 XcodeBuildMCP 生成公开结构的 SwiftUI fixture，真实跑通模拟器 build-and-run、UI tree、截图、tap 和本次 run 绑定日志。
 - `logs` 只归档本次 `run` 绑定的动态日志；没有真实日志时明确失败。
 - 真机 build/install/launch 走 XcodeBuildMCP；固定版本、官方 commit 与 origin 的公开 WDA 由 `ui_prepare/ui_status/ui_stop` 管理；crash 走 `devicectl`。
-- 已知缺口：WDA 自动管理已通过命令与状态测试，仍需更多签名环境和真机版本 E2E；真机语义 elementRef 尚未与模拟器统一。
+- 已知缺口：当前验收机未连接可用 iPhone，WDA 真机 E2E 尚待设备与签名环境；真机语义 elementRef 尚未与模拟器统一。
 
 MIT License。欢迎使用、修改和二次开发。

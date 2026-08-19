@@ -457,19 +457,20 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 - 可复用 UI Flow：路径图、验证节点证据、转 Task；
 - iOS 官方插件：XcodeBuildMCP build/run/install/launch/单次绑定动态日志/模拟器 UI 自动化，以及固定版本 WDA 托管、screenshot、probe、crash；
 - 模拟器与真机执行路径，真机 UI 基于 Appium WebDriverAgent；
-- 185 条 selftest 断言（内核 137 + iOS 插件 48）。
+- 200 条 selftest 断言（内核 144 + iOS 插件 56）。
 
 ### 已真实验证
 
 - 内核和 iOS 插件 selftest 全绿；
 - Xcode 自动发现；
-- 旧版模拟器 probe 与 screenshot 曾端到端运行；本次迁移后的 XcodeBuildMCP 路径已通过命令契约测试，当前会话受 Simulator 沙箱限制，仍待非沙箱复验；
+- XcodeBuildMCP 生成的 SwiftUI fixture 已真实跑通模拟器 build-and-run、UI tree、截图、snapshot 自动恢复 tap 和本次 run 绑定日志；
+- E2E 反馈已修复截图冷启动超时、宿主尾部非零覆盖真实产物、运行日志 home 路径解析、后台 helper 阻塞、进程组泄漏与重复语义控件误重绑；
 - oncall demo 从事件到病例、证据、四关、通知完整运行；
 - 扩展创建、校验和防覆盖核心 flow。
 
 ### 仍需继续验证
 
-- 更多真实 iOS 工程上的 build / install / launch 组合；
+- 将本次生成式 fixture 固化为公开 CI E2E；
 - 更多真机与系统版本覆盖；
 - WDA 首次真机签名与完整 elementRef 路径的多设备实测；
 - Android、Web、Lynx 等新平台应以插件方式逐个接入并真实验证，不能仅凭架构推断已经通用。

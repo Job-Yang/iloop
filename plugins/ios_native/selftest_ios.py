@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import subprocess
 import tempfile
@@ -31,12 +32,14 @@ class FakeRunner:
 
     def __init__(self, stdout: str = "", returncode: int = 0) -> None:
         self.calls: list[list[str]] = []
+        self.timeouts: list[float] = []
         self.stdout = stdout
         self.returncode = returncode
 
     def run(self, argv, *, timeout=600.0, cwd=None) -> CommandOutput:
         argv = [str(a) for a in argv]
         self.calls.append(argv)
+        self.timeouts.append(timeout)
         return CommandOutput(argv, self.returncode, self.stdout, "", 0.01)
 
 
@@ -99,6 +102,18 @@ def test_sim_install_launch_screenshot_commands() -> None:
               "xcodebuildmcp simulator launch-app --simulator-id booted --bundle-id com.x.app" in launch_argv)
 
 
+def test_probe_allows_slow_device_discovery() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        fake = FakeRunner(stdout="device list", returncode=0)
+        plugin = IOSNativePlugin("real", data_dir=d, runner=fake)
+        result = plugin.invoke(Capability.PROBE)
+        check(
+            "probe: 设备发现默认允许 120 秒",
+            result.status == CapabilityStatus.SUCCESS
+            and fake.timeouts == [120],
+        )
+
+
 def test_sim_view_tree_and_ui_actions_use_xcodebuildmcp() -> None:
     with tempfile.TemporaryDirectory() as d:
         fake = FakeRunner(stdout='{"screen":{"hash":"x"},"targets":[]}', returncode=0)
@@ -119,6 +134,207 @@ def test_sim_view_tree_and_ui_actions_use_xcodebuildmcp() -> None:
               and swipe.status == CapabilityStatus.SUCCESS)
         check("UI: type_text 使用 elementRef", "--element-ref e8 --text hello" in commands[3]
               and typed.status == CapabilityStatus.SUCCESS)
+
+
+def test_sim_ui_action_refreshes_expired_snapshot_once() -> None:
+    class ExpiredRunner:
+        developer_dir = "/Applications/Xcode.app/Contents/Developer"
+
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, *, timeout=600.0, cwd=None):
+            argv = [str(item) for item in argv]
+            self.calls.append(argv)
+            if len(self.calls) == 1:
+                return CommandOutput(
+                    argv, 1, "Code: SNAPSHOT_EXPIRED", "", 0.01
+                )
+            if len(self.calls) == 2:
+                return CommandOutput(
+                    argv,
+                    0,
+                    json.dumps({
+                        "didError": False,
+                        "data": {
+                            "capture": {
+                                "targets": [
+                                    "e9|tap|button|Count: 0||iloop-counter"
+                                ],
+                            },
+                        },
+                    }),
+                    "",
+                    0.01,
+                )
+            return CommandOutput(argv, 0, '{"didError":false}', "", 0.01)
+
+    with tempfile.TemporaryDirectory() as d:
+        runner = ExpiredRunner()
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=d,
+            runner=runner,
+            config={"sim_udid": "SIM-1"},
+        )
+        plugin._snapshot_state_path("SIM-1").write_text(
+            json.dumps({
+                "udid": "SIM-1",
+                "targets": {
+                    "e8": "tap|button|Count: 0||iloop-counter",
+                },
+            }),
+            encoding="utf-8",
+        )
+        result = plugin.invoke(Capability.TAP, element_ref="e8")
+        commands = [" ".join(call) for call in runner.calls]
+        check(
+            "UI: snapshot 缺失或过期时自动刷新并重试一次",
+            result.status == CapabilityStatus.SUCCESS
+            and len(commands) == 3
+            and "simulator snapshot-ui" in commands[1]
+            and "ui-automation tap" in commands[2]
+            and "--element-ref e9" in commands[2],
+        )
+
+
+def test_sim_ui_action_rejects_ambiguous_snapshot_rebind() -> None:
+    class AmbiguousRunner:
+        developer_dir = "/Applications/Xcode.app/Contents/Developer"
+
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, *, timeout=600.0, cwd=None):
+            argv = [str(item) for item in argv]
+            self.calls.append(argv)
+            if len(self.calls) == 1:
+                return CommandOutput(
+                    argv, 1, "Code: SNAPSHOT_EXPIRED", "", 0.01
+                )
+            return CommandOutput(
+                argv,
+                0,
+                json.dumps({
+                    "didError": False,
+                    "data": {
+                        "capture": {
+                            "targets": [
+                                "e9|tap|button|Delete||delete-button",
+                                "e10|tap|button|Delete||delete-button",
+                            ],
+                        },
+                    },
+                }),
+                "",
+                0.01,
+            )
+
+    with tempfile.TemporaryDirectory() as d:
+        runner = AmbiguousRunner()
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=d,
+            runner=runner,
+            config={"sim_udid": "SIM-1"},
+        )
+        plugin._snapshot_state_path("SIM-1").write_text(
+            json.dumps({
+                "udid": "SIM-1",
+                "targets": {
+                    "e8": "tap|button|Delete||delete-button",
+                },
+            }),
+            encoding="utf-8",
+        )
+        result = plugin.invoke(Capability.TAP, element_ref="e8")
+        check(
+            "UI: 重复语义签名拒绝静默重绑",
+            result.status == CapabilityStatus.ERROR
+            and len(runner.calls) == 2,
+        )
+
+
+def test_snapshot_rebind_does_not_replace_business_text() -> None:
+    class TextRunner:
+        developer_dir = "/Applications/Xcode.app/Contents/Developer"
+
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, *, timeout=600.0, cwd=None):
+            argv = [str(item) for item in argv]
+            self.calls.append(argv)
+            if len(self.calls) == 1:
+                return CommandOutput(
+                    argv, 1, "Code: SNAPSHOT_EXPIRED", "", 0.01
+                )
+            if len(self.calls) == 2:
+                return CommandOutput(
+                    argv,
+                    0,
+                    json.dumps({
+                        "didError": False,
+                        "data": {
+                            "capture": {
+                                "targets": [
+                                    "e9|type|text-field|Name||name-field"
+                                ],
+                            },
+                        },
+                    }),
+                    "",
+                    0.01,
+                )
+            return CommandOutput(argv, 0, "typed", "", 0.01)
+
+    with tempfile.TemporaryDirectory() as d:
+        runner = TextRunner()
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=d,
+            runner=runner,
+            config={"sim_udid": "SIM-1"},
+        )
+        plugin._snapshot_state_path("SIM-1").write_text(
+            json.dumps({
+                "udid": "SIM-1",
+                "targets": {
+                    "e8": "type|text-field|Name||name-field",
+                },
+            }),
+            encoding="utf-8",
+        )
+        result = plugin.invoke(
+            Capability.TYPE_TEXT,
+            element_ref="e8",
+            text="e8",
+        )
+        retry = runner.calls[-1]
+        check(
+            "UI: snapshot 重绑只替换 ref 参数不改业务文本",
+            result.status == CapabilityStatus.SUCCESS
+            and retry[retry.index("--element-ref") + 1] == "e9"
+            and retry[retry.index("--text") + 1] == "e8",
+        )
+
+
+def test_injected_runner_developer_dir_matches_doctor() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        runner = FakeRunner()
+        runner.environment_overrides = {
+            "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+        }
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=d,
+            runner=runner,
+        )
+        check(
+            "doctor: 注入 runner 的 DEVELOPER_DIR 参与环境判定",
+            plugin.developer_dir
+            == "/Applications/Xcode.app/Contents/Developer",
+        )
 
 
 def test_real_device_needs_udid() -> None:
@@ -162,6 +378,53 @@ def test_xcodebuildmcp_json_artifact_path() -> None:
         payload = '{"artifacts":[{"path":' + repr(str(png)).replace("'", '"') + '}]}'
         found = IOSNativePlugin._artifact_path(payload, ".png")
         check("截图: 从 XcodeBuildMCP JSON 解析含空格产物路径", found == png)
+    home_path = "~/.iloop/runtime.log"
+    with mock.patch.object(Path, "exists", return_value=True):
+        found = IOSNativePlugin._artifact_path(
+            f"Runtime Logs: {home_path}",
+            ".log",
+        )
+    check(
+        "运行日志: 展开 XcodeBuildMCP 返回的 home 相对路径",
+        found == Path.home() / ".iloop/runtime.log",
+    )
+    large_output = ("compile output /tmp/object.o\n" * 10000) + (
+        "Runtime Logs: ~/.iloop/runtime.log\n"
+    )
+    with mock.patch.object(Path, "exists", return_value=True):
+        found = IOSNativePlugin._artifact_path(large_output, ".log")
+    check(
+        "运行日志: 大体积构建输出路径解析保持线性",
+        found == Path.home() / ".iloop/runtime.log",
+    )
+
+
+def test_screenshot_accepts_structured_success_and_keeps_evidence_dir() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        jpg = Path(d) / "shot result.jpg"
+        jpg.write_bytes(b"jpeg")
+        payload = json.dumps({
+            "didError": False,
+            "data": {
+                "summary": {"status": "SUCCEEDED"},
+                "artifacts": {"screenshotPath": str(jpg)},
+            },
+        })
+        fake = FakeRunner(stdout=payload, returncode=1)
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=d,
+            runner=fake,
+            config={"sim_udid": "SIM-1"},
+        )
+        result = plugin.invoke(Capability.SCREENSHOT)
+        copied = list(Path(result.evidence_dir).glob("shot.jpg"))
+        check(
+            "截图: 结构化成功产物不被宿主尾部非零覆盖",
+            result.status == CapabilityStatus.SUCCESS
+            and len(copied) == 1
+            and fake.timeouts == [120],
+        )
 
 
 def test_runtime_logs_are_bound_to_latest_run() -> None:
@@ -510,12 +773,18 @@ def run() -> int:
         test_build_exit0_without_marker_is_failure,
         test_real_build_uses_xcodebuildmcp_device_workflow,
         test_sim_install_launch_screenshot_commands,
+        test_probe_allows_slow_device_discovery,
         test_sim_view_tree_and_ui_actions_use_xcodebuildmcp,
+        test_sim_ui_action_refreshes_expired_snapshot_once,
+        test_sim_ui_action_rejects_ambiguous_snapshot_rebind,
+        test_snapshot_rebind_does_not_replace_business_text,
+        test_injected_runner_developer_dir_matches_doctor,
         test_real_device_needs_udid,
         test_crash_now_implemented,
         test_real_crash_needs_udid,
         test_plugin_never_crashes_kernel,
         test_xcodebuildmcp_json_artifact_path,
+        test_screenshot_accepts_structured_success_and_keeps_evidence_dir,
         test_runtime_logs_are_bound_to_latest_run,
         test_wda_actions_share_managed_endpoint,
         test_wda_manager_uses_pinned_source_and_managed_command,

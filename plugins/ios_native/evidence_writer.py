@@ -24,8 +24,10 @@ class EvidenceWriter:
         return d
 
     def from_command(self, *, capability: str, source: str, out: CommandOutput,
-                     summary: str, kind: EvidenceKind = EvidenceKind.OBSERVED) -> tuple[EvidenceArtifact, str]:
-        d = self._dir(capability)
+                     summary: str, kind: EvidenceKind = EvidenceKind.OBSERVED,
+                     directory: Optional[str | Path] = None) -> tuple[EvidenceArtifact, str]:
+        d = Path(directory) if directory else self._dir(capability)
+        d.mkdir(parents=True, exist_ok=True)
         log = d / "cmd.log"
         log.write_text(
             f"$ {' '.join(out.argv)}\n[exit={out.returncode} dur={out.duration:.2f}s]\n\n"
