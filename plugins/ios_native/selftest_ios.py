@@ -86,6 +86,25 @@ def test_real_build_uses_xcodebuildmcp_device_workflow() -> None:
               "xcodebuildmcp device build" in argv)
         check("real build: 传 scheme", "--scheme App" in argv)
         check("real build: 输出采用公开 CLI", "--output text" in argv)
+        fake_with_device = FakeRunner(
+            stdout="** BUILD SUCCEEDED **",
+            returncode=0,
+        )
+        plugin_with_device = IOSNativePlugin(
+            "real",
+            data_dir=d,
+            runner=fake_with_device,
+            config={
+                "scheme": "App",
+                "project": "App.xcodeproj",
+                "device_udid": "DEVICE-1",
+            },
+        )
+        plugin_with_device.invoke(Capability.BUILD)
+        check(
+            "real build: device workflow 不传不支持的 --device-id",
+            "--device-id" not in fake_with_device.calls[0],
+        )
 
 
 def test_sim_install_launch_screenshot_commands() -> None:
@@ -113,6 +132,25 @@ def test_probe_allows_slow_device_discovery() -> None:
             result.status == CapabilityStatus.SUCCESS
             and fake.timeouts == [120],
         )
+        counter = plugin.invoke(
+            Capability.COUNTER_PROBE,
+            counter_capability="probe",
+            counter_condition="use a different device condition",
+            counter_expect="summary_contains:探测完成",
+        )
+        check(
+            "counter_probe: 明确执行反证条件并落独立产物",
+            counter.status == CapabilityStatus.SUCCESS
+            and (Path(counter.evidence_dir) / "counter-result.json").is_file(),
+        )
+        mismatch = plugin.invoke(
+            Capability.COUNTER_PROBE,
+            counter_capability="probe",
+            counter_condition="use another condition",
+            counter_expect="summary_contains:never-matches",
+        )
+        check("counter_probe: 反证断言不匹配时不能过关",
+              mismatch.status == CapabilityStatus.ERROR)
 
 
 def test_sim_view_tree_and_ui_actions_use_xcodebuildmcp() -> None:
@@ -356,7 +394,12 @@ def test_crash_now_implemented() -> None:
 
 
 def test_real_crash_needs_udid() -> None:
-    p = IOSNativePlugin("real", data_dir="/tmp/iloop-ios-test", runner=FakeRunner())
+    p = IOSNativePlugin(
+        "real",
+        data_dir="/tmp/iloop-ios-test",
+        runner=FakeRunner(),
+        config={"bundle_id": "dev.iloop.test"},
+    )
     res = p.invoke(Capability.CRASH)
     check("crash: 真机采集缺 udid 时报错而非乱跑",
           res.status == CapabilityStatus.ERROR and "udid" in res.summary)
@@ -437,6 +480,18 @@ def test_evidence_directories_do_not_collide() -> None:
             "证据: 同秒重复能力调用使用不同目录",
             first != second and first.is_dir() and second.is_dir(),
         )
+        output = CommandOutput(["build"], 0, "warning only", "", 0.01)
+        evidence, _ = writer.from_command(
+            capability="build",
+            source="test",
+            out=output,
+            summary="marker missing",
+            outcome="failure",
+        )
+        check(
+            "证据: 语义失败不会被 exit 0 写成 success",
+            evidence.outcome == "failure",
+        )
 
 
 def test_runtime_logs_are_bound_to_latest_run() -> None:
@@ -450,6 +505,11 @@ def test_runtime_logs_are_bound_to_latest_run() -> None:
         config = {"scheme": "App", "sim_udid": "SIM-1"}
         plugin = IOSNativePlugin("simulator", data_dir=d, runner=fake, config=config)
         run = plugin.invoke(Capability.RUN, task_id="task-a", run_id="run-a")
+        run_state = json.loads(
+            (plugin.state_dir / "last-run-task-a.json").read_text(
+                encoding="utf-8"
+            )
+        )
         logs = plugin.invoke(Capability.LOGS, task_id="task-a", run_id="run-a")
         stale_run_logs = plugin.invoke(
             Capability.LOGS, task_id="task-a", run_id="run-b"
@@ -472,6 +532,8 @@ def test_runtime_logs_are_bound_to_latest_run() -> None:
             Capability.LOGS, task_id="task-a", run_id="run-a"
         )
         check("动态日志: run 成功后记录本次日志路径", run.status == CapabilityStatus.SUCCESS)
+        check("动态日志: run 窗口从 build-and-run 调用前开始",
+              run_state["started_at"] <= run_state["captured_at"])
         check("动态日志: logs 只读取本次 run 绑定文件",
               logs.status == CapabilityStatus.SUCCESS and "2 行" in logs.summary)
         check("动态日志: 其他 Task 不能复用上一任务日志",
@@ -484,6 +546,118 @@ def test_runtime_logs_are_bound_to_latest_run() -> None:
         check("动态日志: 同 run_id 后续失败会清理旧成功绑定",
               same_id_failed_run.status == CapabilityStatus.ERROR
               and same_id_logs.status == CapabilityStatus.ERROR)
+        fake.stdout = f"Build succeeded. App launched. Runtime log: {runtime_log}\n"
+        fake.returncode = 0
+        plugin.invoke(Capability.RUN, task_id="task-c", run_id="run-c")
+        empty = plugin.invoke(
+            Capability.LOGS,
+            task_id="task-c",
+            run_id="run-c",
+            predicate="NEVER_PRESENT",
+        )
+        check("动态日志: predicate 零命中不算成功",
+              empty.status == CapabilityStatus.ERROR)
+
+
+def test_real_ui_actions_write_durable_evidence() -> None:
+    class FakeWDA:
+        base = "http://127.0.0.1:8100"
+
+        def tap(self, x, y):
+            return {"value": None}
+
+    with tempfile.TemporaryDirectory() as d:
+        plugin = IOSNativePlugin(
+            "real",
+            data_dir=d,
+            runner=FakeRunner(),
+            config={"device_udid": "DEVICE-1"},
+            wda=FakeWDA(),
+        )
+        manager = mock.Mock()
+        manager.status.return_value = {"ready": True}
+        with mock.patch.object(plugin, "_wda_manager", return_value=manager):
+            result = plugin.invoke(Capability.TAP, x=10, y=20)
+        check(
+            "真机 UI: 成功动作写入可哈希响应证据",
+            result.status == CapabilityStatus.SUCCESS
+            and bool(result.evidence_dir)
+            and (Path(result.evidence_dir) / "wda-response.json").is_file(),
+        )
+
+
+def test_sim_crash_never_falls_back_to_other_app() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d) / "home"
+        reports = home / "Library" / "Logs" / "DiagnosticReports"
+        reports.mkdir(parents=True)
+        other = reports / "OtherApp.ips"
+        other.write_text("bundle_id: com.other.app", encoding="utf-8")
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=Path(d) / "data",
+            runner=FakeRunner(),
+            config={"bundle_id": "com.target.app"},
+        )
+        with mock.patch.object(Path, "home", return_value=home):
+            result = plugin.invoke(
+                Capability.CRASH,
+                bundle_id="com.target.app",
+                since_seconds=3600,
+            )
+            unbound = plugin.invoke(
+                Capability.CRASH,
+                bundle_id="com.target.app",
+                task_id="task-without-run",
+                run_id="missing-run",
+            )
+            state_path = plugin.state_dir / "last-run-task-bound.json"
+            state_path.write_text(json.dumps({
+                "status": "success",
+                "task_id": "task-bound",
+                "run_id": "run-bound",
+                "mode": "simulator",
+                "bundle_id": "com.other.app",
+                "device_id": "booted",
+                "captured_at": __import__("time").time(),
+            }), encoding="utf-8")
+            wrong_subject = plugin.invoke(
+                Capability.CRASH,
+                bundle_id="com.target.app",
+                task_id="task-bound",
+                run_id="run-bound",
+            )
+        copied = list(Path(result.evidence_dir).glob("OtherApp.ips"))
+        check(
+            "crash: 目标 App 无报告时不回退其他 App",
+            result.status == CapabilityStatus.SUCCESS
+            and not copied
+            and (Path(result.evidence_dir) / "absence.json").is_file(),
+        )
+        check("crash: Task 采集必须绑定前序成功 run",
+              unbound.status == CapabilityStatus.ERROR)
+        check("crash: run 绑定同时校验 task/bundle/device",
+              wrong_subject.status == CapabilityStatus.ERROR)
+        real_plugin = IOSNativePlugin(
+            "real",
+            data_dir=Path(d) / "real-data",
+            runner=FakeRunner(stdout="copy complete", returncode=0),
+            config={
+                "bundle_id": "com.target.app",
+                "device_udid": "DEVICE-1",
+            },
+        )
+        no_real_crash = real_plugin.invoke(
+            Capability.CRASH,
+            bundle_id="com.target.app",
+            udid="DEVICE-1",
+            since_seconds=3600,
+        )
+        check(
+            "crash: 真机查询成功且无目标报告时产出 absence 证据",
+            no_real_crash.status == CapabilityStatus.SUCCESS
+            and (Path(no_real_crash.evidence_dir) / "absence.json").is_file(),
+        )
 
 
 def test_wda_actions_share_managed_endpoint() -> None:
@@ -687,7 +861,11 @@ def test_wda_prepare_failure_cleans_processes() -> None:
                 "ready": True,
                 "runtime": {"device_udid": "OLD-DEVICE", "version": WDA_VERSION},
             },
-        ), mock.patch.object(manager, "stop", return_value={"stopped": [1, 2]}) as stop_mock, \
+        ), mock.patch.object(
+            manager,
+            "_stop_locked",
+            return_value={"stopped": [1, 2], "unresolved": []},
+        ) as stop_mock, \
              mock.patch("plugins.ios_native.wda_manager.shutil.which", return_value="/usr/bin/iproxy"), \
              mock.patch("plugins.ios_native.wda_manager.subprocess.Popen", side_effect=old_device_processes):
             try:
@@ -695,6 +873,25 @@ def test_wda_prepare_failure_cleans_processes() -> None:
             except RuntimeError:
                 pass
         check("WDA: 切换设备时不会复用旧设备 ready 状态", stop_mock.called)
+        with mock.patch.object(
+            manager,
+            "status",
+            return_value={
+                "ready": False,
+                "runtime": {"device_udid": "OLD-DEVICE", "version": WDA_VERSION},
+            },
+        ), mock.patch.object(
+            manager,
+            "_stop_locked",
+            return_value={"stopped": [], "unresolved": ["wda_pid"]},
+        ):
+            ownership_blocked = False
+            try:
+                manager.prepare(timeout=0)
+            except RuntimeError as error:
+                ownership_blocked = "ownership is unresolved" in str(error)
+        check("WDA: 旧进程所有权未确认时拒绝启动替代实例",
+              ownership_blocked)
         startup_process = FakeProcess()
         with mock.patch.object(manager, "status", return_value={"ready": False}), \
              mock.patch("plugins.ios_native.wda_manager.shutil.which", return_value="/usr/bin/iproxy"), \
@@ -737,6 +934,22 @@ def test_wda_cleanup_targets_process_group() -> None:
         "WDA: cleanup terminates the dedicated process group",
         signals == [(4321, __import__("signal").SIGTERM), (4321, __import__("signal").SIGKILL)],
     )
+    with tempfile.TemporaryDirectory() as d:
+        manager = WDAManager(d)
+        state = {
+            "wda_pid": 5001,
+            "proxy_pid": 5002,
+            "wda_identity_sha256": "old",
+            "proxy_identity_sha256": "old",
+        }
+        with mock.patch.object(manager, "_read_state", return_value=state), \
+             mock.patch.object(manager, "_pid_matches", return_value=False), \
+             mock.patch.object(manager, "_pid_exists", return_value=False):
+            stopped = manager.stop()
+        check(
+            "WDA: 已死亡 PID 不会被误判为所有权冲突",
+            stopped["unresolved"] == [],
+        )
 
 
 def test_wda_status_binds_endpoint_to_managed_processes() -> None:
@@ -827,6 +1040,8 @@ def run() -> int:
         test_screenshot_accepts_structured_success_and_keeps_evidence_dir,
         test_evidence_directories_do_not_collide,
         test_runtime_logs_are_bound_to_latest_run,
+        test_real_ui_actions_write_durable_evidence,
+        test_sim_crash_never_falls_back_to_other_app,
         test_wda_actions_share_managed_endpoint,
         test_wda_manager_uses_pinned_source_and_managed_command,
         test_wda_prepare_failure_cleans_processes,

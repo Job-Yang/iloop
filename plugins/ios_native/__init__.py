@@ -80,6 +80,7 @@ class IOSNativePlugin:
             Capability.DOCTOR, Capability.BUILD, Capability.RUN, Capability.INSTALL,
             Capability.LAUNCH, Capability.SCREENSHOT, Capability.VIEW_TREE,
             Capability.LOGS, Capability.PROBE, Capability.CRASH,
+            Capability.COUNTER_PROBE,
             Capability.TAP, Capability.SWIPE, Capability.TYPE_TEXT,
             Capability.UI_PREPARE, Capability.UI_STATUS, Capability.UI_STOP,
         ]
@@ -98,6 +99,7 @@ class IOSNativePlugin:
             Capability.VIEW_TREE: self._view_tree,
             Capability.LOGS: self._logs,
             Capability.PROBE: self._probe,
+            Capability.COUNTER_PROBE: self._counter_probe,
             Capability.CRASH: self._crash,
             Capability.TAP: self._tap,
             Capability.SWIPE: self._swipe,
@@ -283,7 +285,8 @@ class IOSNativePlugin:
         argv = [self._xb(), self.mode if self.mode == "simulator" else "device", "build"]
         argv += self._project_args()
         argv += ["--scheme", scheme, "--configuration", configuration]
-        argv += self._target_args()
+        if self.mode == "simulator":
+            argv += self._target_args()
         if derived_data:
             argv += ["--derived-data-path", derived_data]
         argv += ["--output", "text"]
@@ -294,7 +297,8 @@ class IOSNativePlugin:
         ev, edir = self.writer.from_command(
             capability="build", source=f"{self.platform_id}.xcodebuildmcp", out=out,
             summary=("BUILD SUCCEEDED" if succeeded else "构建失败"),
-            kind=EvidenceKind.OBSERVED)
+            kind=EvidenceKind.OBSERVED,
+            outcome="success" if succeeded else "failure")
         if succeeded:
             return self._ok(Capability.BUILD, f"[{self.mode}] {scheme} 构建成功", edir, [ev.id])
         return self._err(Capability.BUILD, f"[{self.mode}] {scheme} 构建失败（见 cmd.log）", edir, [ev.id])
@@ -313,6 +317,7 @@ class IOSNativePlugin:
         if derived_data:
             argv += ["--derived-data-path", derived_data]
         argv += ["--output", "text"]
+        run_started_at = time.time()
         out = self.runner.run(argv, timeout=1800)
         runtime_log = self._artifact_path(out.stdout or out.combined, ".log")
         succeeded = out.returncode == 0 and bool(
@@ -321,6 +326,7 @@ class IOSNativePlugin:
         if succeeded:
             state = {
                 "captured_at": time.time(),
+                "started_at": run_started_at,
                 "status": "success",
                 "task_id": task_id,
                 "run_id": run_id,
@@ -329,6 +335,12 @@ class IOSNativePlugin:
                 "project": self.config.get("project", ""),
                 "workspace": self.config.get("workspace", ""),
                 "runtime_log": str(runtime_log) if runtime_log else "",
+                "bundle_id": self.config.get("bundle_id", ""),
+                "device_id": (
+                    self.config.get("device_udid", "")
+                    if self.mode == "real"
+                    else self.config.get("sim_udid", "booted")
+                ),
             }
             (self.state_dir / f"last-run-{task_id}.json").write_text(
                 json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -341,7 +353,8 @@ class IOSNativePlugin:
                     state_path.unlink()
         ev, edir = self.writer.from_command(
             capability="run", source=f"{self.platform_id}.xcodebuildmcp", out=out,
-            summary=("构建并拉起成功" if succeeded else "构建或拉起失败"))
+            summary=("构建并拉起成功" if succeeded else "构建或拉起失败"),
+            outcome="success" if succeeded else "failure")
         if succeeded:
             return self._ok(Capability.RUN, f"[{self.mode}] 构建、安装、拉起完成；运行日志路径见证据",
                             edir, [ev.id])
@@ -551,6 +564,13 @@ class IOSNativePlugin:
             file_path=str(dest),
             summary=f"动态日志 {len(selected)} 行，源={source}",
         )
+        if predicate and not selected:
+            return self._err(
+                Capability.LOGS,
+                f"[{self.mode}] 动态日志中未命中 predicate={predicate!r}",
+                str(edir),
+                [ev.id],
+            )
         return self._ok(Capability.LOGS,
                         f"[{self.mode}] 动态日志已抓取 {len(selected)} 行 -> {dest}",
                         str(edir), [ev.id])
@@ -564,7 +584,7 @@ class IOSNativePlugin:
             if x < 0 or y < 0:
                 return self._err(Capability.TAP, "真机 WDA tap 需要 x + y")
             result = self.wda.tap(float(x), float(y))
-            return self._ok(Capability.TAP, f"[real] WDA tap 完成: {result}")
+            return self._real_ui_evidence(Capability.TAP, "tap", result)
         return self._sim_ui_action(Capability.TAP, "tap", udid, [
             "--element-ref", element_ref,
         ] if element_ref else [], required="element_ref")
@@ -580,7 +600,7 @@ class IOSNativePlugin:
             if min(x1, y1, x2, y2) < 0:
                 return self._err(Capability.SWIPE, "真机 WDA swipe 需要 x1/y1/x2/y2")
             result = self.wda.swipe(float(x1), float(y1), float(x2), float(y2))
-            return self._ok(Capability.SWIPE, f"[real] WDA swipe 完成: {result}")
+            return self._real_ui_evidence(Capability.SWIPE, "swipe", result)
         args = ["--within-element-ref", within_element_ref, "--direction", direction,
                 "--distance", str(distance)] if within_element_ref else []
         return self._sim_ui_action(Capability.SWIPE, "swipe", udid, args,
@@ -594,7 +614,9 @@ class IOSNativePlugin:
             if not text:
                 return self._err(Capability.TYPE_TEXT, "真机 type_text 需要 text")
             result = self.wda.type_text(text)
-            return self._ok(Capability.TYPE_TEXT, f"[real] WDA 输入完成: {result}")
+            return self._real_ui_evidence(
+                Capability.TYPE_TEXT, "type_text", result
+            )
         args = ["--element-ref", element_ref, "--text", text] if element_ref and text else []
         return self._sim_ui_action(Capability.TYPE_TEXT, "type-text", udid, args,
                                    required="element_ref + text")
@@ -623,6 +645,11 @@ class IOSNativePlugin:
         if self.mode != "real":
             return self._ok(Capability.UI_STOP, "[simulator] no managed WDA runtime")
         stopped = self._wda_manager().stop()
+        if stopped.get("unresolved"):
+            return self._err(
+                Capability.UI_STOP,
+                f"[real] WDA ownership could not be verified: {stopped['unresolved']}",
+            )
         return self._ok(Capability.UI_STOP, f"[real] WDA runtime stopped: {stopped['stopped']}")
 
     def _sim_ui_action(self, capability: Capability, command: str, udid: str,
@@ -717,6 +744,35 @@ class IOSNativePlugin:
             return self._ok(capability, f"[simulator] {command} 成功", edir, [ev.id])
         return self._err(capability, f"[simulator] {command} 失败", edir, [ev.id])
 
+    def _real_ui_evidence(
+        self,
+        capability: Capability,
+        action: str,
+        result: dict,
+    ) -> CapabilityResult:
+        edir = self.writer._dir(capability.value)
+        artifact = Path(edir) / "wda-response.json"
+        artifact.write_text(
+            json.dumps(
+                {"action": action, "response": result, "captured_at": time.time()},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        evidence = self.writer.register_file(
+            capability=capability.value,
+            source=f"{self.platform_id}.wda",
+            file_path=str(artifact),
+            summary=f"真机 WDA {action} 响应",
+        )
+        return self._ok(
+            capability,
+            f"[real] WDA {action} 完成",
+            str(edir),
+            [evidence.id],
+        )
+
     # ---- PROBE ----
     def _probe(self, *, udid: str = "") -> CapabilityResult:
         """探测：设备/模拟器枚举 + 环境快照。"""
@@ -735,28 +791,196 @@ class IOSNativePlugin:
             return self._ok(Capability.PROBE, f"[{self.mode}] 探测完成", edir, [ev.id])
         return self._err(Capability.PROBE, f"[{self.mode}] 探测失败", edir, [ev.id])
 
+    def _counter_probe(
+        self,
+        *,
+        counter_capability: str = "",
+        counter_condition: str = "",
+        counter_expect: str = "",
+        scheme: str = "",
+        bundle_id: str = "",
+        predicate: str = "",
+        udid: str = "",
+    ) -> CapabilityResult:
+        if not counter_condition.strip():
+            return self._err(
+                Capability.COUNTER_PROBE,
+                "counter_probe requires counter_condition",
+            )
+        if not (
+            counter_expect.startswith("summary_contains:")
+            or counter_expect.startswith("artifact_contains:")
+        ):
+            return self._err(
+                Capability.COUNTER_PROBE,
+                "counter_probe requires counter_expect="
+                "summary_contains:<text> or artifact_contains:<text>",
+            )
+        try:
+            capability = Capability(counter_capability)
+        except ValueError:
+            return self._err(
+                Capability.COUNTER_PROBE,
+                f"invalid counter_capability: {counter_capability}",
+            )
+        if capability == Capability.COUNTER_PROBE:
+            return self._err(
+                Capability.COUNTER_PROBE,
+                "counter_probe cannot invoke itself",
+            )
+        result = self.invoke(
+            capability,
+            scheme=scheme,
+            bundle_id=bundle_id,
+            predicate=predicate,
+            udid=udid,
+        )
+        if not result.ok():
+            return self._err(
+                Capability.COUNTER_PROBE,
+                f"counter condition failed: {result.summary}",
+                result.evidence_dir,
+                result.artifacts,
+            )
+        expectation_kind, expected_text = counter_expect.split(":", 1)
+        matched = False
+        if expected_text:
+            if expectation_kind == "summary_contains":
+                matched = expected_text in result.summary
+            else:
+                evidence_root = Path(result.evidence_dir)
+                if evidence_root.is_dir():
+                    for item in evidence_root.rglob("*"):
+                        if not item.is_file() or item.stat().st_size > 2_000_000:
+                            continue
+                        try:
+                            text = item.read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        except OSError:
+                            continue
+                        if expected_text in text:
+                            matched = True
+                            break
+        if not matched:
+            return self._err(
+                Capability.COUNTER_PROBE,
+                f"counter expectation did not match: {counter_expect}",
+                result.evidence_dir,
+                result.artifacts,
+            )
+        edir = self.writer._dir("counter_probe")
+        artifact = Path(edir) / "counter-result.json"
+        artifact.write_text(
+            json.dumps({
+                "condition": counter_condition,
+                "capability": capability.value,
+                "expectation": counter_expect,
+                "matched": True,
+                "result": result.to_dict(),
+                "captured_at": time.time(),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        evidence = self.writer.register_file(
+            capability="counter_probe",
+            source=f"{self.platform_id}.{self.mode}",
+            file_path=str(artifact),
+            summary=f"反证条件已执行: {counter_condition}",
+        )
+        return self._ok(
+            Capability.COUNTER_PROBE,
+            f"[{self.mode}] 反证条件已执行",
+            str(edir),
+            [evidence.id],
+        )
+
     # ---- CRASH ----
-    def _crash(self, *, udid: str = "", bundle_id: str = "") -> CapabilityResult:
+    def _crash(self, *, udid: str = "", bundle_id: str = "",
+               task_id: str = "direct", run_id: str = "direct",
+               since_seconds: int = 600) -> CapabilityResult:
         """采集本地 crash report（.ips/.crash）。
 
         模拟器：扫 ~/Library/Logs/DiagnosticReports（模拟器 crash 也落这里）。
         真机：xcrun devicectl device copy from 拉设备 crash 目录（需 device udid）。
         """
         edir = self.writer._dir("crash")
+        bundle = bundle_id or self.config.get("bundle_id", "")
+        if not bundle:
+            return self._err(
+                Capability.CRASH,
+                f"[{self.mode}] crash 采集需要 bundle_id",
+                str(edir),
+            )
+        since = time.time() - max(1, int(since_seconds))
+        if task_id != "direct":
+            state_path = self.state_dir / f"last-run-{task_id}.json"
+            if not state_path.is_file():
+                return self._err(
+                    Capability.CRASH,
+                    f"[{self.mode}] 本次 crash 未绑定前序成功 run",
+                    str(edir),
+                )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if (
+                state.get("status") != "success"
+                or state.get("task_id") != task_id
+                or state.get("run_id") != run_id
+                or state.get("mode") != self.mode
+                or state.get("bundle_id") != bundle
+                or state.get("device_id") != (
+                    (udid or self.config.get("device_udid", ""))
+                    if self.mode == "real"
+                    else (udid or self.config.get("sim_udid", "booted"))
+                )
+            ):
+                return self._err(
+                    Capability.CRASH,
+                    f"[{self.mode}] crash run binding mismatch",
+                    str(edir),
+                )
+            since = float(state.get("started_at", since))
         if self.mode == "simulator":
             reports_dir = Path.home() / "Library" / "Logs" / "DiagnosticReports"
             if not reports_dir.exists():
                 return self._err(Capability.CRASH, "[simulator] 无 DiagnosticReports 目录", str(edir))
-            bundle = bundle_id or self.config.get("bundle_id", "")
             crashes = sorted(reports_dir.glob("*.ips"), key=lambda p: p.stat().st_mtime, reverse=True)
+            crashes = [item for item in crashes if item.stat().st_mtime >= since]
             if bundle:
-                # 粗筛：文件名或内容含 bundle 短名
                 short = bundle.split(".")[-1]
-                crashes = [c for c in crashes if short.lower() in c.name.lower()] or crashes[:5]
-            else:
-                crashes = crashes[:5]
+                crashes = [
+                    crash for crash in crashes
+                    if crash.name.lower().startswith(short.lower() + "-")
+                    or bundle.lower() in crash.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).lower()
+                ]
             if not crashes:
-                return self._ok(Capability.CRASH, "[simulator] 近期无 crash report", str(edir))
+                manifest = Path(edir) / "absence.json"
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "bundle_id": bundle,
+                            "since": since,
+                            "run_id": run_id,
+                            "matches": 0,
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                ev = self.writer.register_file(
+                    capability="crash",
+                    source=f"{self.platform_id}.simulator",
+                    file_path=str(manifest),
+                    summary=f"{bundle} 在绑定时间窗内无 crash report",
+                )
+                return self._ok(
+                    Capability.CRASH,
+                    "[simulator] 绑定时间窗内无目标 App crash report",
+                    str(edir),
+                    [ev.id],
+                )
             latest = crashes[0]
             dest = Path(edir) / latest.name
             dest.write_text(latest.read_text(errors="replace"), encoding="utf-8")
@@ -768,12 +992,67 @@ class IOSNativePlugin:
             udid = udid or self.config.get("device_udid", "")
             if not udid:
                 return self._err(Capability.CRASH, "真机 crash 采集需要 device udid")
+            raw_dir = Path(edir) / "raw"
             out = self.runner.run(
                 ["xcrun", "devicectl", "device", "copy", "from", "--device", udid,
-                 "--source", "/var/mobile/Library/Logs/CrashReporter", "--destination", str(edir)],
+                 "--source", "/var/mobile/Library/Logs/CrashReporter",
+                 "--destination", str(raw_dir)],
                 timeout=300)
-            ev, _ = self.writer.from_command(capability="crash", source=f"{self.platform_id}.real",
-                                             out=out, summary=("真机 crash 已拉取" if out.ok() else "真机 crash 拉取失败"))
-            if out.ok():
+            candidates = [
+                item for item in raw_dir.rglob("*")
+                if item.is_file() and item.suffix.lower() in {".ips", ".crash"}
+            ]
+            short = bundle.split(".")[-1].lower()
+            reports = [
+                item for item in candidates
+                if item.stat().st_mtime >= since
+                and (
+                    item.name.lower().startswith(short + "-")
+                    or bundle.lower() in item.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).lower()
+                )
+            ]
+            selected = []
+            for report in reports:
+                destination = Path(edir) / report.name
+                shutil.copy2(report, destination)
+                selected.append(destination)
+            shutil.rmtree(raw_dir, ignore_errors=True)
+            ev, _ = self.writer.from_command(
+                capability="crash",
+                source=f"{self.platform_id}.real",
+                out=out,
+                summary=("真机 crash 查询完成" if out.ok()
+                         else "真机 crash 拉取失败"),
+                directory=edir,
+                outcome="success" if out.ok() else "failure",
+            )
+            if out.ok() and selected:
                 return self._ok(Capability.CRASH, "[real] 真机 crash report 已拉取", str(edir), [ev.id])
+            if out.ok():
+                absence = Path(edir) / "absence.json"
+                absence.write_text(
+                    json.dumps({
+                        "bundle_id": bundle,
+                        "device_id": udid,
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "since": since,
+                        "matches": 0,
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                absence_evidence = self.writer.register_file(
+                    capability="crash",
+                    source=f"{self.platform_id}.real",
+                    file_path=str(absence),
+                    summary=f"{bundle} 在绑定真机 run 中无 crash report",
+                )
+                return self._ok(
+                    Capability.CRASH,
+                    "[real] 绑定 run 内无目标 App crash report",
+                    str(edir),
+                    [ev.id, absence_evidence.id],
+                )
             return self._err(Capability.CRASH, "[real] 真机 crash 拉取失败（设备权限/路径？）", str(edir), [ev.id])

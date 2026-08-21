@@ -273,7 +273,6 @@ class AcceptanceStore:
             artifact_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         )
         data["result"] = result.to_dict()
-        data["package"]["status"] = "reviewed"
         self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return result
 

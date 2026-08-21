@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from .wda_client import WDAClient
+from kernel.storage import file_lock
 
 WDA_REPOSITORY = "https://github.com/appium/WebDriverAgent.git"
 WDA_VERSION = "v16.1.1"
@@ -216,6 +217,10 @@ class WDAManager:
         return "".join(output)
 
     def prepare(self, timeout: float = 120.0) -> dict:
+        with file_lock(self.root / ".runtime.lock"):
+            return self._prepare_locked(timeout)
+
+    def _prepare_locked(self, timeout: float) -> dict:
         current = self.status()
         current_runtime = current.get("runtime") or {}
         if (
@@ -225,7 +230,12 @@ class WDAManager:
         ):
             return current
         if current["ready"] or current_runtime:
-            self.stop()
+            stopped = self._stop_locked()
+            if stopped.get("unresolved"):
+                raise RuntimeError(
+                    "cannot replace WDA while prior process ownership is unresolved: "
+                    f"{stopped['unresolved']}"
+                )
         self.install_source()
         iproxy = shutil.which("iproxy")
         if not iproxy:
@@ -284,6 +294,10 @@ class WDAManager:
             raise
 
     def stop(self) -> dict:
+        with file_lock(self.root / ".runtime.lock"):
+            return self._stop_locked()
+
+    def _stop_locked(self) -> dict:
         state = self._read_state()
         stopped = []
         for key, marker, identity_key in (
@@ -296,8 +310,34 @@ class WDAManager:
             ):
                 self._terminate_pid_tree(pid)
                 stopped.append(pid)
+        unresolved = [
+            key for key, marker, identity_key in (
+                ("wda_pid", "xcodebuildmcp", "wda_identity_sha256"),
+                ("proxy_pid", "iproxy", "proxy_identity_sha256"),
+            )
+            if int(state.get(key) or 0) > 0
+            and int(state.get(key) or 0) not in stopped
+            and self._pid_exists(int(state.get(key) or 0))
+            and not self._pid_matches(
+                int(state.get(key) or 0),
+                marker,
+                str(state.get(identity_key, "")),
+            )
+        ]
+        if unresolved:
+            return {"stopped": stopped, "unresolved": unresolved}
         self._write_state({})
-        return {"stopped": stopped}
+        return {"stopped": stopped, "unresolved": []}
+
+    @staticmethod
+    def _pid_exists(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
 
     def _read_state(self) -> dict:
         if not self.state_path.exists():

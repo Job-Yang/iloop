@@ -54,6 +54,8 @@ class EvidenceArtifact:
         """Observed is provenance, not verdict. Only successful observations support completion."""
         if not self.is_observed() or self.outcome != "success":
             return False
+        if self.created_at > time.time() + 5:
+            return False
         for key, expected in (expected_bindings or {}).items():
             if expected not in (None, "") and self.metadata.get(key) != expected:
                 return False
@@ -121,6 +123,7 @@ class EvidenceArtifact:
             "device_id": self.metadata.get("device_id", ""),
             "subjects": self.metadata.get("subjects", []),
             "gates": self.metadata.get("gates", []),
+            "created_at": self.created_at,
         }
         return all(
             row.get(key, "" if key == "source_run_id" else None) == value

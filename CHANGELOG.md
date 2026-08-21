@@ -2,6 +2,27 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与语义化版本。
 
+## [0.2.0] - 2026-08-21
+
+### [breaking-entry] 受信宿主入口
+- 新增 `python3 -m host_cli` 作为默认用户入口，证明账本独立存放于
+  `~/.iloop/host-trust/`；低层 `cli` 保持 fail closed。
+- 新增只读验收 preflight 子进程和 fresh-clone 旅程 CI；最终高风险 pass 仍只接受外部宿主证明。
+
+### 修复
+- Task policy 绑定 goal、constraints、acceptance 和稳定 step ID；证据 receipt
+  绑定 created_at；Capability Gate 取消凭证重新核验 task/operation/user/reason。
+- Task 与 UI Flow 使用随机唯一 ID；公共路径做 containment 校验；关键状态写入
+  增加跨进程锁、原子替换和中断事务 journal。
+- 扩展脚手架可立即校验；畸形扩展隔离、合并原子化，并校验内核版本约束。
+- 真机 build 不再传非法 `--device-id`；真机 UI 动作写入响应证据；日志零命中
+  不再成功；crash 按 bundle、run 和时间窗筛选；WDA prepare/stop 串行化。
+- 单独“回归”路由到 L1 验证，L2/L3 缺 Git 工程根时创建前直接拒绝。
+
+### 验证
+- selftest 237 条断言：内核 166 + iOS 插件 71。
+- fresh-clone managed-host 旅程覆盖低风险四关与最终 wrapup，并验证高风险验收 fail closed。
+
 ## [0.1.1] - 2026-08-19
 
 ### 修复

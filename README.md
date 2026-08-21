@@ -140,37 +140,44 @@ brew tap getsentry/xcodebuildmcp
 brew install xcodebuildmcp
 
 # 内核与插件自测
-python3 -m cli selftest
+python3 -m host_cli selftest
 
 # 看 iLoop 会怎么处理一个任务
-python3 -m cli plan "帮我修复下单页崩溃"
+python3 -m host_cli plan "帮我修复下单页崩溃"
 
 # iOS 环境体检
-python3 -m cli doctor
+python3 -m host_cli doctor
 
 # 创建可恢复任务；能力结果、轮次和看板写入 ~/.iloop/data/
 export ILOOP_PROJECT_ROOT=/path/to/your/app
-python3 -m cli run "帮我修复下单页崩溃" \
+python3 -m host_cli run "帮我修复下单页崩溃" \
   constraints="不改公共 API" \
   acceptance="编译通过;拉起无 crash"
 
 # 中断或换会话后恢复
-python3 -m cli tasks
-python3 -m cli resume <task_id> caps=build,run,logs \
+python3 -m host_cli tasks
+python3 -m host_cli resume <task_id> caps=build,run,logs \
   workspace=App.xcworkspace scheme=App sim_udid=<simulator-id> \
   subjects=Sources/Feature.swift,Tests/FeatureTests.swift
 
 # 查看证据缺口给出的下一动作；重构收口前逐项复核完整 diff
-python3 -m cli next <task_id>
-python3 -m cli global-review prepare <task_id> project_root=$ILOOP_PROJECT_ROOT
+python3 -m host_cli next <task_id>
+python3 -m host_cli global-review prepare <task_id> project_root=$ILOOP_PROJECT_ROOT
 
-# 高影响改动：生成验收包，交给外部只读 Agent，再回写结论
-python3 -m cli accept prepare <task_id>
+# 高影响改动：生成验收包；本地 review 只做 preflight
+python3 -m host_cli accept prepare <task_id>
+python3 -m host_cli accept review <task_id>
 ```
 
-独立验收身份属于宿主信任边界。普通 CLI 进程不可信，`accept record` 默认拒绝回写；宿主必须在创建任务时提供并证明执行者身份，另行证明 reviewer 身份不同于执行者后，才能通过 `AcceptanceStore.record_file(..., verify_attestation=...)` API 写入。仅填写 reviewer 名称或设置环境变量都不算独立验收。
+`host_cli` 是开源版默认入口。它把证明记录在任务目录之外的
+`~/.iloop/host-trust/`，用于防止任务状态文件自行补签。它不对抗同一 OS
+用户主动修改 iLoop 源码或已安装的可信插件。内置 `accept review` 会启动只读
+preflight 子进程，但永远不签发最终 `pass`；高风险任务必须由外部 Agent 宿主
+验证 reviewer 身份和 evidence subjects，再通过
+`AcceptanceStore.record_file(...)` / Runtime verifier API 回写。
 
-同理，CLI 不能手工写 observed evidence、用户确认、平台完成/取消。`trusted_producer` 只是来源声明，不是身份证明；Plugin receipt、Task 创建策略和 Capability requirements 都必须由进程外宿主 verifier 复验。未接入受信宿主回调时可以执行和取证，但 `wrapup` 保持 blocked。
+`python3 -m cli` 保留为低层 fail-closed 调试入口：它可以规划和取证，但不能
+自行给 Task policy、平台完成或独立验收签字，因此不能完成 `wrapup`。
 
 宿主集成入口只有一个：
 
@@ -188,7 +195,9 @@ runtime = Runtime(
 
 `project_root` 用于隔离不同工程的数据；也可固定设置 `ILOOP_PROJECT_ROOT`。任务、证据和看板默认写入 `~/.iloop/data/<project-id>/`，不污染业务仓。
 
-然后把仓根的 [AGENT_PROMPT.md](AGENT_PROMPT.md) 作为项目规则或 Agent 入口加载到 Claude Code、Codex、Cursor 或自建宿主。提示词、内核和插件一起随仓库分发，不需要再拉第二套工具链。
+然后把仓根的 [AGENT_PROMPT.md](AGENT_PROMPT.md) 作为项目规则或 Agent
+入口加载到 Claude Code、Codex、Cursor 或自建宿主。默认调用
+`python3 -m host_cli`；提示词、内核、宿主适配和插件一起随仓库分发。
 
 ---
 
@@ -217,9 +226,10 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.1.1`，首发范围是**平台无关内核 + iOS 官方插件**。
+版本 `0.2.0`，当前范围是**平台无关内核 + 受信宿主入口 + iOS 官方插件**。
 
-- selftest 206 条断言全绿：内核 148 + iOS 插件 58。
+- selftest 237 条断言全绿：内核 166 + iOS 插件 71。
+- 公开 CI 额外运行 fresh-clone managed-host 旅程，覆盖低风险 Task 的四关与最终 `wrapup`，并验证高风险任务在缺外部 reviewer 时 fail closed。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
 - 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。

@@ -47,8 +47,8 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "name": name,
-        "version": "0.1.1",
-        "iloop_kernel": ">=0.1.1",
+        "version": "0.2.0",
+        "iloop_kernel": ">=0.2.0",
         "description": f"{name} iLoop extension",
         "provides": {"flows": FLOWS_NAME, "plugin": None},
     }
@@ -82,21 +82,56 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
     if not re.match(r"^[a-z0-9_]+\.[a-z0-9_]+$", ext.name):
         issues.append(ValidationIssue("error", f"扩展名非法: {ext.name}"))
 
+    provides = ext.manifest.get("provides", {})
+    if not isinstance(provides, dict):
+        issues.append(ValidationIssue("error", "manifest.provides must be an object"))
+        provides = {}
+    requirement = str(ext.manifest.get("iloop_kernel", "")).strip()
+    if requirement:
+        from . import __version__
+        match = re.fullmatch(r">=\s*(\d+)\.(\d+)\.(\d+)", requirement)
+        current = tuple(int(part) for part in __version__.split(".")[:3])
+        if not match:
+            issues.append(ValidationIssue(
+                "error", f"unsupported iloop_kernel requirement: {requirement}"
+            ))
+        elif current < tuple(int(part) for part in match.groups()):
+            issues.append(ValidationIssue(
+                "error",
+                f"extension requires iLoop {requirement}, current={__version__}",
+            ))
+
     flows_file = ext.root / FLOWS_NAME
     if flows_file.exists():
         try:
-            flows = json.loads(flows_file.read_text(encoding="utf-8"))
+            payload = json.loads(flows_file.read_text(encoding="utf-8"))
+            flows = payload if isinstance(payload, list) else payload.get("flows", [])
+            if not isinstance(flows, list):
+                raise TypeError("flows must be an array")
         except Exception as e:
             issues.append(ValidationIssue("error", f"flows.json 解析失败: {e}"))
             flows = []
+        seen = set()
         for f in flows:
+            if not isinstance(f, dict):
+                issues.append(ValidationIssue("error", "each flow must be an object"))
+                continue
             fid = f.get("flow_id", "")
+            if fid in seen:
+                issues.append(ValidationIssue("error", f"duplicate flow_id '{fid}'"))
+            seen.add(fid)
             if not fid.startswith(ext.name + "."):
                 issues.append(ValidationIssue("error",
                     f"flow_id '{fid}' 必须以扩展名 '{ext.name}.' 为前缀（防覆盖核心）"))
             if fid in core_flow_ids:
                 issues.append(ValidationIssue("error", f"flow_id '{fid}' 与核心 flow 冲突"))
-    plugin_path = ext.manifest.get("provides", {}).get("plugin")
+            try:
+                Flow(**f)
+            except (TypeError, ValueError) as error:
+                issues.append(ValidationIssue(
+                    "error", f"flow '{fid}' schema invalid: {error}"
+                ))
+    plugin_path = provides.get("plugin")
     if plugin_path:
         candidate = (ext.root / plugin_path).resolve()
         if ext.root.resolve() not in candidate.parents:
@@ -137,15 +172,28 @@ def load_installed_extensions(reg: FlowRegistry, base_dir: str | Path) -> tuple[
             issues.append(ValidationIssue("error", f"{root.name}: manifest 加载失败: {exc}"))
             continue
 
-        ext_issues = validate_extension(ext, core_flow_ids=core_ids)
+        try:
+            ext_issues = validate_extension(ext, core_flow_ids=core_ids)
+        except Exception as exc:
+            issues.append(ValidationIssue(
+                "error", f"{root.name}: validation failed: {exc}"
+            ))
+            continue
         if has_errors(ext_issues):
             issues.extend(
                 ValidationIssue(i.level, f"{ext.name}: {i.message}") for i in ext_issues
             )
             continue
         try:
-            loaded += merge_into_registry(reg, ext)
-            core_ids.update(f.flow_id for f in reg.all())
+            staging = FlowRegistry()
+            for flow in reg.all():
+                staging.register(flow)
+            count = merge_into_registry(staging, ext)
+            for flow in staging.all():
+                if flow.flow_id not in core_ids:
+                    reg.register(flow)
+                    core_ids.add(flow.flow_id)
+            loaded += count
         except Exception as exc:
             issues.append(ValidationIssue("error", f"{ext.name}: flow 合并失败: {exc}"))
     return loaded, issues

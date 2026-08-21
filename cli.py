@@ -11,7 +11,7 @@
   python3 -m cli next <task_id>
   python3 -m cli capability require|complete|cancel|status <task_id>
   python3 -m cli global-review prepare|show|record <task_id>
-  python3 -m cli accept prepare|record|status <task_id>
+  python3 -m cli accept prepare|review|record|status <task_id>
   python3 -m cli wrapup <task_id>
   python3 -m cli round start|end <task_id> [...]
   python3 -m cli lessons search|add ...
@@ -36,6 +36,7 @@ import os
 import sys
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -47,11 +48,21 @@ from kernel import (  # noqa: E402
     Runtime, TaskStore, TaskStatus, TaskStep, StepStatus, Lesson, LessonBook, Ledger, RoundStatus,
     AcceptancePackage, AcceptanceStore, Verdict, EvidenceKind, CapabilityGate,
     GlobalReview, ProjectMemory, UIFlowStore, ACTION_CAPABILITY,
-    load_installed_plugins,
+    load_installed_plugins, HostTrustStore,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
 
 FLOWS_JSON = ROOT / "workflow" / "flows.json"
+
+
+def _host_trust() -> HostTrustStore | None:
+    if os.environ.get("ILOOP_MANAGED_HOST") != "1":
+        return None
+    root = os.environ.get(
+        "ILOOP_HOST_TRUST_DIR",
+        str(Path.home() / ".iloop" / "host-trust"),
+    )
+    return HostTrustStore(root)
 
 
 def _data_dir(project_root: str = "") -> Path:
@@ -86,7 +97,15 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
                        if candidate.platform_id == platform), None)
         if plugin is None:
             raise ValueError(f"extension platform plugin not found: {platform}")
-    return Runtime(data_dir, _registry(), plugin, project_root=project_root)
+    trust = _host_trust()
+    return Runtime(
+        data_dir,
+        _registry(),
+        plugin,
+        project_root=project_root,
+        attestation_verifier=trust.verify if trust else None,
+        attestation_recorder=trust.attest if trust else None,
+    )
 
 
 def _split(value: str) -> list[str]:
@@ -105,12 +124,15 @@ def _print_resume_card(runtime: Runtime, task) -> None:
 def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
     runtime = _runtime(real, kwargs)
     capabilities = _split(kwargs.pop("caps", kwargs.pop("capabilities", "")))
+    executor_id = kwargs.pop("executor_id", "")
+    if _host_trust() is not None and not executor_id:
+        executor_id = os.environ.get("ILOOP_EXECUTOR_ID", "iloop-managed-host")
     task = runtime.start(
         task_text,
         constraints=_split(kwargs.pop("constraints", "")),
         acceptance=_split(kwargs.pop("acceptance", "")),
         capabilities=capabilities,
-        executor_id=kwargs.pop("executor_id", ""),
+        executor_id=executor_id,
     )
     if capabilities:
         task = runtime.execute_capabilities(task, capabilities, **kwargs)
@@ -266,7 +288,9 @@ def cmd_case(action: str, task_id: str) -> int:
     except ValueError as error:
         print(render("blocked", str(error)))
         return 1
-    path = _data_dir() / "runtime" / task_id / "case.json"
+    runtime = _runtime(False, {})
+    task = runtime.load(task_id)
+    path = Path(task.case_path)
     case = Case.load(path)
     if action == "show":
         print(json.dumps(case.to_dict(), ensure_ascii=False, indent=2))
@@ -277,7 +301,15 @@ def cmd_case(action: str, task_id: str) -> int:
                          ensure_ascii=False, indent=2))
         return 0
     if action == "resolve":
-        ok, message = case.try_resolve()
+        verifier = None
+        if runtime.attestation_verifier is not None:
+            verifier = lambda path, row: runtime.attestation_verifier(
+                "evidence", path, row
+            )
+        ok, message = case.try_resolve(
+            verifier,
+            {"task_id": task.id, "flow_id": task.flow_id},
+        )
         case.save(path)
         print(render("verify" if ok else "blocked", message))
         return 0 if ok else 1
@@ -308,7 +340,7 @@ def cmd_case_write(action: str, task_id: str, rest: list[str]) -> int:
         if kind == EvidenceKind.OBSERVED:
             print(render(
                 "blocked",
-                "CLI 不可信，不能手工写 observed evidence；请执行受信 Capability",
+                "不能从任意文件导入 observed evidence；请执行 managed Capability",
             ))
             return 1
         else:
@@ -390,17 +422,57 @@ def cmd_capability_gate(action: str, task_id: str, rest: list[str]) -> int:
         runtime.require_operation(task, op_id, reason)
         gate = CapabilityGate.load(task.capability_gate_path)
     elif action == "complete":
-        print(render(
-            "blocked",
-            "CLI 不可信，不能完成平台 Gate；由受信宿主 Adapter 通过 API 回写",
-        ))
-        return 1
+        evidence_path = values.get("evidence", "")
+        trust = _host_trust()
+        if (
+            trust is None
+            or not evidence_path
+            or not trust.verify(
+                "capability",
+                Path(evidence_path),
+                json.loads(Path(evidence_path).read_text(encoding="utf-8")),
+            )
+        ):
+            print(render(
+                "blocked",
+                "平台 Gate 只接受已由宿主 Adapter 记录的 capability receipt",
+            ))
+            return 1
+        path = Path(evidence_path)
+        row = json.loads(path.read_text(encoding="utf-8"))
+        gate.complete(
+            values.get("id", ""),
+            evidence_path,
+            verify_attestation=lambda path, payload: trust.verify(
+                "capability", path, payload
+            ),
+        )
     elif action == "cancel":
-        print(render(
-            "blocked",
-            "CLI 不可信，不能取消平台 Gate；由受信宿主根据用户确认通过 API 回写",
-        ))
-        return 1
+        attestation_path = values.get("attestation", "")
+        trust = _host_trust()
+        if (
+            trust is None
+            or not attestation_path
+            or not trust.verify(
+                "user_confirmation",
+                Path(attestation_path),
+                json.loads(Path(attestation_path).read_text(encoding="utf-8")),
+            )
+        ):
+            print(render(
+                "blocked",
+                "取消 Gate 只接受宿主交互层已记录的 user confirmation",
+            ))
+            return 1
+        path = Path(attestation_path)
+        row = json.loads(path.read_text(encoding="utf-8"))
+        gate.close(
+            values.get("id", ""),
+            attestation_path=attestation_path,
+            verify_attestation=lambda path, payload: trust.verify(
+                "user_confirmation", path, payload
+            ),
+        )
     elif action != "status":
         print("usage: capability require|complete|cancel|status <task_id> ...")
         return 2
@@ -502,34 +574,126 @@ def cmd_accept(action: str, task_id: str, rest: list[str]) -> int:
     store = AcceptanceStore(task.acceptance_path)
     values = _parse_kv(rest)
     if action == "prepare":
+        policy_path = runtime._task_policy_path(task.id)
+        policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if (
+            runtime.attestation_verifier is None
+            or not runtime.attestation_verifier(
+                "task_policy", policy_path, policy
+            )
+        ):
+            print(render(
+                "blocked",
+                "acceptance package requires the original host-attested task policy",
+            ))
+            return 1
         fingerprint = ""
         if task.global_review_path and Path(task.global_review_path).exists():
             fingerprint = GlobalReview.load(task.global_review_path).fingerprint
         package = AcceptancePackage(
             case_id=task.id,
-            goal=task.goal,
-            criteria=task.acceptance or ["目标与完整 diff 一致", "关键路径有成功 observed 证据"],
+            goal=str(policy.get("goal", task.goal)),
+            criteria=list(policy.get("acceptance", [])) or [
+                "目标与完整 diff 一致",
+                "关键路径有成功 observed 证据",
+            ],
             evidence=runtime.evidence(task.id),
             subject_fingerprint=fingerprint,
-            executor_id=task.executor_id,
+            executor_id=str(policy.get("executor_id", task.executor_id)),
         )
         store.prepare(package)
+        trust = _host_trust()
+        if trust is not None:
+            trust.attest(
+                "acceptance_package",
+                store.path,
+                package.to_dict(),
+            )
         task.independent_acceptance_required = True
         task.acceptance_status = "prepared"
         runtime.tasks.save(task)
         print(json.dumps(package.to_dict(), ensure_ascii=False, indent=2))
         return 0
     if action == "record":
-        print(render(
-            "blocked",
-            "CLI 不可信，不能回写独立验收；由宿主通过 AcceptanceStore.record_file(verifier) API 写入",
-        ))
-        return 1
+        result_path = values.get("result", "")
+        trust = _host_trust()
+        if (
+            trust is None
+            or not result_path
+            or not trust.verify(
+                "independent_review",
+                Path(result_path),
+                json.loads(Path(result_path).read_text(encoding="utf-8")),
+            )
+        ):
+            print(render(
+                "blocked",
+                "外部验收结果必须先由真实宿主 Adapter 证明；本地请用 accept review",
+            ))
+            return 1
+        path = Path(result_path)
+        try:
+            result = runtime.record_external_acceptance(task, path)
+        except ValueError as error:
+            print(render("blocked", str(error)))
+            return 1
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if action == "review":
+        trust = _host_trust()
+        if trust is None:
+            print(render(
+                "blocked",
+                "本地独立验收需要使用 python3 -m host_cli accept review",
+            ))
+            return 1
+        if not store.path.is_file():
+            print(render("blocked", "acceptance package has not been prepared"))
+            return 1
+        package_payload = store.load_raw().get("package") or {}
+        if not trust.verify(
+            "acceptance_package",
+            store.path,
+            package_payload,
+        ):
+            print(render("blocked", "acceptance package was modified after preparation"))
+            return 1
+        result_path = (
+            runtime._task_dir(task.id) / "acceptance-worker-result.json"
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "acceptance_worker",
+                str(store.path),
+                str(result_path),
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if completed.returncode:
+            print(render(
+                "blocked",
+                f"independent acceptance worker failed: {completed.stderr.strip()}",
+            ))
+            return 1
+        row = json.loads(result_path.read_text(encoding="utf-8"))
+        trust.attest("independent_review", result_path, row)
+        try:
+            result = runtime.record_external_acceptance(task, result_path)
+        except ValueError as error:
+            print(render("blocked", str(error)))
+            return 1
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0
     if action == "status":
         print(json.dumps(store.load_raw(), ensure_ascii=False, indent=2))
         # CLI has no trusted host attestation verifier, so status is informational.
-        return 1
-    print("usage: accept prepare|record|status <task_id> [result=/path/to/reviewer-result.json]")
+        return 0
+    print("usage: accept prepare|review|record|status <task_id> [result=/path/to/reviewer-result.json]")
     return 2
 
 
@@ -643,7 +807,17 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
                     row = json.loads(line)
                     evidence_by_id[row["id"]] = EvidenceArtifact(**row)
         try:
-            flow = store.verify(flow_id, evidence_by_id)
+            trust = _host_trust()
+            verifier = (
+                (lambda path, row: trust.verify("evidence", path, row))
+                if trust is not None
+                else None
+            )
+            flow = store.verify(
+                flow_id,
+                evidence_by_id,
+                verify_attestation=verifier,
+            )
         except ValueError as error:
             print(render("blocked", str(error)))
             return 1
@@ -652,11 +826,7 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
     if action == "to-task":
         flow = store.load(flow_id)
         runtime = _runtime(False, {})
-        task = runtime.start(
-            f"验证 UI 路径 {flow.name}",
-            acceptance=[flow.goal],
-        )
-        task.steps = [
+        steps = [
             TaskStep(
                 title=f"{node.action}: {node.target}",
                 capability=ACTION_CAPABILITY[node.action],
@@ -664,7 +834,11 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
             )
             for node in flow.nodes
         ]
-        runtime.tasks.save(task)
+        task = runtime.start(
+            f"验证 UI 路径 {flow.name}",
+            acceptance=[flow.goal],
+            steps=steps,
+        )
         _print_resume_card(runtime, task)
         return 0
     print("usage: ui-flow new|list|show|verify|to-task ...")
@@ -672,8 +846,7 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
 
 
 def _registry() -> FlowRegistry:
-    reg = FlowRegistry()
-    reg.load_json(FLOWS_JSON)
+    reg = _core_registry()
     from kernel import load_installed_extensions
     extensions_dir = os.environ.get(
         "ILOOP_EXTENSIONS_DIR",
@@ -682,6 +855,12 @@ def _registry() -> FlowRegistry:
     _, issues = load_installed_extensions(reg, extensions_dir)
     for issue in issues:
         print(f"  ⚠️ 扩展未加载: {issue.message}", file=sys.stderr)
+    return reg
+
+
+def _core_registry() -> FlowRegistry:
+    reg = FlowRegistry()
+    reg.load_json(FLOWS_JSON)
     return reg
 
 
@@ -841,7 +1020,7 @@ def cmd_extension_init(name: str, base_dir: str) -> int:
 
 def cmd_extension_validate(root: str) -> int:
     from kernel import load_extension, validate_extension, has_errors
-    reg = _registry()
+    reg = _core_registry()
     core_ids = {f.flow_id for f in reg.all()}
     ext = load_extension(root)
     issues = validate_extension(ext, core_flow_ids=core_ids)

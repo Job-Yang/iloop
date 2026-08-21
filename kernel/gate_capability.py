@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import hashlib
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -33,6 +34,7 @@ class RequiredOperation:
     op_id: str
     reason: str
     task_id: str = ""
+    requirement_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: OpStatus = OpStatus.BLOCKED
     created_at: float = field(default_factory=time.time)
     evidence_path: str = ""
@@ -47,6 +49,7 @@ class RequiredOperation:
             "op_id": self.op_id,
             "reason": self.reason,
             "task_id": self.task_id,
+            "requirement_id": self.requirement_id,
             "status": self.status.value,
             "created_at": self.created_at,
             "evidence_path": self.evidence_path,
@@ -101,8 +104,17 @@ class CapabilityGate:
                 raise ValueError("capability evidence operation_id mismatch")
             if receipt.get("task_id") != self._ops[op_id].task_id:
                 raise ValueError("capability evidence task_id mismatch")
+            if receipt.get("requirement_id") != self._ops[op_id].requirement_id:
+                raise ValueError("capability evidence requirement_id mismatch")
+            if float(receipt.get("required_at", 0)) != self._ops[op_id].created_at:
+                raise ValueError("capability evidence required_at mismatch")
             if receipt.get("kind") != "observed" or receipt.get("outcome") != "success":
                 raise ValueError("capability evidence must be observed success")
+            if (
+                float(receipt.get("created_at", 0)) < self._ops[op_id].created_at
+                or float(receipt.get("created_at", 0)) > time.time() + 5
+            ):
+                raise ValueError("capability evidence timestamp is outside requirement window")
             if float(receipt.get("expires_at", 0)) <= time.time():
                 raise ValueError("capability evidence attestation has expired")
             self._ops[op_id].status = OpStatus.COMPLETED
@@ -128,9 +140,13 @@ class CapabilityGate:
             if (
                 row.get("operation_id") != op_id
                 or row.get("task_id") != self._ops[op_id].task_id
+                or row.get("requirement_id") != self._ops[op_id].requirement_id
+                or float(row.get("required_at", 0)) != self._ops[op_id].created_at
                 or row.get("confirmed") is not True
                 or not str(row.get("reason", "")).strip()
                 or not row.get("user_id")
+                or float(row.get("created_at", 0)) < self._ops[op_id].created_at
+                or float(row.get("created_at", 0)) > time.time() + 5
                 or float(row.get("expires_at", 0)) <= time.time()
             ):
                 raise ValueError("capability cancellation attestation is incomplete")
@@ -181,8 +197,12 @@ class CapabilityGate:
                     if (
                         receipt.get("operation_id") != operation.op_id
                         or receipt.get("task_id") != operation.task_id
+                        or receipt.get("requirement_id") != operation.requirement_id
+                        or float(receipt.get("required_at", 0)) != operation.created_at
                         or receipt.get("kind") != "observed"
                         or receipt.get("outcome") != "success"
+                        or float(receipt.get("created_at", 0)) < operation.created_at
+                        or float(receipt.get("created_at", 0)) > time.time() + 5
                     ):
                         invalid.append(f"{operation.op_id}(平台证明主体或结论不匹配)")
                     if float(receipt.get("expires_at", 0)) <= time.time():
@@ -206,6 +226,21 @@ class CapabilityGate:
                         or not verify_attestation("user_confirmation", path, row)
                     ):
                         invalid.append(f"{operation.op_id}(用户取消证明无法复验)")
+                    if (
+                        row.get("operation_id") != operation.op_id
+                        or row.get("task_id") != operation.task_id
+                        or row.get("requirement_id") != operation.requirement_id
+                        or float(row.get("required_at", 0)) != operation.created_at
+                        or row.get("confirmed") is not True
+                        or str(row.get("reason", "")).strip()
+                        != operation.cancellation_reason
+                        or not row.get("user_id")
+                        or float(row.get("created_at", 0)) < operation.created_at
+                        or float(row.get("created_at", 0)) > time.time() + 5
+                    ):
+                        invalid.append(
+                            f"{operation.op_id}(用户取消证明主体或理由不匹配)"
+                        )
                     if float(row.get("expires_at", 0)) <= time.time():
                         invalid.append(f"{operation.op_id}(取消证明已过期)")
         if invalid:
@@ -239,6 +274,7 @@ class CapabilityGate:
                 op_id=row["op_id"],
                 reason=row["reason"],
                 task_id=row.get("task_id", ""),
+                requirement_id=row.get("requirement_id", ""),
                 status=OpStatus(row.get("status", "blocked")),
                 created_at=row.get("created_at", time.time()),
                 evidence_path=row.get("evidence_path", ""),

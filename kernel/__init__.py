@@ -48,6 +48,7 @@ from .runtime import Runtime
 from .global_review import GlobalReview, ImpactItem, analyze_global_impact
 from .project import ProjectMemory
 from .ui_flow import UIFlow, UINode, UIFlowStore, ACTION_CAPABILITY
+from .host import HostTrustStore
 
 
 def discover_developer_dir():
@@ -89,6 +90,7 @@ __all__ = [
     "GlobalReview", "ImpactItem", "analyze_global_impact",
     "ProjectMemory",
     "UIFlow", "UINode", "UIFlowStore", "ACTION_CAPABILITY",
+    "HostTrustStore",
 ]
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"

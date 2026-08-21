@@ -69,6 +69,7 @@
     "flow_id": "core.verify",
     "name": "验证验收",
     "autonomy": "L1",
+    "priority": 10,
     "when_keywords": ["验证", "验收", "回归", "verify", "acceptance"],
     "guidance": "按出错代价定强度：亏得起验得轻，亏不起验到底。高风险起独立验收。",
     "required_docs": ["SPEC.md", "docs/VDD.md", "prompts/record-wrapup.md"],

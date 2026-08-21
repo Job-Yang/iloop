@@ -97,6 +97,7 @@ def observed(
             "device_id": evidence.metadata.get("device_id", ""),
             "subjects": evidence.metadata.get("subjects", []),
             "gates": evidence.metadata.get("gates", []),
+            "created_at": evidence.created_at,
         }, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -373,16 +374,23 @@ def test_channel_and_gate() -> None:
 
     # 能力 Gate：有未完成必需操作时不许收口
     gate = CapabilityGate()
-    gate.require("notify.send", "需要通知渠道授权", task_id="task-gate")
+    operation = gate.require(
+        "notify.send", "需要通知渠道授权", task_id="task-gate"
+    )
     ok, _ = gate.can_wrapup()
     check("能力Gate: 有未完成必需操作时禁止收口", not ok)
     with tempfile.TemporaryDirectory() as d:
         evidence = Path(d) / "delivery.json"
-        evidence.write_text(
-            '{"operation_id":"notify.send","task_id":"task-gate",'
-            f'"kind":"observed","outcome":"success","expires_at":{time.time()+3600}}}',
-            encoding="utf-8",
-        )
+        evidence.write_text(__import__("json").dumps({
+            "operation_id": "notify.send",
+            "task_id": "task-gate",
+            "requirement_id": operation.requirement_id,
+            "required_at": operation.created_at,
+            "created_at": time.time(),
+            "kind": "observed",
+            "outcome": "success",
+            "expires_at": time.time() + 3600,
+        }), encoding="utf-8")
         gate.complete(
             "notify.send", str(evidence),
             verify_attestation=lambda path, row: True,
@@ -406,16 +414,21 @@ def test_channel_and_gate() -> None:
         ok3, _ = restored.can_wrapup(verifier)
         check("能力Gate: 回读证据删除后旧 completed 状态失效", not ok3)
         cancel_gate = CapabilityGate()
-        cancel_gate.require(
+        cancel_operation = cancel_gate.require(
             "optional.notify", "用户决定是否放弃通知", task_id="task-gate"
         )
         cancellation = Path(d) / "cancel.json"
-        cancellation.write_text(
-            '{"operation_id":"optional.notify","task_id":"task-gate","confirmed":true,'
-            f'"reason":"用户明确改为手动通知","user_id":"user-1",'
-            f'"expires_at":{time.time()+3600}}}',
-            encoding="utf-8",
-        )
+        cancellation.write_text(__import__("json").dumps({
+            "operation_id": "optional.notify",
+            "task_id": "task-gate",
+            "requirement_id": cancel_operation.requirement_id,
+            "required_at": cancel_operation.created_at,
+            "created_at": time.time(),
+            "confirmed": True,
+            "reason": "用户明确改为手动通知",
+            "user_id": "user-1",
+            "expires_at": time.time() + 3600,
+        }), encoding="utf-8")
         rejected = False
         try:
             cancel_gate.close(
@@ -770,7 +783,7 @@ def test_runtime_task_resume_and_evidence() -> None:
         registry.load_json(ROOT / "workflow" / "flows.json")
         runtime = Runtime(d, registry, FakePlugin())
         task = runtime.start(
-            "修复页面崩溃",
+            "验证页面行为",
             constraints=["不改公共 API"],
             acceptance=["编译通过"],
             capabilities=["build", "logs"],
@@ -864,7 +877,7 @@ def test_policy_and_constitution_cannot_be_forged_by_cli_state() -> None:
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
         runtime = Runtime(d, registry, FakePlugin(), project_root=d)
-        task = runtime.start("重构公共模块")
+        task = runtime.start("重构公共模块", executor_id="main-agent")
         task.global_review_required = False
         task.independent_acceptance_required = False
         task.title = "只读分析"
@@ -984,6 +997,7 @@ def test_attested_evidence_revalidates_exact_scope() -> None:
             "device_id": "",
             "subjects": ["feature.py"],
             "gates": ["mechanism"],
+            "created_at": time.time(),
             "expires_at": time.time() + 3600,
         }
         receipt = Path(d) / "external-receipt.json"
@@ -1014,7 +1028,7 @@ def test_wrapup_cannot_bypass_vdd_gates() -> None:
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
         runtime = Runtime(d, registry, FakePlugin())
-        task = runtime.start("实现一个功能")
+        task = runtime.start("验证一个功能")
         for step in task.steps:
             step.status = "done"
         runtime.tasks.save(task)
@@ -1274,6 +1288,7 @@ def test_global_review_uses_task_base_and_explicit_subjects() -> None:
         task = runtime.start(
             "重构公共模块",
             capabilities=["build"],
+            executor_id="main-agent",
         )
         source.write_text("def feature():\n    return 2\n", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=root, check=True)
@@ -1580,7 +1595,7 @@ def test_global_review_requires_consumer_evidence() -> None:
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
         runtime = Runtime(data, registry, FakePlugin(), project_root=root)
-        task = runtime.start("重构公共模块")
+        task = runtime.start("重构公共模块", executor_id="main-agent")
         review = runtime.prepare_global_review(task, root)
         evidence = observed(
             "service verified",
@@ -1734,6 +1749,323 @@ def test_ui_flow_verification_requires_evidence() -> None:
         check("UI Flow: 补证后可验证并持久化", verified.status == "verified")
 
 
+def test_release_audit_regressions() -> None:
+    import hashlib
+    import json
+    import subprocess
+    from kernel import (
+        CapabilityResult,
+        CapabilityStatus,
+        HostTrustStore,
+        ProjectMemory,
+        Runtime,
+        StepStatus,
+        TaskStep,
+        TaskStatus,
+        UIFlowStore,
+        has_errors,
+        load_installed_extensions,
+        scaffold_extension,
+        validate_extension,
+    )
+    from kernel.gate_capability import OpStatus
+
+    class FakePlugin:
+        platform_id = "fake"
+
+        def capabilities(self):
+            return list(Capability)
+
+        def invoke(self, capability, **kwargs):
+            evidence_root = Path(d) / "fake-plugin-evidence" / str(
+                kwargs.get("run_id", capability.value)
+            ).replace(":", "-")
+            evidence_root.mkdir(parents=True, exist_ok=True)
+            (evidence_root / "proof.log").write_text(
+                "verified", encoding="utf-8"
+            )
+            return CapabilityResult(
+                "fake",
+                capability.value,
+                CapabilityStatus.SUCCESS,
+                "verified",
+                str(evidence_root),
+            )
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d) / "repo"
+        data = Path(d) / "data"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"],
+                       cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"],
+                       cwd=root, check=True)
+        (root / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        trust = HostTrustStore(Path(d) / "trust")
+        runtime = Runtime(
+            data,
+            registry,
+            FakePlugin(),
+            project_root=root,
+            attestation_verifier=trust.verify,
+            attestation_recorder=trust.attest,
+        )
+        task = runtime.start("验证配置", executor_id="main-agent")
+        artifact = Path(d) / "proof.log"
+        artifact.write_text(
+            "对齐现象与范围 建立候选假设 执行最有区分度的取证 四关收敛",
+            encoding="utf-8",
+        )
+        for gate in ("time", "scope", "mechanism", "counter_evidence"):
+            evidence = observed(
+                f"{gate} verified",
+                metadata={
+                    "task_id": task.id,
+                    "run_id": f"run-{gate}",
+                    "flow_id": task.flow_id,
+                    "gates": [gate],
+                },
+            )
+            runtime._seal_trusted_evidence(task, evidence)
+            runtime._append_evidence(task.id, evidence)
+            task.evidence_ids.append(evidence.id)
+            case = Case.load(task.case_path)
+            case.attach("h1", evidence, gate=gate)
+            case.save(task.case_path)
+            for step in task.steps:
+                if not step.evidence_ids:
+                    step.evidence_ids = [evidence.id]
+                    step.status = StepStatus.DONE
+                    step.completion_source = "machine"
+        case = Case.load(task.case_path)
+        case.try_resolve(
+            lambda path, row: trust.verify("evidence", path, row),
+            {"task_id": task.id, "flow_id": task.flow_id},
+        )
+        case.save(task.case_path)
+        runtime.tasks.save(task)
+        journal = runtime._task_dir(task.id) / "transaction.json"
+        journal.write_text('{"operation":"interrupted"}', encoding="utf-8")
+        _, transaction_blockers = runtime.can_wrapup(task)
+        check("事务: 中断留下 journal 时禁止静默收口",
+              any("incomplete task transaction" in item
+                  for item in transaction_blockers))
+        journal.unlink()
+        completed = runtime.complete(task)
+        check("宿主: managed trust store 可完成真实 wrapup",
+              completed.status == TaskStatus.DONE)
+
+        task_path = runtime.tasks.path_for(task.id)
+        raw = json.loads(task_path.read_text(encoding="utf-8"))
+        raw["steps"] = []
+        raw["acceptance"] = []
+        task_path.write_text(json.dumps(raw), encoding="utf-8")
+        restored = runtime.load(task.id)
+        check("策略派生: 删除步骤和验收标准会从宿主证明恢复",
+              len(restored.steps) == 4)
+
+        first = runtime.tasks.create(
+            "same", goal="one", flow_id="core.verify", autonomy="L1"
+        )
+        second = runtime.tasks.create(
+            "same", goal="two", flow_id="core.verify", autonomy="L1"
+        )
+        check("任务: 同秒同标题仍生成唯一 ID", first.id != second.id)
+        stale = runtime.tasks.load(first.id)
+        current = runtime.tasks.load(first.id)
+        current.goal = "updated"
+        runtime.tasks.save(current)
+        stale_rejected = False
+        try:
+            runtime.tasks.save(stale)
+        except RuntimeError:
+            stale_rejected = True
+        check("任务: 并发陈旧写入被 revision CAS 拒绝", stale_rejected)
+
+        l2_rejected = False
+        runtime_without_root = Runtime(data / "no-root", registry, FakePlugin())
+        try:
+            runtime_without_root.start("实现功能")
+        except ValueError:
+            l2_rejected = True
+        check("任务: L2 缺 project_root 时创建前拒绝", l2_rejected)
+
+        gate = CapabilityGate()
+        gate.require("op-b", "required", task_id="task-b")
+        receipt = Path(d) / "cancel.json"
+        receipt.write_text(json.dumps({
+            "operation_id": "op-a",
+            "task_id": "task-a",
+            "confirmed": True,
+            "reason": "cancel",
+            "user_id": "user",
+            "expires_at": time.time() + 3600,
+        }), encoding="utf-8")
+        operation = gate._ops["op-b"]
+        operation.status = OpStatus.CANCELLED
+        operation.cancelled_by_user = True
+        operation.cancellation_reason = "cancel"
+        operation.cancellation_attestation_path = str(receipt)
+        operation.cancellation_attestation_sha256 = hashlib.sha256(
+            receipt.read_bytes()
+        ).hexdigest()
+        check("能力Gate: 跨任务取消凭证不能重放",
+              not gate.can_wrapup(lambda kind, path, row: True,
+                                  expected_task_id="task-b")[0])
+        replay_gate = CapabilityGate()
+        first_requirement = replay_gate.require(
+            "platform.read", "read", task_id="task-replay"
+        )
+        completion = Path(d) / "completion.json"
+        completion.write_text(json.dumps({
+            "operation_id": "platform.read",
+            "task_id": "task-replay",
+            "requirement_id": first_requirement.requirement_id,
+            "required_at": first_requirement.created_at,
+            "created_at": time.time(),
+            "kind": "observed",
+            "outcome": "success",
+            "expires_at": time.time() + 3600,
+        }), encoding="utf-8")
+        replay_gate.complete(
+            "platform.read",
+            str(completion),
+            verify_attestation=lambda path, row: True,
+        )
+        replay_gate.require("platform.read", "read again", task_id="task-replay")
+        replay_rejected = False
+        try:
+            replay_gate.complete(
+                "platform.read",
+                str(completion),
+                verify_attestation=lambda path, row: True,
+            )
+        except ValueError:
+            replay_rejected = True
+        check("能力Gate: 旧 receipt 不能关闭重新签发的 requirement",
+              replay_rejected)
+
+        attestation_path = Path(d) / "package.json"
+        attestation_path.write_text("{}", encoding="utf-8")
+        package_a = {"criteria": ["A"]}
+        package_b = {"criteria": ["B"]}
+        trust.attest("acceptance_package", attestation_path, package_a)
+        trust.attest("acceptance_package", attestation_path, package_b)
+        check("宿主: 同一路径只接受最新证明防止 package rollback",
+              not trust.verify(
+                  "acceptance_package", attestation_path, package_a
+              )
+              and trust.verify(
+                  "acceptance_package", attestation_path, package_b
+              ))
+
+        future = observed(
+            "future",
+            metadata={
+                "task_id": task.id,
+                "run_id": "future",
+                "flow_id": task.flow_id,
+            },
+        )
+        future.created_at = time.time() + 3600
+        check("证据: 未来时间戳不能绕过 review freshness",
+              not future.supports_success(lambda path, row: True))
+
+        interrupted = runtime._task_dir(task.id) / "partial.txt"
+        try:
+            with runtime._transaction(task.id, "partial-test"):
+                interrupted.write_text("partial", encoding="utf-8")
+                raise OSError("simulated interruption")
+        except OSError:
+            pass
+        check("事务: 部分写入异常保留恢复 journal",
+              (runtime._task_dir(task.id) / "transaction.json").is_file())
+        (runtime._task_dir(task.id) / "transaction.json").unlink()
+
+        flow_store = UIFlowStore(data)
+        traversal_rejected = False
+        try:
+            flow_store.load("../../outside")
+        except ValueError:
+            traversal_rejected = True
+        blocker_rejected = False
+        memory = ProjectMemory(data)
+        try:
+            memory.emit_blocker(
+                "../outside",
+                reason="reason",
+                evidence=["e"],
+                options=["o"],
+                recommendation="r",
+            )
+        except ValueError:
+            blocker_rejected = True
+        check("路径: UI Flow 和 blocker 标识不能越界",
+              traversal_rejected and blocker_rejected)
+
+        extensions = Path(d) / "extensions"
+        extension = scaffold_extension("team.audit", extensions)
+        core_ids = {flow.flow_id for flow in registry.all()}
+        check("扩展: 脚手架可立即通过校验",
+              not has_errors(validate_extension(extension, core_flow_ids=core_ids)))
+        malformed = extensions / "team.bad"
+        malformed.mkdir()
+        (malformed / "manifest.json").write_text(
+            '{"name":"team.bad","provides":[]}',
+            encoding="utf-8",
+        )
+        (malformed / "flows.json").write_text("[]", encoding="utf-8")
+        isolated_registry = FlowRegistry()
+        isolated_registry.load_json(ROOT / "workflow" / "flows.json")
+        _, issues = load_installed_extensions(isolated_registry, extensions)
+        check("扩展: 畸形扩展只隔离自身不阻断其他 flow",
+              bool(issues) and isolated_registry.plan("示例") is not None)
+
+        future = scaffold_extension("team.future", extensions)
+        future.manifest["iloop_kernel"] = ">=999.0.0"
+        (future.root / "manifest.json").write_text(
+            json.dumps(future.manifest),
+            encoding="utf-8",
+        )
+        check("扩展: 不兼容内核版本被拒绝",
+              has_errors(validate_extension(future)))
+
+        check("路由: 单独回归命中 L1 验证 flow",
+              registry.plan("回归").flow_id == "core.verify")
+        custom_steps = [
+            TaskStep(title="launch: app", capability="launch"),
+            TaskStep(title="assert: home", capability="view_tree"),
+        ]
+        custom_task = runtime_without_root.start(
+            "验证 UI 路径",
+            steps=custom_steps,
+        )
+        restored_custom = runtime_without_root.load(custom_task.id)
+        check("UI Flow: 自定义步骤在 policy 创建时固化",
+              [step.title for step in restored_custom.steps]
+              == ["launch: app", "assert: home"])
+
+        scoped_task = runtime.start(
+            "重构范围证明",
+            executor_id="main-agent",
+        )
+        (root / "feature.py").write_text("VALUE = 2\n", encoding="utf-8")
+        runtime.prepare_global_review(scoped_task, root)
+        scoped_task = runtime.execute_capabilities(
+            scoped_task,
+            ["probe"],
+            subjects="feature.py",
+        )
+        scoped_evidence = runtime.evidence(scoped_task.id)[-1]
+        check("宿主: 本地 host 不替调用者自动证明 subjects",
+              scoped_evidence.metadata["subjects"] == [])
+
+
 def run() -> int:
     for fn in [
         test_evidence_observed_vs_inferred,
@@ -1779,6 +2111,7 @@ def run() -> int:
         test_global_review_covers_behavior_dynamic_entries_and_tests,
         test_global_review_requires_consumer_evidence,
         test_ui_flow_verification_requires_evidence,
+        test_release_audit_regressions,
     ]:
         fn()
     passed = sum(1 for _, ok in _checks if ok)

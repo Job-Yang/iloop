@@ -37,7 +37,7 @@ iLoop 是稳定的反馈闭环底座。业务二次开发只定义自己的领�
 扩展名使用 `<team>.<extension>`：
 
 ```bash
-python3 -m cli extension-init team.oncall
+python3 -m host_cli extension-init team.oncall
 ```
 
 默认生成：
@@ -67,8 +67,8 @@ Agent 根据目标自主选择最少的插口，不要求每个扩展都实现�
 |---|---|---|
 | 增加一类业务任务 | 业务 flow | 写 `flows.json` |
 | 接公司内部日志、监控、CI | 平台插件 | 实现 `Plugin` / `Capability` |
-| 做 oncall 或事件驱动 Agent | 事件源 + 通知渠道 | 实现 `EventSource` / `Notifier` |
-| 增加领域诊断方法 | 方法专家 | 参考 `kernel/experts.json` |
+| 做 oncall 或事件驱动 Agent | Capability Plugin + 业务 flow | 由插件在 `invoke` 内接事件/通知平台 |
+| 增加领域诊断方法 | 领域 flow | 把判断方法写入 `guidance` 与 `required_docs` |
 | 有复杂批处理逻辑 | 扩展脚本 | 放在扩展目录，由 flow 引用 |
 
 ### flow 负责“怎么想”
@@ -88,20 +88,26 @@ flow 至少写清：
 
 平台插件只负责接真实能力，例如 logs、metrics、build、screenshot、crash。它返回统一结果和证据，不负责决定病例是否收敛。
 
+Capability Plugin 是宿主进程内执行的可信代码。安装第三方插件等价于允许它以
+当前用户权限运行；只安装已审阅来源。需要隔离不可信插件时，由自定义宿主把
+插件放进独立进程或容器，不能依赖 Python 模块边界提供安全沙箱。
+
 需要运行时代码时，在 `manifest.json` 设置 `"provides": {"plugin": "plugin.py"}`，并导出 `create_plugin(config)`。返回对象必须满足 `Plugin` 协议；调用时通过 `platform=<platform_id>` 选择。加载器会拒绝路径逃逸、缺文件和不符合契约的返回值。
 
 如果能力不支持，返回 `unsupported`；不要假装成功。
 
-### 方法专家负责“怎么判断”
+### 领域判断先放 flow
 
-专家只回答边界明确的问题，并通过 `wants_capabilities` 声明需要什么证据。它不绑定具体平台名称。
+当前扩展自动发现只接入 flow 和 Capability Plugin。领域判断应先写进
+`guidance` / `required_docs`；`EventSource`、`Notifier` 和自定义专家属于
+手工宿主集成 API，尚不由扩展 manifest 自动加载。
 
 ---
 
 ## 第四步：校验边界
 
 ```bash
-python3 -m cli extension-validate ~/.iloop/extensions/team.oncall
+python3 -m host_cli extension-validate ~/.iloop/extensions/team.oncall
 ```
 
 校验器会拒绝：
@@ -122,7 +128,7 @@ python3 -m cli extension-validate ~/.iloop/extensions/team.oncall
 用一条真实业务请求验证：
 
 ```bash
-python3 -m cli plan "处理一条真实 oncall 告警"
+python3 -m host_cli plan "处理一条真实 oncall 告警"
 ```
 
 必须确认：
@@ -148,8 +154,8 @@ Agent 应当：
 1. 判断为业务扩展；
 2. 创建 `team.oncall`；
 3. 写 oncall flow；
-4. 实现 webhook `EventSource`；
-5. 实现 Slack `Notifier`；
+4. 在 Capability Plugin 中接入 webhook 输入；
+5. 在同一插件中接入 Slack 输出；
 6. 复用 `Case`、诊断专家、四道关卡和能力 Gate；
 7. 校验扩展；
 8. 用一条测试告警跑通“事件 → 病例 → 证据 → 结论 → 通知”。

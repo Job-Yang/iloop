@@ -28,7 +28,8 @@ class EvidenceWriter:
 
     def from_command(self, *, capability: str, source: str, out: CommandOutput,
                      summary: str, kind: EvidenceKind = EvidenceKind.OBSERVED,
-                     directory: Optional[str | Path] = None) -> tuple[EvidenceArtifact, str]:
+                     directory: Optional[str | Path] = None,
+                     outcome: Optional[str] = None) -> tuple[EvidenceArtifact, str]:
         d = Path(directory) if directory else self._dir(capability)
         d.mkdir(parents=True, exist_ok=True)
         log = d / "cmd.log"
@@ -39,7 +40,7 @@ class EvidenceWriter:
         )
         ev = EvidenceArtifact(capability=capability, source=source, kind=kind,
                               summary=summary, path=str(log),
-                              outcome="success" if out.ok() else "failure")
+                              outcome=outcome or ("success" if out.ok() else "failure"))
         return ev, str(d)
 
     def register_file(self, *, capability: str, source: str, file_path: str,

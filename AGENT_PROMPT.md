@@ -17,30 +17,35 @@
 
 ## 工具入口（开源版命令）
 
-所有能力通过 CLI 调用（`cd` 到 iloop 仓库根）：
+所有能力默认通过受信宿主入口调用（`cd` 到 iloop 仓库根）：
 
 ```
-python3 -m cli plan "<任务>"        # flow 路由 + 自治分级（先跑这个）
-python3 -m cli run "<任务>" [caps=build,run,logs] [k=v ...]  # 建任务并按需执行能力
-python3 -m cli resume <task_id> [caps=...] [k=v ...]         # 从磁盘断点继续
-python3 -m cli tasks                # 未完成任务恢复卡（阶段/约束/下一步）
-python3 -m cli task show|step|complete ...                   # 推进结构化任务计划
-python3 -m cli case show|tick|evidence|gate|resolve <task_id> # 病例续诊与证据绑定
-python3 -m cli next <task_id>                                # 按当前证据缺口给下一探针
-python3 -m cli global-review prepare|show|record <task_id>   # 全局影响复核
-python3 -m cli capability require|complete|status <task_id>  # 必需平台操作 Gate
-python3 -m cli lessons search|add ...                        # 错题本召回/沉淀
-python3 -m cli accept prepare|record|status <task_id>        # 外部独立验收包与回写
-python3 -m cli wrapup <task_id>                              # 验收、完成、生成看板
-python3 -m cli flows                # 列出已加载 flow
-python3 -m cli experts "<任务>"     # 诊断方法专家路由
-python3 -m cli doctor [--real]      # iOS 插件依赖体检
-python3 -m cli invoke <cap> [--real] [k=v ...]   # build/run/UI/logs/crash 等原子能力
-python3 -m cli oncall-demo          # 演示：同一内核驱动 oncall 诊断
-python3 -m cli extension-init <team.ext>          # 创建业务扩展包（二开入口）
-python3 -m cli extension-validate <dir>           # 校验扩展包
-python3 -m cli selftest             # 改了内核/插件后必跑，全绿才算完成
+python3 -m host_cli plan "<任务>"        # flow 路由 + 自治分级（先跑这个）
+python3 -m host_cli run "<任务>" [caps=build,run,logs] [k=v ...]
+python3 -m host_cli resume <task_id> [caps=...] [k=v ...]
+python3 -m host_cli tasks
+python3 -m host_cli task show|step|complete ...
+python3 -m host_cli case show|tick|evidence|gate|resolve <task_id>
+python3 -m host_cli next <task_id>
+python3 -m host_cli global-review prepare|show|record <task_id>
+python3 -m host_cli capability require|complete|status <task_id>
+python3 -m host_cli lessons search|add ...
+python3 -m host_cli accept prepare|review|record|status <task_id>
+python3 -m host_cli wrapup <task_id>
+python3 -m host_cli flows
+python3 -m host_cli experts "<任务>"
+python3 -m host_cli doctor [--real]
+python3 -m host_cli invoke <cap> [--real] [k=v ...]
+python3 -m host_cli oncall-demo
+python3 -m host_cli extension-init <team.ext>
+python3 -m host_cli extension-validate <dir>
+python3 -m host_cli selftest
 ```
+
+`python3 -m cli` 仅是低层 fail-closed 调试入口，没有宿主证明时不得用于最终
+`wrapup`。L2/L3 开工前必须设置 `ILOOP_PROJECT_ROOT` 指向真实 Git 工程。
+本地 `accept review` 只是只读 preflight，不能给高风险任务签发最终 pass；
+最终独立验收必须来自宿主实际启动并认证的外部 Agent。
 
 ## 开场必须声明计划（强制）
 
@@ -92,7 +97,7 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 - **危险命令不裸跑**：`sudo`/`rm -rf`/`git reset --hard`/`git checkout --`/`git rebase`/`git push -f`/`git commit --amend`/`kill` 等由内核 `redline` 守卫拦截，不直接暴露给用户。
 - **不污染用户工程目录**：所有过程产物（分析/日志/截图/临时探针）必须写进数据目录，**禁止写用户工程根**（内核 `guard_write_path`）。
 - **编辑最小化、不改产物**：不动 `Pods/`/`DerivedData/`/`*.xcodeproj`/锁文件（除非用户明确要）；不回滚用户未要求的改动。
-- **改 iLoop 自身必跑 `selftest`**：改了内核/协议/脚本视同改代码，完成前 `python3 -m cli selftest` 必须全绿。规则改了让代码/测试跟上，别只写文档不验证。
+- **改 iLoop 自身必跑 `selftest`**：改了内核/协议/脚本视同改代码，完成前 `python3 -m host_cli selftest` 和 `python3 scripts/fresh_clone_smoke.py` 必须全绿。规则改了让代码/测试跟上，别只写文档不验证。
 - **二开禁止改核心**：业务扩展只走 `extension-init` 返回的扩展目录，核心整体只读（细则 `EXTENDING.md`）。
 
 ## 输出可视化规范

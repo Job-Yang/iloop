@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
+
+from .storage import atomic_write_json, file_lock
 
 
 class TaskStatus(str, Enum):
@@ -30,6 +31,7 @@ class StepStatus(str, Enum):
 @dataclass
 class TaskStep:
     title: str
+    id: str = ""
     capability: str = ""
     status: StepStatus = StepStatus.PENDING
     summary: str = ""
@@ -39,6 +41,8 @@ class TaskStep:
     def __post_init__(self) -> None:
         if isinstance(self.status, str):
             self.status = StepStatus(self.status)
+        if not self.id:
+            self.id = f"step-{uuid.uuid4().hex[:12]}"
 
 
 @dataclass
@@ -67,6 +71,7 @@ class TaskRecord:
     independent_acceptance_required: bool = False
     global_review_status: str = "not_required"
     acceptance_status: str = "not_required"
+    revision: int = 0
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -104,7 +109,7 @@ class TaskStore:
                acceptance: Optional[List[str]] = None,
                steps: Optional[List[TaskStep]] = None) -> TaskRecord:
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        task_id = f"task-{stamp}-{self._slug(title)}"
+        task_id = f"task-{stamp}-{self._slug(title)}-{uuid.uuid4().hex[:10]}"
         record = TaskRecord(
             id=task_id,
             title=title,
@@ -132,16 +137,20 @@ class TaskStore:
     def save(self, task: TaskRecord) -> Path:
         task.updated_at = time.time()
         path = self.path_for(task.id)
-        fd, tmp = tempfile.mkstemp(prefix=f".{task.id}.", suffix=".tmp", dir=str(self.root))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(task.to_dict(), handle, ensure_ascii=False, indent=2)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
+        with file_lock(self.root / ".tasks.lock"):
+            if path.is_file():
+                current = json.loads(path.read_text(encoding="utf-8"))
+                current_revision = int(current.get("revision", 0))
+                if task.revision != current_revision:
+                    raise RuntimeError(
+                        f"stale task revision: expected {current_revision}, "
+                        f"got {task.revision}"
+                    )
+            next_revision = task.revision + 1
+            payload = task.to_dict()
+            payload["revision"] = next_revision
+            atomic_write_json(path, payload)
+            task.revision = next_revision
         return path
 
     def load(self, task_id: str) -> TaskRecord:

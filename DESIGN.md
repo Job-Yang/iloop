@@ -360,7 +360,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 3. **平台插件**：把具体工程和设备反馈转换成统一证据；
 4. **宿主信任适配**：在 CLI 进程外记录并复验 Task 创建策略、Capability requirements、Plugin receipt、用户确认和独立 reviewer 结果。
 
-支持项目规则或系统提示的宿主，都可以加载入口文档；支持 shell/进程调用的宿主，都可以运行同一套 CLI。需要最终 `wrapup` 的宿主还必须向 `Runtime(attestation_verifier=...)` 注入进程外 verifier。普通 CLI 可以计划、执行和取证，但不能给自己的 receipt 或本地状态签字。Claude Code、Codex、Cursor 或自建 Agent 的差异由宿主适配承担，VDD、flow、证据和病例不会跟着重写。
+支持项目规则或系统提示的宿主，都可以加载入口文档；支持 shell/进程调用的宿主，都可以运行同一套 CLI。开源版默认使用 `host_cli`：它把证明记录在任务目录之外的宿主账本，防止任务状态文件自行补签；它不把同一 OS 用户主动修改源码或可信插件纳入本地威胁模型。内置只读验收进程只做 preflight，不签发最终 pass。`cli` 保留为 fail-closed 的低层调试面。高风险独立验收和企业级身份边界由自建宿主通过 `Runtime(attestation_verifier=..., attestation_recorder=...)` 接入。Claude Code、Codex、Cursor 或自建 Agent 的差异由宿主适配承担，VDD、flow、证据和病例不会跟着重写。
 
 开源版选择把提示词与代码放进同一个 GitHub 仓：
 
@@ -388,7 +388,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 2. **读取扩展契约**：加载 `EXTENDING.md`，而不是凭入口提示词猜目录。
 3. **创建隔离空间**：运行 `extension-init <team.extension>`。
 4. **只改扩展目录**：核心整体只读，业务能力不 fork、不魔改入口。
-5. **实现业务层**：按需添加 flow、平台插件、事件源、通知渠道或方法专家。
+5. **实现业务层**：自动加载 flow 与 Capability Plugin；事件源、通知渠道或方法专家由自定义宿主手工接入。
 6. **执行边界校验**：运行 `extension-validate`，检查命名空间、核心覆盖和格式。
 7. **拿真实任务验收**：再次运行 `plan`，确认真实业务请求能命中新 flow，再按该 flow 跑一次闭环。
 
@@ -418,7 +418,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 
 因此同一套内核既可以驱动交互式代码修复，也可以驱动一个事件唤醒的诊断 Agent。区别只是入口和平台插件，不是重新造一套 Agent。
 
-开源版提供 `EventSource`、`Notifier`、stdout/webhook 参考实现和 `oncall-demo`。
+开源版提供 `EventSource`、`Notifier` 与 `oncall-demo` 作为宿主集成参考；它们当前不由扩展 manifest 自动加载。
 
 ---
 

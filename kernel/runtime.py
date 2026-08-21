@@ -6,6 +6,7 @@ import json
 import hashlib
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -19,6 +20,7 @@ from .gate_capability import CapabilityGate
 from .global_review import GlobalReview, analyze_global_impact
 from .ledger import Ledger, RoundStatus
 from .task import StepStatus, TaskRecord, TaskStatus, TaskStep, TaskStore
+from .storage import atomic_write_json, file_lock
 
 
 FLOW_STEPS = {
@@ -43,6 +45,7 @@ CAPABILITY_GATE_HINT = {
     Capability.SCREENSHOT: "scope",
     Capability.CRASH: "time",
     Capability.PROBE: "scope",
+    Capability.COUNTER_PROBE: "counter_evidence",
 }
 
 
@@ -51,12 +54,14 @@ class Runtime:
 
     def __init__(self, data_dir: str | Path, registry: FlowRegistry, plugin: Plugin,
                  *, project_root: str | Path = "",
-                 attestation_verifier: Optional[Callable[[str, Path, dict], bool]] = None) -> None:
+                 attestation_verifier: Optional[Callable[[str, Path, dict], bool]] = None,
+                 attestation_recorder: Optional[Callable[[str, Path, dict], None]] = None) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.registry = registry
         self.plugin = plugin
         self.attestation_verifier = attestation_verifier
+        self.attestation_recorder = attestation_recorder
         self.project_root = str(Path(project_root).resolve()) if project_root else ""
         self.tasks = TaskStore(self.data_dir)
 
@@ -87,18 +92,90 @@ class Runtime:
     def _requirements_path(self, task_id: str) -> Path:
         return self._task_dir(task_id) / "capability-requirements.json"
 
+    @contextmanager
+    def _transaction(self, task_id: str, operation: str):
+        task_dir = self._task_dir(task_id)
+        journal = task_dir / "transaction.json"
+        with file_lock(task_dir / ".task.lock"):
+            before = self._transaction_fingerprint(task_dir)
+            atomic_write_json(
+                journal,
+                {
+                    "task_id": task_id,
+                    "operation": operation,
+                    "started_at": time.time(),
+                },
+            )
+            try:
+                yield
+            except BaseException as error:
+                after = self._transaction_fingerprint(task_dir)
+                if after == before:
+                    journal.unlink(missing_ok=True)
+                else:
+                    atomic_write_json(
+                        journal,
+                        {
+                            "task_id": task_id,
+                            "operation": operation,
+                            "started_at": time.time(),
+                            "status": "interrupted",
+                            "error": f"{type(error).__name__}: {error}",
+                        },
+                    )
+                raise
+            else:
+                journal.unlink(missing_ok=True)
+
+    def _transaction_fingerprint(self, task_dir: Path) -> str:
+        rows = []
+        task_path = self.tasks.path_for(task_dir.name)
+        if task_path.is_file():
+            rows.append({
+                "path": f"../tasks/{task_path.name}",
+                "sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
+            })
+        for path in sorted(
+            item for item in task_dir.rglob("*")
+            if item.is_file()
+            and item.name not in {".task.lock", "transaction.json"}
+        ):
+            rows.append({
+                "path": str(path.relative_to(task_dir)),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            })
+        return hashlib.sha256(
+            json.dumps(rows, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
     def start(self, title: str, *, constraints: Optional[list[str]] = None,
               acceptance: Optional[list[str]] = None,
               capabilities: Optional[Iterable[str]] = None,
-              executor_id: str = "") -> TaskRecord:
+              executor_id: str = "",
+              steps: Optional[list[TaskStep]] = None) -> TaskRecord:
         decision = self.registry.plan_details(title)
         flow = decision["flow"]
         if flow is None:
             raise ValueError("no flow matched; clarify the task before execution")
-        steps = [TaskStep(title=s) for s in FLOW_STEPS.get(flow.flow_id, ["执行", "验证", "收口"])]
+        if flow.autonomy.value in {"L2", "L3"} and not self.project_root:
+            raise ValueError(
+                "L2/L3 tasks require project_root (set ILOOP_PROJECT_ROOT or "
+                "pass project_root=...) before task creation"
+            )
+        if decision["acceptance_gate"] and not executor_id.strip():
+            raise ValueError(
+                "high-risk tasks require executor_id before task creation"
+            )
+        task_steps = steps or [
+            TaskStep(title=s)
+            for s in FLOW_STEPS.get(flow.flow_id, ["执行", "验证", "收口"])
+        ]
         for cap in capabilities or []:
             capability = Capability(cap).value
-            steps.append(TaskStep(title=f"执行能力: {capability}", capability=capability))
+            task_steps.append(TaskStep(
+                title=f"执行能力: {capability}",
+                capability=capability,
+            ))
         task = self.tasks.create(
             title,
             goal=title,
@@ -106,11 +183,11 @@ class Runtime:
             autonomy=flow.autonomy.value,
             constraints=constraints,
             acceptance=acceptance,
-            steps=steps,
+            steps=task_steps,
         )
         task.project_root = self.project_root
         task.executor_id = executor_id.strip()
-        if self.project_root:
+        if self.project_root and flow.autonomy.value in {"L2", "L3"}:
             result = subprocess.run(
                 ["git", "-C", self.project_root, "rev-parse", "HEAD"],
                 capture_output=True,
@@ -134,12 +211,22 @@ class Runtime:
         task.global_review_path = str(self._global_review_path(task.id))
         task.acceptance_path = str(self._acceptance_path(task.id))
         CapabilityGate().save(task.capability_gate_path)
-        self._task_policy_path(task.id).write_text(
-            json.dumps({
+        policy = {
                 "task_id": task.id,
                 "title": task.title,
+                "goal": task.goal,
                 "flow_id": task.flow_id,
                 "autonomy": task.autonomy,
+                "constraints": list(task.constraints),
+                "acceptance": list(task.acceptance),
+                "steps": [
+                    {
+                        "id": step.id,
+                        "title": step.title,
+                        "capability": step.capability,
+                    }
+                    for step in task.steps
+                ],
                 "project_root": task.project_root,
                 "base_commit": task.base_commit,
                 "executor_id": task.executor_id,
@@ -148,20 +235,35 @@ class Runtime:
                     task.independent_acceptance_required
                 ),
                 "created_at": task.created_at,
-            }, ensure_ascii=False, indent=2),
+        }
+        policy_path = self._task_policy_path(task.id)
+        policy_path.write_text(
+            json.dumps(policy, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        self._requirements_path(task.id).write_text(
-            json.dumps({
+        requirements = {
                 "task_id": task.id,
                 "revision": 0,
                 "operations": [],
-            }, ensure_ascii=False, indent=2),
+        }
+        requirements_path = self._requirements_path(task.id)
+        requirements_path.write_text(
+            json.dumps(requirements, ensure_ascii=False, indent=2),
             encoding="utf-8",
+        )
+        self._attest("task_policy", policy_path, policy)
+        self._attest(
+            "capability_requirements",
+            requirements_path,
+            requirements,
         )
         self.tasks.save(task)
         Ledger(self._task_dir(task.id)).flush()
         return task
+
+    def _attest(self, kind: str, path: Path, payload: dict) -> None:
+        if self.attestation_recorder is not None:
+            self.attestation_recorder(kind, path, payload)
 
     def load(self, task_id: str) -> TaskRecord:
         task = self.tasks.load(task_id)
@@ -192,12 +294,22 @@ class Runtime:
         """Re-derive mandatory gates instead of trusting mutable task JSON flags."""
         policy_path = self._task_policy_path(task.id)
         if not policy_path.is_file():
-            policy_path.write_text(
-                json.dumps({
+            legacy_policy = {
                     "task_id": task.id,
                     "title": task.title,
+                    "goal": task.goal,
                     "flow_id": task.flow_id,
                     "autonomy": task.autonomy,
+                    "constraints": list(task.constraints),
+                    "acceptance": list(task.acceptance),
+                    "steps": [
+                        {
+                            "id": step.id,
+                            "title": step.title,
+                            "capability": step.capability,
+                        }
+                        for step in task.steps
+                    ],
                     "project_root": task.project_root,
                     "base_commit": task.base_commit,
                     "executor_id": task.executor_id,
@@ -207,7 +319,9 @@ class Runtime:
                     ),
                     "created_at": task.created_at,
                     "legacy_migration": True,
-                }, ensure_ascii=False, indent=2),
+            }
+            policy_path.write_text(
+                json.dumps(legacy_policy, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         policy = json.loads(policy_path.read_text(encoding="utf-8"))
@@ -215,12 +329,36 @@ class Runtime:
             raise ValueError("task policy task_id mismatch")
         changed = False
         for field_name in (
-            "title", "flow_id", "autonomy", "project_root", "base_commit",
+            "title", "goal", "flow_id", "autonomy", "project_root", "base_commit",
             "executor_id",
         ):
             expected = policy.get(field_name, "")
             if getattr(task, field_name) != expected:
                 setattr(task, field_name, expected)
+                changed = True
+        for field_name in ("constraints", "acceptance"):
+            expected = list(policy.get(field_name, []))
+            if getattr(task, field_name) != expected:
+                setattr(task, field_name, expected)
+                changed = True
+        contracts = list(policy.get("steps", []))
+        if contracts:
+            existing = {step.id: step for step in task.steps}
+            restored = []
+            for contract in contracts:
+                step = existing.get(str(contract.get("id", "")))
+                if step is None:
+                    step = TaskStep(
+                        id=str(contract["id"]),
+                        title=str(contract["title"]),
+                        capability=str(contract.get("capability", "")),
+                    )
+                else:
+                    step.title = str(contract["title"])
+                    step.capability = str(contract.get("capability", ""))
+                restored.append(step)
+            if [step.id for step in task.steps] != [step.id for step in restored]:
+                task.steps = restored
                 changed = True
         decision = self.registry.plan_details(str(policy.get("title", "")))
         flow_requires_review = (
@@ -251,6 +389,14 @@ class Runtime:
         return changed
 
     def add_attested_evidence(self, task: TaskRecord, receipt_path: str | Path) -> EvidenceArtifact:
+        with self._transaction(task.id, "add_attested_evidence"):
+            return self._add_attested_evidence_locked(task, receipt_path)
+
+    def _add_attested_evidence_locked(
+        self,
+        task: TaskRecord,
+        receipt_path: str | Path,
+    ) -> EvidenceArtifact:
         if self.attestation_verifier is None:
             raise ValueError("trusted host attestation verifier is not configured")
         path = Path(receipt_path)
@@ -260,7 +406,8 @@ class Runtime:
         if row.get("task_id") != task.id:
             raise ValueError("evidence attestation task_id mismatch")
         required = ("kind", "run_id", "capability", "source", "outcome", "summary",
-                    "artifact_sha256", "flow_id", "subjects", "gates", "expires_at")
+                    "artifact_sha256", "flow_id", "subjects", "gates", "expires_at",
+                    "created_at")
         missing = [key for key in required if key not in row]
         if missing:
             raise ValueError(f"evidence attestation missing bindings: {missing}")
@@ -303,6 +450,7 @@ class Runtime:
                 "human_confirmed": row.get("kind") == "user_confirmation",
                 "user_id": row.get("user_id", ""),
             },
+            created_at=float(row["created_at"]),
         )
         case = Case.load(task.case_path)
         hypothesis_id = str(row.get("hypothesis_id", "h1"))
@@ -322,9 +470,25 @@ class Runtime:
         return evidence
 
     def record_external_acceptance(self, task: TaskRecord, result_path: str | Path):
+        with self._transaction(task.id, "record_external_acceptance"):
+            return self._record_external_acceptance_locked(task, result_path)
+
+    def _record_external_acceptance_locked(
+        self,
+        task: TaskRecord,
+        result_path: str | Path,
+    ):
         if self.attestation_verifier is None:
             raise ValueError("trusted host attestation verifier is not configured")
-        result = AcceptanceStore(task.acceptance_path).record_file(
+        store = AcceptanceStore(task.acceptance_path)
+        package = store.load_raw().get("package") or {}
+        if not self.attestation_verifier(
+            "acceptance_package",
+            Path(task.acceptance_path),
+            package,
+        ):
+            raise ValueError("acceptance package is not host attested")
+        result = store.record_file(
             result_path,
             verify_attestation=lambda path, row: self.attestation_verifier(
                 "independent_review", path, row
@@ -335,6 +499,15 @@ class Runtime:
         return result
 
     def require_operation(
+        self,
+        task: TaskRecord,
+        operation_id: str,
+        reason: str,
+    ):
+        with self._transaction(task.id, "require_operation"):
+            return self._require_operation_locked(task, operation_id, reason)
+
+    def _require_operation_locked(
         self,
         task: TaskRecord,
         operation_id: str,
@@ -351,19 +524,27 @@ class Runtime:
         )
         if requirements.get("task_id") != task.id:
             raise ValueError("capability requirements task_id mismatch")
-        operations = list(requirements.get("operations", []))
-        if not any(item.get("operation_id") == operation_id for item in operations):
-            operations.append({
+        operations = [
+            item for item in requirements.get("operations", [])
+            if item.get("operation_id") != operation_id
+        ]
+        operations.append({
                 "operation_id": operation_id,
                 "reason": reason,
-                "required_at": time.time(),
-            })
-            requirements["operations"] = operations
-            requirements["revision"] = int(requirements.get("revision", 0)) + 1
-            requirements_path.write_text(
-                json.dumps(requirements, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+                "requirement_id": operation.requirement_id,
+                "required_at": operation.created_at,
+        })
+        requirements["operations"] = operations
+        requirements["revision"] = int(requirements.get("revision", 0)) + 1
+        requirements_path.write_text(
+            json.dumps(requirements, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        self._attest(
+            "capability_requirements",
+            requirements_path,
+            requirements,
+        )
         if operation_id not in task.required_operation_ids:
             task.required_operation_ids.append(operation_id)
             self.tasks.save(task)
@@ -371,6 +552,15 @@ class Runtime:
 
     def execute_capabilities(self, task: TaskRecord, capabilities: Iterable[str],
                              **kwargs) -> TaskRecord:
+        with self._transaction(task.id, "execute_capabilities"):
+            return self._execute_capabilities_locked(task, capabilities, **kwargs)
+
+    def _execute_capabilities_locked(
+        self,
+        task: TaskRecord,
+        capabilities: Iterable[str],
+        **kwargs,
+    ) -> TaskRecord:
         ledger = Ledger.load(self._task_dir(task.id))
         case = Case.load(self._case_path(task.id))
         task.status = TaskStatus.RUNNING
@@ -398,7 +588,7 @@ class Runtime:
             run_id = f"{task.id}:round:{len(ledger.rounds)}"
             source_run_id = (
                 task.capability_runs.get(Capability.RUN.value, "")
-                if capability == Capability.LOGS
+                if capability in {Capability.LOGS, Capability.CRASH}
                 else ""
             )
             invoke_kwargs = dict(kwargs)
@@ -425,6 +615,7 @@ class Runtime:
                     "subjects": sorted(str(item) for item in explicit_subjects),
                     "evidence_dir": result.evidence_dir,
                     "status": result.status.value,
+                    "created_at": time.time(),
                 }
                 claim_dir = self._task_dir(task.id) / "subject-claims"
                 claim_dir.mkdir(parents=True, exist_ok=True)
@@ -487,7 +678,7 @@ class Runtime:
             task.status = TaskStatus.OPEN
         self.tasks.save(task)
         self.write_dashboard(task.id)
-        return task
+        return self.load(task.id)
 
     def _seal_trusted_evidence(
         self,
@@ -512,6 +703,7 @@ class Runtime:
             "device_id": evidence.metadata.get("device_id", ""),
             "subjects": evidence.metadata.get("subjects", []),
             "gates": evidence.metadata.get("gates", []),
+            "created_at": evidence.created_at,
         }
         proof_dir = self._task_dir(task.id) / "producer-receipts"
         proof_dir.mkdir(parents=True, exist_ok=True)
@@ -524,9 +716,24 @@ class Runtime:
         evidence.metadata["producer_receipt_sha256"] = hashlib.sha256(
             path.read_bytes()
         ).hexdigest()
+        self._attest("evidence", path, payload)
 
     def prepare_global_review(self, task: TaskRecord, project_root: str | Path,
                               *, base: str = "") -> GlobalReview:
+        with self._transaction(task.id, "prepare_global_review"):
+            return self._prepare_global_review_locked(
+                task,
+                project_root,
+                base=base,
+            )
+
+    def _prepare_global_review_locked(
+        self,
+        task: TaskRecord,
+        project_root: str | Path,
+        *,
+        base: str = "",
+    ) -> GlobalReview:
         if self._enforce_policy(task):
             self.tasks.save(task)
         resolved_root = str(Path(project_root).resolve())
@@ -615,6 +822,11 @@ class Runtime:
 
     def can_wrapup(self, task: TaskRecord) -> tuple[bool, list[str]]:
         blockers = []
+        journal = self._task_dir(task.id) / "transaction.json"
+        if journal.is_file():
+            blockers.append(
+                f"incomplete task transaction requires recovery: {journal}"
+            )
         if self._enforce_policy(task):
             self.tasks.save(task)
         policy_path = self._task_policy_path(task.id)
@@ -628,7 +840,11 @@ class Runtime:
         known_evidence = set(evidence_by_id)
         if task.autonomy in {"L2", "L3"} and not task.project_root:
             blockers.append("L2/L3 task has no project_root; whole-diff review cannot run")
-        if task.project_root and not Path(task.global_review_path).exists():
+        if (
+            task.global_review_required
+            and task.project_root
+            and not Path(task.global_review_path).exists()
+        ):
             try:
                 review = self.prepare_global_review(task, task.project_root)
                 if not review.changed_files:
@@ -831,6 +1047,16 @@ class Runtime:
                             )
         if task.independent_acceptance_required:
             acceptance_store = AcceptanceStore(task.acceptance_path)
+            package = acceptance_store.load_raw().get("package") or {}
+            if (
+                self.attestation_verifier is None
+                or not self.attestation_verifier(
+                    "acceptance_package",
+                    Path(task.acceptance_path),
+                    package,
+                )
+            ):
+                blockers.append("acceptance package is not host attested")
             verifier = None
             if self.attestation_verifier is not None:
                 verifier = lambda path, row: self.attestation_verifier(
@@ -843,7 +1069,6 @@ class Runtime:
             if result is None or result.verdict != Verdict.PASS:
                 blockers.append("independent acceptance has not passed")
             else:
-                package = acceptance_store.load_raw().get("package") or {}
                 if task.global_review_required and Path(task.global_review_path).exists():
                     current_fingerprint = GlobalReview.load(task.global_review_path).fingerprint
                     if package.get("subject_fingerprint") != current_fingerprint:

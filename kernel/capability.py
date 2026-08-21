@@ -22,6 +22,7 @@ class Capability(str, Enum):
     SCREENSHOT = "screenshot"
     CRASH = "crash"
     PROBE = "probe"
+    COUNTER_PROBE = "counter_probe"
     TAP = "tap"
     SWIPE = "swipe"
     TYPE_TEXT = "type_text"

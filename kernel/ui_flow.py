@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List
 
 from .evidence import EvidenceArtifact
+from .storage import atomic_write_json, file_lock
 
 
 ACTION_CAPABILITY = {
@@ -79,8 +81,9 @@ class UIFlowStore:
         return re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", text).strip("-")[:48] or "flow"
 
     def create(self, name: str, goal: str, device: str = "auto") -> UIFlow:
+        flow_id = f"{self._slug(name)}-{uuid.uuid4().hex[:10]}"
         flow = UIFlow(
-            id=self._slug(name),
+            id=flow_id,
             name=name,
             goal=goal,
             device=device,
@@ -94,13 +97,20 @@ class UIFlowStore:
         return flow
 
     def path(self, flow_id: str) -> Path:
-        return self.root / flow_id / "flow.json"
+        value = str(flow_id)
+        if not re.fullmatch(r"[\w-]{1,160}", value):
+            raise ValueError("flow_id contains unsafe path characters")
+        target = (self.root / value / "flow.json").resolve()
+        if self.root.resolve() not in target.parents:
+            raise ValueError("flow_id escapes ui_flows root")
+        return target
 
     def save(self, flow: UIFlow) -> Path:
         path = self.path(flow.id)
         path.parent.mkdir(parents=True, exist_ok=True)
         (path.parent / "shots").mkdir(exist_ok=True)
-        path.write_text(json.dumps(flow.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        with file_lock(self.root / ".ui-flows.lock"):
+            atomic_write_json(path, flow.to_dict())
         return path
 
     def load(self, flow_id: str) -> UIFlow:

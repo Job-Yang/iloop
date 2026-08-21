@@ -17,4 +17,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Run iLoop selftest (kernel + iOS plugin command assembly)
-        run: python3 -m cli selftest
+        run: python3 -m host_cli selftest
+      - name: Run managed-host fresh clone journey
+        run: python3 scripts/fresh_clone_smoke.py

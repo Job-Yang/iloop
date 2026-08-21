@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import re
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+from .storage import atomic_write_json, file_lock
 
 
 class ProjectMemory:
@@ -99,18 +102,19 @@ class ProjectMemory:
                 or float(attestation.get("expires_at", 0)) <= time.time()
             ):
                 raise ValueError("constitution attestation subject mismatch or expired")
-        rules = self.constitution()
-        row = {"id": f"rule-{len(rules)+1:03d}", "rule": rule, "source": source,
-               "created_at": time.time(), "evidence_path": str(path),
-               "evidence_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-        rules.append(row)
-        self.constitution_path.write_text(
-            json.dumps(rules, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        with file_lock(self.root / "constitution" / ".rules.lock"):
+            rules = self.constitution()
+            row = {"id": f"rule-{len(rules)+1:03d}", "rule": rule, "source": source,
+                   "created_at": time.time(), "evidence_path": str(path),
+                   "evidence_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            rules.append(row)
+            atomic_write_json(self.constitution_path, rules)
         return row
 
     def emit_blocker(self, task_id: str, *, reason: str, evidence: Iterable[str],
                      options: Iterable[str], recommendation: str) -> Path:
+        if not re.fullmatch(r"[\w-]{1,160}", str(task_id)):
+            raise ValueError("blocker task_id contains unsafe path characters")
         evidence = [item for item in evidence if item]
         options = [item for item in options if item]
         if not reason or not evidence or not options or not recommendation:
@@ -124,5 +128,5 @@ class ProjectMemory:
             "created_at": time.time(),
         }
         path = self.root / "blockers" / f"{task_id}-{int(time.time())}.json"
-        path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, row)
         return path
