@@ -152,7 +152,8 @@ class Runtime:
               acceptance: Optional[list[str]] = None,
               capabilities: Optional[Iterable[str]] = None,
               executor_id: str = "",
-              steps: Optional[list[TaskStep]] = None) -> TaskRecord:
+              steps: Optional[list[TaskStep]] = None,
+              execution_context: Optional[dict[str, str]] = None) -> TaskRecord:
         decision = self.registry.plan_details(title)
         flow = decision["flow"]
         if flow is None:
@@ -187,6 +188,7 @@ class Runtime:
         )
         task.project_root = self.project_root
         task.executor_id = executor_id.strip()
+        task.execution_context = dict(execution_context or {})
         if self.project_root and flow.autonomy.value in {"L2", "L3"}:
             result = subprocess.run(
                 ["git", "-C", self.project_root, "rev-parse", "HEAD"],
@@ -230,6 +232,7 @@ class Runtime:
                 "project_root": task.project_root,
                 "base_commit": task.base_commit,
                 "executor_id": task.executor_id,
+                "execution_context": dict(task.execution_context),
                 "global_review_required": bool(task.global_review_required),
                 "independent_acceptance_required": bool(
                     task.independent_acceptance_required
@@ -313,6 +316,7 @@ class Runtime:
                     "project_root": task.project_root,
                     "base_commit": task.base_commit,
                     "executor_id": task.executor_id,
+                    "execution_context": dict(task.execution_context),
                     "global_review_required": bool(task.global_review_required),
                     "independent_acceptance_required": bool(
                         task.independent_acceptance_required
@@ -341,6 +345,13 @@ class Runtime:
             if getattr(task, field_name) != expected:
                 setattr(task, field_name, expected)
                 changed = True
+        expected_context = {
+            str(key): str(value)
+            for key, value in policy.get("execution_context", {}).items()
+        }
+        if task.execution_context != expected_context:
+            task.execution_context = expected_context
+            changed = True
         contracts = list(policy.get("steps", []))
         if contracts:
             existing = {step.id: step for step in task.steps}
@@ -441,6 +452,7 @@ class Runtime:
                 "subjects": list(row.get("subjects", [])),
                 "gates": list(row.get("gates", [])),
                 "flow_id": row.get("flow_id", ""),
+                "ui_flow_id": row.get("ui_flow_id", ""),
                 "flow_run_id": row.get("flow_run_id", ""),
                 "device": row.get("device", ""),
                 "device_id": row.get("device_id", ""),
@@ -596,42 +608,11 @@ class Runtime:
             invoke_kwargs["run_id"] = source_run_id or run_id
             result = self.plugin.invoke(capability, **invoke_kwargs)
             gate_hint = CAPABILITY_GATE_HINT.get(capability)
-            explicit_subjects = kwargs.get("subjects", [])
-            if isinstance(explicit_subjects, str):
-                explicit_subjects = [
-                    item.strip()
-                    for item in explicit_subjects.replace(",", ";").split(";")
-                    if item.strip()
-                ]
             producer_subjects = [
                 str(item) for item in result.metadata.get("subjects", [])
             ]
-            attested_subjects = []
-            if explicit_subjects:
-                subject_claim = {
-                    "task_id": task.id,
-                    "run_id": run_id,
-                    "capability": capability.value,
-                    "subjects": sorted(str(item) for item in explicit_subjects),
-                    "evidence_dir": result.evidence_dir,
-                    "status": result.status.value,
-                    "created_at": time.time(),
-                }
-                claim_dir = self._task_dir(task.id) / "subject-claims"
-                claim_dir.mkdir(parents=True, exist_ok=True)
-                claim_path = claim_dir / f"{len(ledger.rounds)}-{capability.value}.json"
-                claim_path.write_text(
-                    json.dumps(subject_claim, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                if (
-                    self.attestation_verifier is not None
-                    and self.attestation_verifier(
-                        "evidence_subjects", claim_path, subject_claim
-                    )
-                ):
-                    attested_subjects = subject_claim["subjects"]
-            subjects = sorted({*producer_subjects, *attested_subjects})
+            subjects = sorted(set(producer_subjects))
+            ui_flow_id = str(kwargs.get("ui_flow_id") or "")
             evidence = EvidenceArtifact(
                 capability=capability.value,
                 source=result.platform,
@@ -649,6 +630,7 @@ class Runtime:
                     "device_id": kwargs.get("device_udid") or kwargs.get("sim_udid") or "",
                     "gates": [gate_hint] if gate_hint else [],
                     "flow_id": task.flow_id,
+                    "ui_flow_id": ui_flow_id,
                     "flow_run_id": kwargs.get("flow_run_id", ""),
                     "device": result.metadata.get("device", ""),
                     "trusted_producer": True,
@@ -698,6 +680,7 @@ class Runtime:
             "run_id": evidence.metadata.get("run_id", ""),
             "source_run_id": evidence.metadata.get("source_run_id", ""),
             "flow_id": task.flow_id,
+            "ui_flow_id": evidence.metadata.get("ui_flow_id", ""),
             "flow_run_id": evidence.metadata.get("flow_run_id", ""),
             "device": evidence.metadata.get("device", ""),
             "device_id": evidence.metadata.get("device_id", ""),

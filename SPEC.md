@@ -27,7 +27,7 @@
 
 - `kind` 是红线字段：`observed` = 真跑真看到；`inferred` = 从源码/日志推出来的。**推断标成 observed 即造假。**
 - `kind` 只回答“来源是否观测”，不回答“结果是否成功”。observed failure 仍是硬证据，但不能支持四关通过；只有 `kind=observed + outcome=success` 才能作为完成证据。
-- observed 成功还必须满足主体与完整性：产物哈希未变化，并绑定 task/run/gate/target/flow/device/created_at。`trusted_producer` 只是声明；Plugin receipt、外部事实、Task 创建策略和 Capability requirements 都需由 Runtime 注入的宿主 attestation verifier 复验。默认 `host_cli` 将证明写入任务目录之外；低层 `cli` 不能手工创建 observed 或自行完成收口。
+- observed 成功还必须满足主体与完整性：产物哈希未变化，并绑定 task/run/gate/target/flow/device/created_at。`trusted_producer` 只是声明；Plugin receipt、外部事实、Task 创建策略和 Capability requirements 都需由 Runtime 注入的宿主 attestation verifier 复验。默认 `host_cli` 只提供同用户边界内的本地完整性证明；`independent_review`、`user_confirmation` 和任意 `evidence_subjects` 必须由进程外宿主提供，低层 `cli` 不能手工创建 observed 或自行完成收口。
 - `path` 必须指向能被别人重新打开/重跑的东西。嘴上说"验过了"不产出 artifact。
 
 ---

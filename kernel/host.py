@@ -12,15 +12,23 @@ import time
 from pathlib import Path
 
 
+EXTERNAL_ATTESTATION_KINDS = frozenset({
+    "evidence_subjects",
+    "independent_review",
+    "user_confirmation",
+})
+
+
 def _canonical(payload: dict) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 class HostTrustStore:
-    """Durable attestations kept outside project task state.
+    """Durable local-integrity attestations kept outside project task state.
 
     The managed host records facts when they occur and later verifies the exact
-    payload. Editing task files cannot mint a new host attestation.
+    payload. Identity-bearing facts are deliberately excluded: they must come
+    from an external host adapter with a separate trust boundary.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -71,6 +79,10 @@ class HostTrustStore:
         return hmac.new(self._key, message, hashlib.sha256).hexdigest()
 
     def attest(self, kind: str, path: Path, payload: dict) -> None:
+        if kind in EXTERNAL_ATTESTATION_KINDS:
+            raise ValueError(
+                f"{kind} requires an external host attestation provider"
+            )
         resolved = Path(path).expanduser().resolve()
         payload_sha256 = hashlib.sha256(
             _canonical(payload).encode("utf-8")
@@ -93,6 +105,8 @@ class HostTrustStore:
             )
 
     def verify(self, kind: str, path: Path, payload: dict) -> bool:
+        if kind in EXTERNAL_ATTESTATION_KINDS:
+            return False
         resolved = Path(path).expanduser().resolve()
         payload_sha256 = hashlib.sha256(
             _canonical(payload).encode("utf-8")

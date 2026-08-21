@@ -118,6 +118,7 @@ class EvidenceArtifact:
             "run_id": self.metadata.get("run_id", ""),
             "source_run_id": self.metadata.get("source_run_id", ""),
             "flow_id": self.metadata.get("flow_id", ""),
+            "ui_flow_id": self.metadata.get("ui_flow_id", ""),
             "flow_run_id": self.metadata.get("flow_run_id", ""),
             "device": self.metadata.get("device", ""),
             "device_id": self.metadata.get("device_id", ""),
@@ -126,7 +127,10 @@ class EvidenceArtifact:
             "created_at": self.created_at,
         }
         return all(
-            row.get(key, "" if key == "source_run_id" else None) == value
+            row.get(
+                key,
+                "" if key in {"source_run_id", "ui_flow_id"} else None,
+            ) == value
             for key, value in expected_receipt.items()
         )
 

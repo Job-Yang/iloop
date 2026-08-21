@@ -135,15 +135,18 @@ iLoop 把记忆拆成不同用途：
 git clone https://github.com/Job-Yang/iloop.git
 cd iloop
 
-# 安装公开执行底座（MIT；MCP/Skill 与 CLI 是同一项目的不同入口）
-brew tap getsentry/xcodebuildmcp
-brew install xcodebuildmcp
-
-# 内核与插件自测
+# 平台无关的内核自测（Linux/macOS 均可）
 python3 -m host_cli selftest
 
 # 看 iLoop 会怎么处理一个任务
 python3 -m host_cli plan "帮我修复下单页崩溃"
+```
+
+需要执行 iOS build/run/UI 时，再在 macOS 安装公开执行底座：
+
+```bash
+brew tap getsentry/xcodebuildmcp
+brew install xcodebuildmcp
 
 # iOS 环境体检
 python3 -m host_cli doctor
@@ -169,12 +172,11 @@ python3 -m host_cli accept prepare <task_id>
 python3 -m host_cli accept review <task_id>
 ```
 
-`host_cli` 是开源版默认入口。它把证明记录在任务目录之外的
-`~/.iloop/host-trust/`，用于防止任务状态文件自行补签。它不对抗同一 OS
-用户主动修改 iLoop 源码或已安装的可信插件。内置 `accept review` 会启动只读
-preflight 子进程，但永远不签发最终 `pass`；高风险任务必须由外部 Agent 宿主
-验证 reviewer 身份和 evidence subjects，再通过
-`AcceptanceStore.record_file(...)` / Runtime verifier API 回写。
+`host_cli` 是开源版默认入口。它把本地执行事实的完整性记录放在任务目录之外的
+`~/.iloop/host-trust/`，防止仅编辑任务状态文件改变结论；它不是同一 OS 用户下的
+独立身份边界。`independent_review`、`user_confirmation` 和
+`evidence_subjects` 必须来自外部 Agent 宿主，默认本地账本拒绝签发和验证。
+内置 `accept review` 只启动只读 preflight，永远不签发最终 `pass`。
 
 `python3 -m cli` 保留为低层 fail-closed 调试入口：它可以规划和取证，但不能
 自行给 Task policy、平台完成或独立验收签字，因此不能完成 `wrapup`。
@@ -187,11 +189,16 @@ runtime = Runtime(
     registry,
     plugin,
     project_root=project_root,
+    attestation_recorder=host.record,  # 只记录宿主实际观察到的事实
     attestation_verifier=host.verify,  # 受信状态必须保存在任务进程外
 )
 ```
 
-`host.verify(kind, path, payload)` 需要复验 `task_policy`、`capability_requirements`、`evidence`、`capability`、`user_confirmation` 和 `independent_review`。把本地文件哈希原样写回同一目录不构成宿主证明。
+`host.record(kind, path, payload)` 与 `host.verify(kind, path, payload)` 必须按
+事实类型分权；尤其不能向执行任务的 Agent 暴露 `independent_review`、
+`user_confirmation` 或任意 `evidence_subjects` 的签发入口。外部验收结果通过
+`runtime.record_external_acceptance(task, result_path)` 回写。把本地文件哈希
+原样写回同一目录不构成宿主证明。
 
 `project_root` 用于隔离不同工程的数据；也可固定设置 `ILOOP_PROJECT_ROOT`。任务、证据和看板默认写入 `~/.iloop/data/<project-id>/`，不污染业务仓。
 
@@ -226,14 +233,14 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.2.0`，当前范围是**平台无关内核 + 受信宿主入口 + iOS 官方插件**。
+版本 `0.2.1`，当前范围是**平台无关内核 + 本地完整性宿主入口 + iOS 官方插件**。
 
-- selftest 237 条断言全绿：内核 166 + iOS 插件 71。
+- selftest 250 条断言全绿：内核 175 + iOS 插件 75。
 - 公开 CI 额外运行 fresh-clone managed-host 旅程，覆盖低风险 Task 的四关与最终 `wrapup`，并验证高风险任务在缺外部 reviewer 时 fail closed。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
 - 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
-- 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 传入的 `subjects` 还需宿主单独证明，不能自行伪造覆盖范围。
+- 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 传入的 `subjects` 不会进入证据，覆盖范围只能由插件实际产出或进程外宿主证明。
 - inputs manifest、Constitution、结构化 blocker、records 和 UI Flow 已进入工程数据层。
 - 模拟器 build/run/install/launch/UI tree/tap/swipe/type/screenshot/probe 统一走 XcodeBuildMCP CLI。
 - 已用 XcodeBuildMCP 生成公开结构的 SwiftUI fixture，真实跑通模拟器 build-and-run、UI tree、截图、tap 和本次 run 绑定日志。

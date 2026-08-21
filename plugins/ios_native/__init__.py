@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -131,7 +133,10 @@ class IOSNativePlugin:
                                           else "ios-simulator"})
 
     def _has_full_xcode(self) -> bool:
-        return self.developer_dir is not None
+        return bool(
+            self.developer_dir
+            and not str(self.developer_dir).endswith("/CommandLineTools")
+        )
 
     def _wda_manager(self) -> WDAManager:
         manager = WDAManager(
@@ -154,12 +159,59 @@ class IOSNativePlugin:
             return ["--project-path", self.config["project"]]
         return []
 
-    def _target_args(self) -> List[str]:
+    def _target_args(self, *, require_simulator: bool = False) -> List[str]:
         if self.mode == "simulator":
-            udid = self.config.get("sim_udid", "booted")
+            configured = str(self.config.get("sim_udid", ""))
+            if not configured and not require_simulator:
+                return []
+            udid = self._simulator_id()
+            if not udid:
+                raise ValueError(
+                    "未找到 booted simulator UUID；请启动模拟器或传 sim_udid"
+                )
             return ["--simulator-id", udid]
         udid = self.config.get("device_udid", "")
         return ["--device-id", udid] if udid else []
+
+    def _simulator_id(self, requested: str = "") -> str:
+        configured = requested or str(self.config.get("sim_udid", ""))
+        if configured and configured != "booted":
+            return configured
+        out = self.runner.run(
+            ["xcrun", "simctl", "list", "devices", "booted", "--json"],
+            timeout=30,
+        )
+        if not out.ok():
+            return ""
+        try:
+            devices = json.loads(out.stdout or out.combined).get("devices", {})
+        except (AttributeError, json.JSONDecodeError):
+            return ""
+        for rows in devices.values():
+            for device in rows:
+                if (
+                    device.get("state") == "Booted"
+                    and device.get("isAvailable", True)
+                    and device.get("udid")
+                ):
+                    return str(device["udid"])
+        return ""
+
+    @staticmethod
+    def _global_developer_dir() -> str:
+        environment = dict(os.environ)
+        environment.pop("DEVELOPER_DIR", None)
+        try:
+            completed = subprocess.run(
+                ["/usr/bin/xcode-select", "-p"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=environment,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return completed.stdout.strip() if completed.returncode == 0 else ""
 
     @staticmethod
     def _artifact_path(text: str, suffix: str) -> Optional[Path]:
@@ -262,15 +314,29 @@ class IOSNativePlugin:
         notes = []
         if not self._has_full_xcode():
             notes.append("需完整 Xcode（当前是 CommandLineTools）：simctl/xcodebuild/devicectl 不可用")
+        global_developer_dir = self._global_developer_dir()
+        if (
+            self.mode == "simulator"
+            and global_developer_dir
+            and global_developer_dir.endswith("/CommandLineTools")
+        ):
+            notes.append(
+                "全局 xcode-select 指向 CommandLineTools，"
+                "XcodeBuildMCP 语义 UI 不可用"
+            )
+        if self.mode == "simulator" and not self._simulator_id():
+            notes.append("未发现已启动的 simulator UUID")
         if self.mode == "real" and shutil.which("iproxy") is None:
             notes.append("iproxy 缺失：仅 WDA 真机 UI 自动化不可用，编译/安装/拉起仍可用")
         if missing or notes:
+            details = []
+            if missing:
+                details.append(", ".join(missing))
+            details.extend(notes)
             return self._err(Capability.DOCTOR,
-                             f"[{self.mode}] 未就绪: {', '.join(missing)}" +
-                             (("；" + "；".join(notes)) if notes else ""))
-        suffix = ("；" + "；".join(notes)) if notes else ""
+                             f"[{self.mode}] 未就绪: {'；'.join(details)}")
         return self._ok(Capability.DOCTOR,
-                        f"[{self.mode}] 依赖齐备: {', '.join(DEP_TOOLS)} + 完整 Xcode{suffix}")
+                        f"[{self.mode}] 依赖齐备: {', '.join(DEP_TOOLS)} + 完整 Xcode")
 
     # ---- BUILD ----
     def _build(self, *, scheme: str = "", project: str = "", workspace: str = "",
@@ -313,7 +379,9 @@ class IOSNativePlugin:
         argv = [self._xb(), workflow, "build-and-run"]
         argv += self._project_args()
         argv += ["--scheme", scheme, "--configuration", configuration]
-        argv += self._target_args()
+        target_args = self._target_args(require_simulator=True)
+        argv += target_args
+        target_id = target_args[-1] if target_args else ""
         if derived_data:
             argv += ["--derived-data-path", derived_data]
         argv += ["--output", "text"]
@@ -336,11 +404,7 @@ class IOSNativePlugin:
                 "workspace": self.config.get("workspace", ""),
                 "runtime_log": str(runtime_log) if runtime_log else "",
                 "bundle_id": self.config.get("bundle_id", ""),
-                "device_id": (
-                    self.config.get("device_udid", "")
-                    if self.mode == "real"
-                    else self.config.get("sim_udid", "booted")
-                ),
+                "device_id": target_id,
             }
             (self.state_dir / f"last-run-{task_id}.json").write_text(
                 json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -366,7 +430,9 @@ class IOSNativePlugin:
         if not app_path:
             return self._err(Capability.INSTALL, "缺少 app_path")
         if self.mode == "simulator":
-            udid = udid or self.config.get("sim_udid", "booted")
+            udid = self._simulator_id(udid)
+            if not udid:
+                return self._err(Capability.INSTALL, "未找到 booted simulator UUID")
             argv = [self._xb(), "simulator", "install",
                     "--simulator-id", udid, "--app-path", app_path]
         else:
@@ -387,7 +453,9 @@ class IOSNativePlugin:
     def _launch(self, *, bundle_id: str = "", udid: str = "", url: str = "") -> CapabilityResult:
         bundle_id = bundle_id or self.config.get("bundle_id", "")
         if self.mode == "simulator":
-            udid = udid or self.config.get("sim_udid", "booted")
+            udid = self._simulator_id(udid)
+            if not udid:
+                return self._err(Capability.LAUNCH, "未找到 booted simulator UUID")
             if url:
                 argv = ["xcrun", "simctl", "openurl", udid, url]
             else:
@@ -417,7 +485,9 @@ class IOSNativePlugin:
         edir = self.writer._dir("screenshot")
         image_path = Path(out_path) if out_path else None
         if self.mode == "simulator":
-            udid = udid or self.config.get("sim_udid", "booted")
+            udid = self._simulator_id(udid)
+            if not udid:
+                return self._err(Capability.SCREENSHOT, "未找到 booted simulator UUID", str(edir))
             out = self.runner.run(
                 [self._xb(), "ui-automation", "screenshot", "--simulator-id", udid,
                  "--return-format", "path", "--output", "json"],
@@ -488,7 +558,9 @@ class IOSNativePlugin:
         edir = self.writer._dir("view_tree")
         tree_file = Path(edir) / "tree.json"
         if self.mode == "simulator":
-            udid = udid or self.config.get("sim_udid", "booted")
+            udid = self._simulator_id(udid)
+            if not udid:
+                return self._err(Capability.VIEW_TREE, "未找到 booted simulator UUID", str(edir))
             out = self.runner.run(
                 [self._xb(), "simulator", "snapshot-ui", "--simulator-id", udid,
                  "--output", "json"],
@@ -656,7 +728,9 @@ class IOSNativePlugin:
                        args: List[str], *, required: str) -> CapabilityResult:
         if not args:
             return self._err(capability, f"{command} 需要 {required}")
-        udid = udid or self.config.get("sim_udid", "booted")
+        udid = self._simulator_id(udid)
+        if not udid:
+            return self._err(capability, "未找到 booted simulator UUID")
         argv = [
             self._xb(), "ui-automation", command, "--simulator-id", udid,
             *args, "--output", "text",
@@ -913,6 +987,11 @@ class IOSNativePlugin:
                 str(edir),
             )
         since = time.time() - max(1, int(since_seconds))
+        selected_device_id = (
+            udid or self.config.get("device_udid", "")
+            if self.mode == "real"
+            else self._simulator_id(udid)
+        )
         if task_id != "direct":
             state_path = self.state_dir / f"last-run-{task_id}.json"
             if not state_path.is_file():
@@ -928,11 +1007,7 @@ class IOSNativePlugin:
                 or state.get("run_id") != run_id
                 or state.get("mode") != self.mode
                 or state.get("bundle_id") != bundle
-                or state.get("device_id") != (
-                    (udid or self.config.get("device_udid", ""))
-                    if self.mode == "real"
-                    else (udid or self.config.get("sim_udid", "booted"))
-                )
+                or state.get("device_id") != selected_device_id
             ):
                 return self._err(
                     Capability.CRASH,
@@ -995,7 +1070,8 @@ class IOSNativePlugin:
             raw_dir = Path(edir) / "raw"
             out = self.runner.run(
                 ["xcrun", "devicectl", "device", "copy", "from", "--device", udid,
-                 "--source", "/var/mobile/Library/Logs/CrashReporter",
+                 "--domain-type", "systemCrashLogs",
+                 "--source", ".",
                  "--destination", str(raw_dir)],
                 timeout=300)
             candidates = [

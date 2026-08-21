@@ -92,6 +92,7 @@ def observed(
             "task_id": evidence.metadata.get("task_id", ""),
             "run_id": evidence.metadata.get("run_id", ""),
             "flow_id": evidence.metadata.get("flow_id", ""),
+            "ui_flow_id": evidence.metadata.get("ui_flow_id", ""),
             "flow_run_id": evidence.metadata.get("flow_run_id", ""),
             "device": evidence.metadata.get("device", ""),
             "device_id": evidence.metadata.get("device_id", ""),
@@ -484,10 +485,12 @@ def test_extension_mechanism() -> None:
         bad = Path(d) / "team.bad"
         bad.mkdir()
         (bad / "manifest.json").write_text("{broken", encoding="utf-8")
-        plugins = load_installed_plugins(d)
+        plugin_issues = []
+        plugins = load_installed_plugins(d, issues=plugin_issues)
         check(
             "扩展: 损坏相邻扩展不阻断合法插件加载",
-            any(item.platform_id == "team_demo" for item in plugins),
+            any(item.platform_id == "team_demo" for item in plugins)
+            and any("team.bad" in issue.message for issue in plugin_issues),
         )
 
 
@@ -543,6 +546,38 @@ def test_redline_guards() -> None:
     check("红线: sudo/rm -rf 命中拦截", not bad and "危险" in why)
     bad2, _ = check_command(["git", "reset", "--hard", "HEAD~1"])
     check("红线: git reset --hard 命中拦截", not bad2)
+    bypasses = [
+        ["git", "-C", "/tmp/repo", "reset", "--hard"],
+        ["rm", "--recursive", "--force", "/tmp/x"],
+        ["rm", "-fr", "/tmp/x"],
+        ["bash", "-lc", "git -C /tmp/repo reset --hard"],
+        ["git", "-c", "alias.wipe=reset --hard", "wipe"],
+        ["git", "wipe"],
+        ["git", "restore", "--worktree", "."],
+        ["git", "checkout", "-f", "HEAD"],
+        ["git", "switch", "--discard-changes", "main"],
+        ["git", "reset", "--merge", "HEAD"],
+        ["git", "clean", "-fd"],
+        ["bash", "-lc", "true && git restore ."],
+        ["bash", "-xc", "true && git restore ."],
+        ["bash", "-lc", "true\ngit restore ."],
+        ["git", "checkout", "HEAD", "tracked.txt"],
+    ]
+    check(
+        "红线: 标准等价参数不能绕过危险命令守卫",
+        all(not check_command(argv)[0] for argv in bypasses),
+    )
+    safe_git = [
+        ["git", "checkout", "main"],
+        ["git", "switch", "main"],
+        ["git", "clean", "-nd"],
+        ["git", "pull", "--ff-only"],
+        ["bash", "-lc", "printf '%s' 'a|b'"],
+    ]
+    check(
+        "红线: 常用非破坏性 Git 操作不被误伤",
+        all(check_command(argv)[0] for argv in safe_git),
+    )
     # 污染守卫
     with tempfile.TemporaryDirectory() as proj, tempfile.TemporaryDirectory() as data:
         blocked = False
@@ -577,7 +612,7 @@ def test_runner_does_not_wait_for_detached_child_output() -> None:
         "/bin/sh",
         "-c",
         "(sleep 3; echo child) & echo parent",
-    ])
+    ], allow_dangerous=True)
     check(
         "运行器: 主进程退出后不被继承输出句柄的后台子进程阻塞",
         out.returncode == 0
@@ -604,6 +639,7 @@ def test_runner_timeout_kills_remaining_process_group() -> None:
                 ),
             ],
             timeout=2,
+            allow_dangerous=True,
         )
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
         time.sleep(0.1)
@@ -1331,10 +1367,9 @@ def test_global_review_uses_task_base_and_explicit_subjects() -> None:
               in forged_review_blockers
               and any("global review incomplete:" in item
                       for item in forged_review_blockers))
-        check("全局复核: Capability 显式 subjects 必须经宿主证明",
+        check("全局复核: CLI subjects 不能扩大任何能力的可信范围",
               denied_evidence.metadata["subjects"] == []
-              and evidence.metadata["subjects"]
-              == ["feature.py", "tests/test_feature.py"])
+              and evidence.metadata["subjects"] == [])
         policy_path = runtime._task_policy_path(task.id)
         policy = json.loads(policy_path.read_text(encoding="utf-8"))
         policy.pop("base_commit")
@@ -1706,7 +1741,8 @@ def test_ui_flow_verification_requires_evidence() -> None:
             "failed tree", capability="view_tree",
             evidence_id="ev-ui", outcome="failure", metadata={
                 "task_id": "task-ui",
-                "flow_id": flow.id, "flow_run_id": "flow-run-1",
+                "flow_id": "core.verify", "ui_flow_id": flow.id,
+                "flow_run_id": "flow-run-1",
                 "device": "ios-simulator", "device_id": "SIM-1",
             },
         )
@@ -1723,7 +1759,8 @@ def test_ui_flow_verification_requires_evidence() -> None:
             "target visible", capability="view_tree",
             evidence_id="ev-ui", metadata={
                 "task_id": "task-ui",
-                "flow_id": flow.id, "flow_run_id": "flow-run-1",
+                "flow_id": "core.verify", "ui_flow_id": flow.id,
+                "flow_run_id": "flow-run-1",
                 "device": "ios-simulator", "device_id": "SIM-1",
             },
         )
@@ -1731,7 +1768,8 @@ def test_ui_flow_verification_requires_evidence() -> None:
             "app launched", capability="launch",
             evidence_id="ev-launch", metadata={
                 "task_id": "task-ui",
-                "flow_id": flow.id, "flow_run_id": "flow-run-1",
+                "flow_id": "core.verify", "ui_flow_id": flow.id,
+                "flow_run_id": "flow-run-1",
                 "device": "ios-simulator", "device_id": "SIM-1",
             },
         )
@@ -1747,6 +1785,93 @@ def test_ui_flow_verification_requires_evidence() -> None:
         check("UI Flow: 任意字符串 evidence id 不能标 verified", spoofed)
         check("UI Flow: 失败证据不能标 verified", failed_rejected)
         check("UI Flow: 补证后可验证并持久化", verified.status == "verified")
+        auto = store.create("自动绑定", "看到详情")
+        auto_launch = observed(
+            "launched",
+            capability="launch",
+            metadata={
+                "task_id": "task-auto",
+                "run_id": "run-launch",
+                "flow_id": "core.verify",
+                "ui_flow_id": auto.id,
+                "flow_run_id": "flow-auto",
+                "device": "ios-simulator",
+                "device_id": "SIM-2",
+            },
+        )
+        auto_tree = observed(
+            "details visible",
+            capability="view_tree",
+            metadata={
+                "task_id": "task-auto",
+                "run_id": "run-tree",
+                "flow_id": "core.verify",
+                "ui_flow_id": auto.id,
+                "flow_run_id": "flow-auto",
+                "device": "ios-simulator",
+                "device_id": "SIM-2",
+            },
+        )
+        auto = store.verify(
+            auto.id,
+            {auto_launch.id: auto_launch, auto_tree.id: auto_tree},
+            verify_attestation=lambda path, row: True,
+            bindings={
+                "task_id": "task-auto",
+                "verification_run_id": "flow-auto",
+                "device": "ios-simulator",
+                "device_id": "SIM-2",
+            },
+        )
+        check(
+            "UI Flow: 任务证据按节点能力自动回绑定",
+            [node.evidence_ids for node in auto.nodes]
+            == [[auto_launch.id], [auto_tree.id]],
+        )
+        before = auto.to_dict()
+        try:
+            store.verify(
+                auto.id,
+                {auto_launch.id: auto_launch, auto_tree.id: auto_tree},
+                verify_attestation=lambda path, row: True,
+                bindings={"task_id": "wrong-task"},
+            )
+        except ValueError:
+            pass
+        check(
+            "UI Flow: 失败验证不污染已验证状态",
+            store.load(auto.id).to_dict() == before,
+        )
+        rebound = False
+        try:
+            store.bind_task(
+                auto.id,
+                "another-task",
+                "another-run",
+                "ios-simulator",
+                "SIM-3",
+            )
+        except ValueError:
+            rebound = True
+        check("UI Flow: 已绑定 Task/Run 不可被二次覆盖", rebound)
+        reserved = store.create("并发占位", "看到页面")
+        store.reserve_task(reserved.id, "owner-a")
+        competing_reservation_rejected = False
+        try:
+            store.reserve_task(reserved.id, "owner-b")
+        except ValueError:
+            competing_reservation_rejected = True
+        stale = store.load(reserved.id)
+        stale.binding_started_at = 1.0
+        store.save(stale)
+        reclaimed = store.reserve_task(reserved.id, "owner-b")
+        store.release_task_reservation(reserved.id, "owner-b")
+        check(
+            "UI Flow: reservation 阻断并发转换且超时可恢复",
+            competing_reservation_rejected
+            and reclaimed.binding_token == "owner-b"
+            and not store.load(reserved.id).binding_token,
+        )
 
 
 def test_release_audit_regressions() -> None:
@@ -1765,6 +1890,7 @@ def test_release_audit_regressions() -> None:
         UIFlowStore,
         has_errors,
         load_installed_extensions,
+        load_installed_plugins,
         scaffold_extension,
         validate_extension,
     )
@@ -1807,6 +1933,26 @@ def test_release_audit_regressions() -> None:
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
         trust = HostTrustStore(Path(d) / "trust")
+        external_rejected = False
+        external_path = Path(d) / "forged-review.json"
+        external_path.write_text('{"verdict":"pass"}', encoding="utf-8")
+        try:
+            trust.attest(
+                "independent_review",
+                external_path,
+                {"verdict": "pass"},
+            )
+        except ValueError:
+            external_rejected = True
+        check(
+            "宿主: 本地账本拒绝签发外部独立验收",
+            external_rejected
+            and not trust.verify(
+                "independent_review",
+                external_path,
+                {"verdict": "pass"},
+            ),
+        )
         runtime = Runtime(
             data,
             registry,
@@ -2007,6 +2153,26 @@ def test_release_audit_regressions() -> None:
             blocker_rejected = True
         check("路径: UI Flow 和 blocker 标识不能越界",
               traversal_rejected and blocker_rejected)
+        blocker_one = memory.emit_blocker(
+            task.id,
+            reason="first",
+            evidence=["e1"],
+            options=["o1"],
+            recommendation="r1",
+        )
+        blocker_two = memory.emit_blocker(
+            task.id,
+            reason="second",
+            evidence=["e2"],
+            options=["o2"],
+            recommendation="r2",
+        )
+        check(
+            "blocker: 同秒连续记录不覆盖",
+            blocker_one != blocker_two
+            and blocker_one.is_file()
+            and blocker_two.is_file(),
+        )
 
         extensions = Path(d) / "extensions"
         extension = scaffold_extension("team.audit", extensions)
@@ -2034,6 +2200,40 @@ def test_release_audit_regressions() -> None:
         )
         check("扩展: 不兼容内核版本被拒绝",
               has_errors(validate_extension(future)))
+
+        for name in ("team.plugin_a", "team.plugin_b"):
+            duplicate = scaffold_extension(name, extensions)
+            duplicate.manifest["provides"]["plugin"] = "plugin.py"
+            (duplicate.root / "manifest.json").write_text(
+                json.dumps(duplicate.manifest),
+                encoding="utf-8",
+            )
+            (duplicate.root / "plugin.py").write_text(
+                "from kernel import Capability, CapabilityResult, CapabilityStatus\n"
+                "class Duplicate:\n"
+                " platform_id='duplicate_platform'\n"
+                " def capabilities(self): return [Capability.PROBE]\n"
+                " def invoke(self, capability, **kwargs):\n"
+                "  return CapabilityResult(self.platform_id, capability.value, CapabilityStatus.SUCCESS, 'ok')\n"
+                "def create_plugin(config): return Duplicate()\n",
+                encoding="utf-8",
+            )
+        plugin_issues = []
+        duplicate_plugins = load_installed_plugins(
+            extensions,
+            issues=plugin_issues,
+        )
+        check(
+            "扩展: 重复 platform_id fail closed 并报告双方来源",
+            not any(
+                item.platform_id == "duplicate_platform"
+                for item in duplicate_plugins
+            )
+            and any(
+                "duplicate platform_id 'duplicate_platform'" in issue.message
+                for issue in plugin_issues
+            ),
+        )
 
         check("路由: 单独回归命中 L1 验证 flow",
               registry.plan("回归").flow_id == "core.verify")

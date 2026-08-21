@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import importlib.util
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
@@ -47,8 +48,8 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "name": name,
-        "version": "0.2.0",
-        "iloop_kernel": ">=0.2.0",
+        "version": "0.2.1",
+        "iloop_kernel": ">=0.2.1",
         "description": f"{name} iLoop extension",
         "provides": {"flows": FLOWS_NAME, "plugin": None},
     }
@@ -228,18 +229,47 @@ def load_extension_plugin(ext: Extension, config: Optional[dict] = None) -> Opti
     return plugin
 
 
-def load_installed_plugins(base_dir: str | Path, config: Optional[dict] = None) -> List[Plugin]:
+def load_installed_plugins(
+    base_dir: str | Path,
+    config: Optional[dict] = None,
+    issues: Optional[List[ValidationIssue]] = None,
+) -> List[Plugin]:
     base = Path(base_dir).expanduser()
     if not base.exists():
         return []
     plugins = []
+    owners = {}
     for root in sorted(path for path in base.iterdir() if path.is_dir()):
         if not (root / MANIFEST_NAME).exists():
             continue
         try:
             plugin = load_extension_plugin(load_extension(root), config)
-        except Exception:
+        except Exception as error:
+            message = (
+                f"{root.name}: plugin load failed: "
+                f"{type(error).__name__}: {error}"
+            )
+            if issues is not None:
+                issues.append(ValidationIssue("error", message))
+            else:
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
             continue
         if plugin is not None:
+            previous = owners.get(plugin.platform_id)
+            if previous is not None:
+                message = (
+                    f"duplicate platform_id '{plugin.platform_id}': "
+                    f"{previous} and {root}"
+                )
+                if issues is not None:
+                    issues.append(ValidationIssue("error", message))
+                else:
+                    warnings.warn(message, RuntimeWarning, stacklevel=2)
+                plugins = [
+                    item for item in plugins
+                    if item.platform_id != plugin.platform_id
+                ]
+                continue
+            owners[plugin.platform_id] = root
             plugins.append(plugin)
     return plugins

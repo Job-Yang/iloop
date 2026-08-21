@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import subprocess
 import tempfile
@@ -59,7 +60,8 @@ def test_sim_build_command_and_success_marker() -> None:
         res = p.invoke(Capability.BUILD)
         argv = " ".join(fake.calls[0])
         check("build: 用了 XcodeBuildMCP", "xcodebuildmcp simulator build" in argv)
-        check("build: 模拟器目标正确", "--simulator-id booted" in argv)
+        check("build: 未指定设备时不传非法 booted 伪 UUID",
+              "--simulator-id" not in argv)
         check("build: 传了 scheme", "--scheme App" in argv)
         check("build: BUILD SUCCEEDED 判成功", res.status == CapabilityStatus.SUCCESS)
         check("build: 产出了证据", len(res.artifacts) == 1 and res.evidence_dir)
@@ -111,15 +113,45 @@ def test_sim_install_launch_screenshot_commands() -> None:
     with tempfile.TemporaryDirectory() as d:
         fake = FakeRunner(stdout="ok", returncode=0)
         p = IOSNativePlugin("simulator", data_dir=d, runner=fake,
-                            config={"app_path": "/x/App.app", "bundle_id": "com.x.app", "sim_udid": "booted"})
+                            config={"app_path": "/x/App.app", "bundle_id": "com.x.app", "sim_udid": "SIM-1"})
         p.invoke(Capability.INSTALL)
         p.invoke(Capability.LAUNCH)
         install_argv = " ".join(fake.calls[0])
         launch_argv = " ".join(fake.calls[1])
         check("install: XcodeBuildMCP simulator install 命令正确",
-              "xcodebuildmcp simulator install --simulator-id booted --app-path /x/App.app" in install_argv)
+              "xcodebuildmcp simulator install --simulator-id SIM-1 --app-path /x/App.app" in install_argv)
         check("launch: XcodeBuildMCP launch-app 命令正确",
-              "xcodebuildmcp simulator launch-app --simulator-id booted --bundle-id com.x.app" in launch_argv)
+              "xcodebuildmcp simulator launch-app --simulator-id SIM-1 --bundle-id com.x.app" in launch_argv)
+
+
+def test_booted_simulator_is_resolved_to_uuid() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        payload = json.dumps({
+            "devices": {
+                "com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
+                    {
+                        "state": "Booted",
+                        "isAvailable": True,
+                        "udid": "SIM-RESOLVED",
+                    }
+                ]
+            }
+        })
+        fake = FakeRunner(stdout=payload, returncode=0)
+        plugin = IOSNativePlugin(
+            "simulator",
+            data_dir=d,
+            runner=fake,
+            config={"bundle_id": "com.x.app"},
+        )
+        result = plugin.invoke(Capability.LAUNCH)
+        launch = fake.calls[-1]
+        check(
+            "simulator: booted 状态先解析为真实 UUID",
+            result.status == CapabilityStatus.SUCCESS
+            and "--simulator-id" in launch
+            and launch[launch.index("--simulator-id") + 1] == "SIM-RESOLVED",
+        )
 
 
 def test_probe_allows_slow_device_discovery() -> None:
@@ -374,6 +406,36 @@ def test_injected_runner_developer_dir_matches_doctor() -> None:
             plugin.developer_dir
             == "/Applications/Xcode.app/Contents/Developer",
         )
+        with mock.patch.object(
+            IOSNativePlugin,
+            "_global_developer_dir",
+            return_value="/Library/Developer/CommandLineTools",
+        ):
+            result = plugin.invoke(Capability.DOCTOR)
+        check(
+            "doctor: 全局 CLT 会阻断 XcodeBuildMCP 语义 UI readiness",
+            result.status == CapabilityStatus.ERROR
+            and "语义 UI 不可用" in result.summary,
+        )
+        completed = subprocess.CompletedProcess(
+            ["/usr/bin/xcode-select", "-p"],
+            0,
+            stdout="/Library/Developer/CommandLineTools\n",
+            stderr="",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer"},
+        ), mock.patch(
+            "plugins.ios_native.subprocess.run",
+            return_value=completed,
+        ) as run:
+            selected = IOSNativePlugin._global_developer_dir()
+        check(
+            "doctor: 读取全局 xcode-select 时移除进程级 DEVELOPER_DIR",
+            selected == "/Library/Developer/CommandLineTools"
+            and "DEVELOPER_DIR" not in run.call_args.kwargs["env"],
+        )
 
 
 def test_real_device_needs_udid() -> None:
@@ -597,7 +659,7 @@ def test_sim_crash_never_falls_back_to_other_app() -> None:
             "simulator",
             data_dir=Path(d) / "data",
             runner=FakeRunner(),
-            config={"bundle_id": "com.target.app"},
+            config={"bundle_id": "com.target.app", "sim_udid": "SIM-1"},
         )
         with mock.patch.object(Path, "home", return_value=home):
             result = plugin.invoke(
@@ -618,7 +680,7 @@ def test_sim_crash_never_falls_back_to_other_app() -> None:
                 "run_id": "run-bound",
                 "mode": "simulator",
                 "bundle_id": "com.other.app",
-                "device_id": "booted",
+                "device_id": "SIM-1",
                 "captured_at": __import__("time").time(),
             }), encoding="utf-8")
             wrong_subject = plugin.invoke(
@@ -657,6 +719,14 @@ def test_sim_crash_never_falls_back_to_other_app() -> None:
             "crash: 真机查询成功且无目标报告时产出 absence 证据",
             no_real_crash.status == CapabilityStatus.SUCCESS
             and (Path(no_real_crash.evidence_dir) / "absence.json").is_file(),
+        )
+        crash_command = real_plugin.runner.calls[0]
+        check(
+            "crash: 真机使用 devicectl systemCrashLogs domain",
+            "--domain-type" in crash_command
+            and crash_command[crash_command.index("--domain-type") + 1]
+            == "systemCrashLogs"
+            and crash_command[crash_command.index("--source") + 1] == ".",
         )
 
 
@@ -1026,6 +1096,7 @@ def run() -> int:
         test_build_exit0_without_marker_is_failure,
         test_real_build_uses_xcodebuildmcp_device_workflow,
         test_sim_install_launch_screenshot_commands,
+        test_booted_simulator_is_resolved_to_uuid,
         test_probe_allows_slow_device_discovery,
         test_sim_view_tree_and_ui_actions_use_xcodebuildmcp,
         test_sim_ui_action_refreshes_expired_snapshot_once,

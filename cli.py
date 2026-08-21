@@ -37,6 +37,7 @@ import sys
 import hashlib
 import json
 import subprocess
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -92,11 +93,26 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
         extensions_dir = os.environ.get(
             "ILOOP_EXTENSIONS_DIR", str(Path.home() / ".iloop" / "extensions")
         )
-        candidates = load_installed_plugins(extensions_dir, kwargs)
+        plugin_issues = []
+        candidates = load_installed_plugins(
+            extensions_dir,
+            kwargs,
+            issues=plugin_issues,
+        )
+        conflicts = [
+            issue.message for issue in plugin_issues
+            if f"platform_id '{platform}'" in issue.message
+        ]
+        if conflicts:
+            raise ValueError("; ".join(conflicts))
         plugin = next((candidate for candidate in candidates
                        if candidate.platform_id == platform), None)
         if plugin is None:
-            raise ValueError(f"extension platform plugin not found: {platform}")
+            details = "; ".join(issue.message for issue in plugin_issues)
+            suffix = f"; load errors: {details}" if details else ""
+            raise ValueError(
+                f"extension platform plugin not found: {platform}{suffix}"
+            )
     trust = _host_trust()
     return Runtime(
         data_dir,
@@ -145,7 +161,12 @@ def cmd_resume(task_id: str, real: bool, kwargs: dict) -> int:
     task = runtime.load(task_id)
     capabilities = _split(kwargs.pop("caps", kwargs.pop("capabilities", "")))
     if capabilities:
-        task = runtime.execute_capabilities(task, capabilities, **kwargs)
+        execution_kwargs = {**kwargs, **task.execution_context}
+        task = runtime.execute_capabilities(
+            task,
+            capabilities,
+            **execution_kwargs,
+        )
     _print_resume_card(runtime, task)
     return 1 if task.status == TaskStatus.BLOCKED else 0
 
@@ -681,13 +702,9 @@ def cmd_accept(action: str, task_id: str, rest: list[str]) -> int:
             ))
             return 1
         row = json.loads(result_path.read_text(encoding="utf-8"))
-        trust.attest("independent_review", result_path, row)
-        try:
-            result = runtime.record_external_acceptance(task, result_path)
-        except ValueError as error:
-            print(render("blocked", str(error)))
-            return 1
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        # Local preflight is advisory only. It must never mint the external
+        # identity proof consumed by the completion gate.
+        print(json.dumps(row, ensure_ascii=False, indent=2))
         return 0
     if action == "status":
         print(json.dumps(store.load_raw(), ensure_ascii=False, indent=2))
@@ -795,11 +812,6 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
         return 0
     if action == "verify":
         values = _parse_kv(rest[1:])
-        flow = store.load(flow_id)
-        flow.task_id = values.get("task_id", flow.task_id)
-        flow.verification_run_id = values.get("flow_run_id", flow.verification_run_id)
-        flow.device_id = values.get("device_id", flow.device_id)
-        store.save(flow)
         evidence_by_id = {}
         for path in _data_dir().glob("runtime/*/evidence.jsonl"):
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -817,6 +829,12 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
                 flow_id,
                 evidence_by_id,
                 verify_attestation=verifier,
+                bindings={
+                    "task_id": values.get("task_id", ""),
+                    "verification_run_id": values.get("flow_run_id", ""),
+                    "device": values.get("device", ""),
+                    "device_id": values.get("device_id", ""),
+                },
             )
         except ValueError as error:
             print(render("blocked", str(error)))
@@ -825,21 +843,54 @@ def cmd_ui_flow(action: str, rest: list[str]) -> int:
         return 0
     if action == "to-task":
         flow = store.load(flow_id)
-        runtime = _runtime(False, {})
-        steps = [
-            TaskStep(
-                title=f"{node.action}: {node.target}",
-                capability=ACTION_CAPABILITY[node.action],
-                summary=f"ui-flow={flow.id} node={node.id}",
+        if flow.task_id or flow.verification_run_id:
+            print(render(
+                "blocked",
+                f"UI Flow {flow.id} 已绑定 Task {flow.task_id}，不能重复转换",
+            ))
+            return 1
+        binding_token = uuid.uuid4().hex
+        try:
+            flow = store.reserve_task(flow.id, binding_token)
+        except ValueError as error:
+            print(render("blocked", str(error)))
+            return 1
+        try:
+            runtime = _runtime(False, {})
+            steps = [
+                TaskStep(
+                    title=f"{node.action}: {node.target}",
+                    capability=ACTION_CAPABILITY[node.action],
+                    summary=f"ui-flow={flow.id} node={node.id}",
+                )
+                for node in flow.nodes
+            ]
+            flow_run_id = f"ui-run-{uuid.uuid4().hex[:12]}"
+            task = runtime.start(
+                f"验证 UI 路径 {flow.name}",
+                acceptance=[flow.goal],
+                steps=steps,
+                execution_context={
+                    "ui_flow_id": flow.id,
+                    "flow_run_id": flow_run_id,
+                },
             )
-            for node in flow.nodes
-        ]
-        task = runtime.start(
-            f"验证 UI 路径 {flow.name}",
-            acceptance=[flow.goal],
-            steps=steps,
-        )
+            flow = store.bind_task(
+                flow.id,
+                task.id,
+                flow_run_id,
+                flow.device,
+                flow.device_id,
+                binding_token=binding_token,
+            )
+        except BaseException as error:
+            store.release_task_reservation(flow.id, binding_token)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            print(render("blocked", f"UI Flow 转 Task 失败: {error}"))
+            return 1
         _print_resume_card(runtime, task)
+        print(f"  ui_flow={flow.id} · flow_run_id={flow_run_id}")
         return 0
     print("usage: ui-flow new|list|show|verify|to-task ...")
     return 2
@@ -880,7 +931,7 @@ def cmd_plan(task: str) -> int:
     ]
     print(f"  active_gates={active_gates}")
     if flow.next_suggest:
-        print(render("wrapup", f"🧭 下一步预备：{flow.next_suggest}"))
+        print(render("plan", f"🧭 完成后建议：{flow.next_suggest}"))
     return 0
 
 

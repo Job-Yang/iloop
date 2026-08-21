@@ -60,6 +60,7 @@ class TaskRecord:
     evidence_ids: List[str] = field(default_factory=list)
     required_operation_ids: List[str] = field(default_factory=list)
     capability_runs: Dict[str, str] = field(default_factory=dict)
+    execution_context: Dict[str, str] = field(default_factory=dict)
     case_path: str = ""
     capability_gate_path: str = ""
     global_review_path: str = ""
@@ -185,5 +186,6 @@ class TaskStore:
             "next_step": next_step.title if next_step else "",
             "next_capability": next_step.capability if next_step else "",
             "evidence_ids": list(task.evidence_ids),
+            "execution_context": dict(task.execution_context),
             "updated_at": task.updated_at,
         }

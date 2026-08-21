@@ -6,6 +6,7 @@ import hashlib
 import json
 import time
 import re
+import uuid
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -127,6 +128,10 @@ class ProjectMemory:
             "recommendation": recommendation,
             "created_at": time.time(),
         }
-        path = self.root / "blockers" / f"{task_id}-{int(time.time())}.json"
+        path = (
+            self.root
+            / "blockers"
+            / f"{task_id}-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json"
+        )
         atomic_write_json(path, row)
         return path

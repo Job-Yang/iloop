@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与语义化版本。
 
+## [0.2.1] - 2026-08-21
+
+### [breaking-entry] 宿主证明分权
+- 默认本地账本拒绝签发或验证独立验收、用户确认和任意 evidence subjects；
+  高风险身份事实只能由进程外宿主提供。
+- 修正宿主接入示例，明确 recorder/verifier 双向契约与外部验收回写 API。
+
+### 修复
+- UI Flow 转 Task 后持久化执行上下文，并从绑定的运行证据自动回填节点；
+  验证失败不再污染已验证状态。
+- 模拟器动作先解析真实 booted UUID；doctor 识别全局 CommandLineTools 对语义
+  UI 的阻断；真机 crash 使用 `systemCrashLogs` domain。
+- redline 按 argv 语义识别 Git 全局参数和 rm 等价选项，关闭常见绕过。
+- 重复扩展 `platform_id` fail closed，插件加载失败返回可诊断来源。
+- blocker 文件名改为纳秒时间加随机后缀；`plan` 不再提前输出完成态文案。
+- 快速开始将平台无关内核与可选 iOS/Homebrew 安装拆开。
+
+### 验证
+- selftest 250 条断言：内核 175 + iOS 插件 75。
+- fresh-clone managed-host smoke 通过。
+- Xcode 26.3 `devicectl` 真实参数探针通过命令解析并进入设备查找阶段。
+
 ## [0.2.0] - 2026-08-21
 
 ### [breaking-entry] 受信宿主入口

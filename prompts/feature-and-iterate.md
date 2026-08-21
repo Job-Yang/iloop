@@ -23,7 +23,7 @@
 
 ## refactor：重构回归影响面
 - 不按“最后改了哪个文件”判断影响。Task 创建时固定 Git commit；`global-review prepare` 只能读取该基线到当前的完整 diff，识别改动定义、Objective-C selector、动态入口、行为配置、仓内调用方、共享边界与删除行为，再按 `suggested_tests` 和受影响主链路逐个回归。
-- 每个影响项必须通过 `global-review record target=... evidence=...` 绑定证据；执行 capability 时用 `subjects=<target,consumer...>` 声明这条证据实际覆盖的对象，并由宿主验证该覆盖声明。删逻辑时说明原服务对象和替代路径。未完成时 `wrapup` 代码级拒绝。
+- 每个影响项必须通过 `global-review record target=... evidence=...` 绑定证据；CLI 的 `subjects=<target,consumer...>` 只是请求参数，不能自行进入可信证据，覆盖范围必须由插件实际产出或进程外宿主证明。删逻辑时说明原服务对象和替代路径。未完成时 `wrapup` 代码级拒绝。
 - 范围不确定、跨模块影响不清时，**先给影响面分析再升级**，不要盲目大改。
 - 行为基线优先：重构不改外部行为，回归要证明关键入口行为不变（编译/测试 + 主链路验证）。
 - 升级时机：跨模块影响不确定、或涉及不可控第三方组件。

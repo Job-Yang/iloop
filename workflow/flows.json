@@ -30,7 +30,7 @@
     "required_docs": ["SPEC.md", "prompts/build-and-run.md"],
     "evidence_strategy": "复现→改→真跑验证，过四道关卡",
     "escalate_when": "同根因失败超过 3 轮",
-    "next_suggest": "崩溃已修复验证；要不要跑一遍相关入口回归，确认没连带影响？"
+    "next_suggest": "修复验证完成后，跑一遍相关入口回归，确认没有连带影响。"
   },
   {
     "flow_id": "core.feature",
@@ -63,7 +63,7 @@
     "required_docs": ["prompts/feature-and-iterate.md", "prompts/triage-impact.md"],
     "evidence_strategy": "先给影响面分析，再挑受影响主链路逐个运行态回归",
     "escalate_when": "跨模块影响不确定或涉及不可控第三方组件",
-    "next_suggest": "重构验证通过；要不要我把受影响入口逐个回归一遍？"
+    "next_suggest": "重构验证完成后，把受影响入口逐个回归一遍。"
   },
   {
     "flow_id": "core.verify",
@@ -75,7 +75,7 @@
     "required_docs": ["SPEC.md", "docs/VDD.md", "prompts/record-wrapup.md"],
     "evidence_strategy": "验数据看日志、验控件看UI树、验最终表现看截图、验崩溃看crash",
     "escalate_when": "代价极高的改动应起独立挑错角色复核",
-    "next_suggest": "验收通过；要不要我刷一下提效看板汇总本轮证据？"
+    "next_suggest": "验收通过后，刷新提效看板并汇总本轮证据。"
   },
   {
     "flow_id": "core.env_doctor",

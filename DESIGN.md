@@ -360,7 +360,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 3. **平台插件**：把具体工程和设备反馈转换成统一证据；
 4. **宿主信任适配**：在 CLI 进程外记录并复验 Task 创建策略、Capability requirements、Plugin receipt、用户确认和独立 reviewer 结果。
 
-支持项目规则或系统提示的宿主，都可以加载入口文档；支持 shell/进程调用的宿主，都可以运行同一套 CLI。开源版默认使用 `host_cli`：它把证明记录在任务目录之外的宿主账本，防止任务状态文件自行补签；它不把同一 OS 用户主动修改源码或可信插件纳入本地威胁模型。内置只读验收进程只做 preflight，不签发最终 pass。`cli` 保留为 fail-closed 的低层调试面。高风险独立验收和企业级身份边界由自建宿主通过 `Runtime(attestation_verifier=..., attestation_recorder=...)` 接入。Claude Code、Codex、Cursor 或自建 Agent 的差异由宿主适配承担，VDD、flow、证据和病例不会跟着重写。
+支持项目规则或系统提示的宿主，都可以加载入口文档；支持 shell/进程调用的宿主，都可以运行同一套 CLI。开源版默认使用 `host_cli`：它把本地执行事实的完整性记录放在任务目录之外，防止只改任务 JSON 就改变结论，但不把这个同用户账本冒充成独立身份边界。`independent_review`、`user_confirmation` 和任意 `evidence_subjects` 由默认账本拒绝签发；内置只读验收进程只做 preflight，不签发最终 pass。`cli` 保留为 fail-closed 的低层调试面。高风险独立验收和企业级身份边界由自建宿主通过 `Runtime(attestation_verifier=..., attestation_recorder=...)` 接入，并按 attestation kind 分权。Claude Code、Codex、Cursor 或自建 Agent 的差异由宿主适配承担，VDD、flow、证据和病例不会跟着重写。
 
 开源版选择把提示词与代码放进同一个 GitHub 仓：
 

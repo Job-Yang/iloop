@@ -17,7 +17,7 @@
 
 ## 工具入口（开源版命令）
 
-所有能力默认通过受信宿主入口调用（`cd` 到 iloop 仓库根）：
+所有能力默认通过本地完整性宿主入口调用（`cd` 到 iloop 仓库根）：
 
 ```
 python3 -m host_cli plan "<任务>"        # flow 路由 + 自治分级（先跑这个）
@@ -78,7 +78,7 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 
 - **模糊先澄清**：目标有歧义/缺关键输入（设备 sim/real、验收口径、接口/PRD）时，先给候选点选澄清，不带歧义开干。
 - **开工前定验收标准**：动手前对齐"怎么算完成"，写成可验证硬指标。步骤不能裸改成 done；Plugin receipt 仍须由进程外宿主 verifier 复验，`trusted_producer` 不是凭证。用户确认、Task 创建策略和 Capability requirements 同属宿主信任边界，普通 CLI 无权伪造或自行收口。
-- **独立验收按风险触发**：高影响改动先 `accept prepare`，把验收包交给外部只读 Agent；宿主在进程外验证身份后，通过 `AcceptanceStore.record_file(verifier)` API 回写。普通 CLI 默认拒绝 `accept record`，环境变量和 reviewer 字符串都不能充当身份证明。
+- **独立验收按风险触发**：高影响改动先 `accept prepare`，把验收包交给外部只读 Agent；宿主在进程外验证身份后，通过 `Runtime.record_external_acceptance(task, result_path)` 回写，或调用 `AcceptanceStore.record_file(result_path, verify_attestation=verifier)`。普通 CLI 默认拒绝 `accept record`，环境变量和 reviewer 字符串都不能充当身份证明。
 
 ## 反循环（防死循环）
 
