@@ -249,4 +249,8 @@ Agent 会按入口协议自动完成：
 - 真机 build/install/launch 走 XcodeBuildMCP；固定版本、官方 commit 与 origin 的公开 WDA 由 `ui_prepare/ui_status/ui_stop` 管理；crash 走 `devicectl`。
 - 真机已发现并验证到一台已配对的 iPhone；设备构建已进入 provisioning 阶段。完整真机 build/install/launch/WDA E2E 仍等待有效 Apple Developer 登录态创建 `dev.iloop.e2e` 的 development profile；真机动作目前使用 WDA 坐标，不与模拟器的语义 `elementRef` 冒充一致。
 
+## 下一步
+
+`0.3` 把开源版从「单 Runtime 验证闭环内核」推进到「用原子应用能力装配多个助手」的平台，分四个里程碑推进（应用动作契约与助手 Recipe → Provider 注册表 → 版本化 Case 生命周期 → Deployment 与跨节点任务信封）。完整排期、每个里程碑的范围/验收/不做边界，以及哪些进核心、哪些走扩展、哪些只留内部，见 [docs/ROADMAP-v0.3.md](docs/ROADMAP-v0.3.md)。
+
 MIT License。欢迎使用、修改和二次开发。
