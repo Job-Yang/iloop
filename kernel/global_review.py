@@ -17,6 +17,34 @@ from pathlib import Path
 from typing import List
 
 
+# 评审三裁决协议：对一片改动只给三种结论之一，对照计划期冻结的设计契约（不改边界），
+# 而不是对照"最新一句话"。忠实对齐内部 VDD 设计基线层。
+THREE_VERDICT_PROTOCOL = (
+    "评审三裁决（对照设计契约逐条判，禁开放式找茬）："
+    "①符合基线→明说\"符合，不改\"（合法交付，别硬挤问题）"
+    "②偏离基线→列偏离点+文件行号+改回（唯一动代码情形）"
+    "③改动合理但基线没覆盖/基线该改→停手，显式确认后先改基线再改代码，"
+    "禁止代码先跑偏事后追认。映射不到任何基线条款的\"问题\"记为基线缺口另议，不当 bug 顺手扩改。"
+)
+
+# 设计契约的字段（计划期冻结、可留空的软基线；不是不可绕过的硬 Gate）。
+DESIGN_CONTRACT_FIELDS = ("objectives", "design_decisions", "non_goals")
+
+
+def design_contract_filled(contract: dict | None) -> bool:
+    """契约是否被真正填写：任一实质字段有非空内容才算，纯空壳视为留空。"""
+    if not isinstance(contract, dict):
+        return False
+    for key in DESIGN_CONTRACT_FIELDS:
+        value = contract.get(key)
+        if isinstance(value, (list, tuple)):
+            if any(str(item).strip() for item in value):
+                return True
+        elif str(value or "").strip():
+            return True
+    return False
+
+
 SHARED_PATH_MARKERS = (
     "kernel/", "core/", "shared/", "common/", "base/", "public/",
     "api/", "protocol", "interface", "router", "service",

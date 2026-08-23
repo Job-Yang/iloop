@@ -45,7 +45,10 @@ from .redline import (
 from .dashboard import Dashboard
 from .task import TaskRecord, TaskStatus, TaskStep, StepStatus, TaskStore
 from .runtime import Runtime
-from .global_review import GlobalReview, ImpactItem, analyze_global_impact
+from .global_review import (
+    GlobalReview, ImpactItem, analyze_global_impact,
+    THREE_VERDICT_PROTOCOL, DESIGN_CONTRACT_FIELDS, design_contract_filled,
+)
 from .project import ProjectMemory
 from .ui_flow import UIFlow, UINode, UIFlowStore, ACTION_CAPABILITY
 from .host import HostTrustStore
@@ -88,9 +91,10 @@ __all__ = [
     "Dashboard",
     "TaskRecord", "TaskStatus", "TaskStep", "StepStatus", "TaskStore", "Runtime",
     "GlobalReview", "ImpactItem", "analyze_global_impact",
+    "THREE_VERDICT_PROTOCOL", "DESIGN_CONTRACT_FIELDS", "design_contract_filled",
     "ProjectMemory",
     "UIFlow", "UINode", "UIFlowStore", "ACTION_CAPABILITY",
     "HostTrustStore",
 ]
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"

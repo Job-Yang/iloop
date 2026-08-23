@@ -233,13 +233,14 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.2.2`，当前范围是**平台无关内核 + 本地完整性宿主入口 + iOS 官方插件**。
+版本 `0.2.3`，当前范围是**平台无关内核 + 本地完整性宿主入口 + iOS 官方插件**。
 
-- selftest 258 条断言全绿：内核 183 + iOS 插件 75。
+- selftest 262 条断言全绿：内核 187 + iOS 插件 75。
 - 公开 CI 额外运行 fresh-clone managed-host 旅程，覆盖低风险 Task 的四关与最终 `wrapup`，并验证高风险任务在缺外部 reviewer 时 fail closed。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
 - 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
+- 设计契约（`design_contract`：核心目标/核心设计决策/不改边界）在计划期冻结进 host-attested policy，随任务恢复；`plan` 命中大任务/重构时外显评审三裁决协议（符合→不改、偏离→改回、基线缺口→先改基线），让多轮评审对照固定尺子而非最新一句话，治过度改与硬挤问题。这是软基线，可留空、不阻断收口。
 - 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 传入的 `subjects` 不会进入证据，覆盖范围只能由插件实际产出或进程外宿主证明。
 - inputs manifest、Constitution、结构化 blocker、records 和 UI Flow 已进入工程数据层。
 - 模拟器 build/run/install/launch/UI tree/tap/swipe/type/screenshot/probe 统一走 XcodeBuildMCP CLI。

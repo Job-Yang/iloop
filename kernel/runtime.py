@@ -153,6 +153,7 @@ class Runtime:
               capabilities: Optional[Iterable[str]] = None,
               executor_id: str = "",
               steps: Optional[list[TaskStep]] = None,
+              design_contract: Optional[dict] = None,
               execution_context: Optional[dict[str, str]] = None) -> TaskRecord:
         decision = self.registry.plan_details(title)
         flow = decision["flow"]
@@ -187,6 +188,7 @@ class Runtime:
             autonomy=flow.autonomy.value,
             constraints=constraints,
             acceptance=acceptance,
+            design_contract=design_contract,
             steps=task_steps,
         )
         task.project_root = self.project_root
@@ -229,6 +231,7 @@ class Runtime:
                 "autonomy": task.autonomy,
                 "constraints": list(task.constraints),
                 "acceptance": list(task.acceptance),
+                "design_contract": dict(task.design_contract),
                 "steps": [
                     {
                         "id": step.id,
@@ -313,6 +316,7 @@ class Runtime:
                     "autonomy": task.autonomy,
                     "constraints": list(task.constraints),
                     "acceptance": list(task.acceptance),
+                    "design_contract": dict(task.design_contract),
                     "steps": [
                         {
                             "id": step.id,
@@ -359,6 +363,12 @@ class Runtime:
         }
         if task.execution_context != expected_context:
             task.execution_context = expected_context
+            changed = True
+        # Design contract is the review baseline frozen at planning time; restore
+        # it from policy so multi-round review compares against a fixed ruler.
+        expected_contract = dict(policy.get("design_contract", {}))
+        if task.design_contract != expected_contract:
+            task.design_contract = expected_contract
             changed = True
         contracts = list(policy.get("steps", []))
         if contracts:

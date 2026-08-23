@@ -49,6 +49,7 @@ from kernel import (  # noqa: E402
     Runtime, TaskStore, TaskStatus, TaskStep, StepStatus, Lesson, LessonBook, Ledger, RoundStatus,
     AcceptancePackage, AcceptanceStore, Verdict, EvidenceKind, CapabilityGate,
     GlobalReview, ProjectMemory, UIFlowStore, ACTION_CAPABILITY,
+    THREE_VERDICT_PROTOCOL, design_contract_filled,
     load_installed_plugins, HostTrustStore,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
@@ -143,12 +144,20 @@ def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
     executor_id = kwargs.pop("executor_id", "")
     if _host_trust() is not None and not executor_id:
         executor_id = os.environ.get("ILOOP_EXECUTOR_ID", "iloop-managed-host")
+    # 计划期冻结的设计基线（可留空的软基线）：objectives / design_decisions / non_goals。
+    design_contract = {}
+    for field in ("objectives", "design_decisions", "non_goals"):
+        raw = kwargs.pop(field, "")
+        values = _split(raw)
+        if values:
+            design_contract[field] = values
     task = runtime.start(
         task_text,
         constraints=_split(kwargs.pop("constraints", "")),
         acceptance=_split(kwargs.pop("acceptance", "")),
         capabilities=capabilities,
         executor_id=executor_id,
+        design_contract=design_contract or None,
     )
     if capabilities:
         task = runtime.execute_capabilities(task, capabilities, **kwargs)
@@ -733,6 +742,13 @@ def cmd_wrapup(task_id: str) -> int:
         "dashboard": dashboard,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(render("wrapup", f"task={task.id} 已收口", result=f"看板={dashboard}"))
+    # 设计契约已填的任务：收口前提醒对照基线做三裁决（不阻断，留空则静默）。
+    if design_contract_filled(runtime.load(task.id).design_contract):
+        print(render(
+            "wrapup",
+            "🧭 设计基线自检：本任务已冻结 design_contract",
+            result=THREE_VERDICT_PROTOCOL,
+        ))
     return 0
 
 
@@ -930,6 +946,15 @@ def cmd_plan(task: str) -> int:
         if decision[name]
     ]
     print(f"  active_gates={active_gates}")
+    # 大任务/多轮/重构：外显设计基线 + 三裁决协议，让每轮 review 对照固定尺子，
+    # 而不是对照"最新一句话"（防目标漂移，治过度改/硬编问题）。
+    if decision["global_review_gate"] or decision["complexity_gate"]:
+        print(render(
+            "plan",
+            "🧭 设计基线（大任务/多轮/重构必读，防目标漂移）",
+            result="计划阶段用 design_contract 钉死核心目标/核心设计决策/不改边界，作为评审的尺子",
+        ))
+        print(render("plan", f"🧭 {THREE_VERDICT_PROTOCOL}"))
     if flow.next_suggest:
         print(render("plan", f"🧭 完成后建议：{flow.next_suggest}"))
     return 0

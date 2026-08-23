@@ -56,6 +56,7 @@ class TaskRecord:
     current_stage: str = "investigate"
     constraints: List[str] = field(default_factory=list)
     acceptance: List[str] = field(default_factory=list)
+    design_contract: Dict[str, object] = field(default_factory=dict)
     steps: List[TaskStep] = field(default_factory=list)
     evidence_ids: List[str] = field(default_factory=list)
     required_operation_ids: List[str] = field(default_factory=list)
@@ -108,6 +109,7 @@ class TaskStore:
     def create(self, title: str, *, goal: str, flow_id: str, autonomy: str,
                constraints: Optional[List[str]] = None,
                acceptance: Optional[List[str]] = None,
+               design_contract: Optional[Dict[str, object]] = None,
                steps: Optional[List[TaskStep]] = None) -> TaskRecord:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         task_id = f"task-{stamp}-{self._slug(title)}-{uuid.uuid4().hex[:10]}"
@@ -119,6 +121,7 @@ class TaskStore:
             autonomy=autonomy,
             constraints=constraints or [],
             acceptance=acceptance or [],
+            design_contract=design_contract or {},
             steps=steps or [],
         )
         self.save(record)

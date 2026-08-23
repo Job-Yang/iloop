@@ -968,6 +968,28 @@ def test_policy_and_constitution_cannot_be_forged_by_cli_state() -> None:
         check("关键词接线: 核心关键词验收要求在恢复后仍然成立",
               risky_restored.independent_acceptance_required)
 
+        # v0.2.3 设计契约层：计划期冻结的软基线随 policy 冻结与恢复，纯空壳视为留空
+        from kernel import design_contract_filled
+        contracted = runtime.start(
+            "重构公共调度模块",
+            executor_id="main-agent",
+            design_contract={
+                "objectives": ["调度不改变对外行为"],
+                "non_goals": ["不引入新持久化存储"],
+            },
+        )
+        check("设计契约: 创建时随任务落盘",
+              design_contract_filled(contracted.design_contract))
+        contracted_restored = runtime.load(contracted.id)
+        check("设计契约: 恢复后契约内容一致（作为多轮评审的固定尺子）",
+              contracted_restored.design_contract.get("objectives") == ["调度不改变对外行为"]
+              and contracted_restored.design_contract.get("non_goals") == ["不引入新持久化存储"])
+        blank = runtime.start("修复局部文案", executor_id="main-agent")
+        check("设计契约: 未填写时视为留空（软基线，不强制）",
+              not design_contract_filled(blank.design_contract))
+        check("设计契约: 纯空壳字段也算留空",
+              not design_contract_filled({"objectives": ["", "  "], "non_goals": []}))
+
         memory = ProjectMemory(d, project_root=d)
         attestation = Path(d) / "constitution.json"
         attestation.write_text(
