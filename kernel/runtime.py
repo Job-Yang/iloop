@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .capability import Capability, Plugin
-from .acceptance import AcceptanceStore, Verdict
+from .acceptance import AcceptanceStore, RiskLevel, Verdict, assess_risk
 from .case import Case
 from .dashboard import Dashboard
 from .evidence import EvidenceArtifact, EvidenceKind
@@ -163,7 +163,10 @@ class Runtime:
                 "L2/L3 tasks require project_root (set ILOOP_PROJECT_ROOT or "
                 "pass project_root=...) before task creation"
             )
-        if decision["acceptance_gate"] and not executor_id.strip():
+        if (
+            decision["acceptance_gate"]
+            or assess_risk(title) == RiskLevel.HIGH
+        ) and not executor_id.strip():
             raise ValueError(
                 "high-risk tasks require executor_id before task creation"
             )
@@ -203,7 +206,12 @@ class Runtime:
             task.base_commit = result.stdout.strip()
         task.global_review_required = decision["global_review_gate"]
         task.global_review_status = "pending" if task.global_review_required else "not_required"
-        task.independent_acceptance_required = decision["acceptance_gate"]
+        # A change touching a core-risk keyword forces independent review even
+        # when its size score is low; keep this consistent with _enforce_policy.
+        task.independent_acceptance_required = (
+            decision["acceptance_gate"]
+            or assess_risk(title) == RiskLevel.HIGH
+        )
         task.acceptance_status = "pending" if task.independent_acceptance_required else "not_required"
         case = Case(task.id, title)
         case.add_hypothesis("当前实现满足任务目标")
@@ -372,14 +380,15 @@ class Runtime:
                 task.steps = restored
                 changed = True
         decision = self.registry.plan_details(str(policy.get("title", "")))
+        # Restore the gate decision frozen at creation time; never re-derive it
+        # from project_root + autonomy, which would silently escalate every
+        # L2/L3 task with a worktree into full global review (review overreach).
+        # The flow-level safety net only prevents a tampered policy from
+        # downgrading a review that plan() had required.
         flow_requires_review = (
-            policy.get("flow_id") == "core.refactor"
+            bool(policy.get("global_review_required"))
+            or policy.get("flow_id") == "core.refactor"
             or bool(decision.get("global_review_gate"))
-            or bool(policy.get("global_review_required"))
-            or (
-                bool(policy.get("project_root"))
-                and policy.get("autonomy") in {"L2", "L3"}
-            )
         )
         if task.global_review_required != flow_requires_review:
             task.global_review_required = flow_requires_review
@@ -389,6 +398,10 @@ class Runtime:
             policy.get("flow_id") == "core.refactor"
             or bool(decision.get("acceptance_gate"))
             or bool(policy.get("independent_acceptance_required"))
+            # Small change that touches a core-risk keyword (payment, auth,
+            # signing, crash, data write...) must still force independent
+            # review even when its size score stays low (review underreach).
+            or assess_risk(str(policy.get("title", ""))) == RiskLevel.HIGH
         )
         if task.global_review_path and Path(task.global_review_path).is_file():
             review = GlobalReview.load(task.global_review_path)

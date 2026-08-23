@@ -233,9 +233,9 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.2.1`，当前范围是**平台无关内核 + 本地完整性宿主入口 + iOS 官方插件**。
+版本 `0.2.2`，当前范围是**平台无关内核 + 本地完整性宿主入口 + iOS 官方插件**。
 
-- selftest 250 条断言全绿：内核 175 + iOS 插件 75。
+- selftest 258 条断言全绿：内核 183 + iOS 插件 75。
 - 公开 CI 额外运行 fresh-clone managed-host 旅程，覆盖低风险 Task 的四关与最终 `wrapup`，并验证高风险任务在缺外部 reviewer 时 fail closed。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。

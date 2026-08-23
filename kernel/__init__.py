@@ -27,7 +27,7 @@ from .ledger import Ledger, Round, RoundStatus, render, BRAND, PHASES
 from .acceptance import (
     RiskLevel, assess_risk, needs_independent_review,
     AcceptancePackage, AcceptanceResult, Verdict, IndependentReviewer,
-    ChangeScore, score_change, AcceptanceStore,
+    ChangeScore, score_change, AcceptanceStore, aggregate_criteria_verdicts,
 )
 from .channel import (
     Event, EventSource, Notifier, StdoutNotifier, WebhookNotifier, StaticEventSource,
@@ -77,7 +77,7 @@ __all__ = [
     "Ledger", "Round", "RoundStatus", "render", "BRAND", "PHASES",
     "RiskLevel", "assess_risk", "needs_independent_review",
     "AcceptancePackage", "AcceptanceResult", "Verdict", "IndependentReviewer",
-    "ChangeScore", "score_change", "AcceptanceStore",
+    "ChangeScore", "score_change", "AcceptanceStore", "aggregate_criteria_verdicts",
     "Event", "EventSource", "Notifier", "StdoutNotifier", "WebhookNotifier", "StaticEventSource",
     "CapabilityGate", "RequiredOperation", "OpStatus",
     "CommandRunner", "CommandOutput", "discover_developer_dir",
@@ -93,4 +93,4 @@ __all__ = [
     "HostTrustStore",
 ]
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"

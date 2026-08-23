@@ -89,6 +89,35 @@ def needs_independent_review(risk: RiskLevel) -> bool:
     return risk == RiskLevel.HIGH
 
 
+def _normalize_verdict(value: str) -> str:
+    text = str(value or "pending").strip().lower()
+    if text in ("needs_more", "needs_more_context", "uncertain"):
+        return "needs_more_context"
+    if text in ("pass", "fail"):
+        return text
+    return "pending"
+
+
+def aggregate_criteria_verdicts(criteria_count: int, per_criterion: list[str]) -> str:
+    """Roll up per-criterion verdicts. Any missing criterion stays pending so an
+    overall pass can never be minted without judging every criterion.
+
+    Priority: fail > needs_more_context > pending > pass.
+    """
+    if criteria_count <= 0:
+        return "pending"
+    verdicts = [_normalize_verdict(item) for item in per_criterion]
+    if len(verdicts) < criteria_count:
+        verdicts += ["pending"] * (criteria_count - len(verdicts))
+    if any(v == "fail" for v in verdicts):
+        return "fail"
+    if any(v == "needs_more_context" for v in verdicts):
+        return "needs_more_context"
+    if any(v == "pending" for v in verdicts):
+        return "pending"
+    return "pass"
+
+
 class Verdict(str, Enum):
     PASS = "pass"
     FAIL = "fail"
@@ -264,6 +293,20 @@ class AcceptanceStore:
         reasons = list(row["reasons"])
         if not reasons:
             raise ValueError("review result requires reasons")
+        # Per-criterion verdicts are mandatory: an overall pass must never be
+        # accepted without judging every criterion in the package.
+        criteria = list(package.get("criteria", []))
+        per_criterion = row.get("criteria_verdicts")
+        if not isinstance(per_criterion, list) or len(per_criterion) != len(criteria):
+            raise ValueError(
+                "review result must include one criteria_verdicts entry per criterion"
+            )
+        normalized = [_normalize_verdict(item) for item in per_criterion]
+        aggregate = aggregate_criteria_verdicts(len(criteria), normalized)
+        if _normalize_verdict(row["verdict"]) != aggregate:
+            raise ValueError(
+                "overall verdict does not match the per-criterion roll-up"
+            )
         result = AcceptanceResult(
             Verdict(row["verdict"]),
             reasons,
@@ -327,6 +370,16 @@ class AcceptanceStore:
             or artifact_row.get("reviewer") == package.get("executor_id")
             or artifact_row.get("verdict") != result.verdict.value
             or float(artifact_row.get("expires_at", 0)) <= time.time()
+        ):
+            return None
+        # Re-check per-criterion coverage so a hand-written result blob cannot
+        # bypass record_file() and claim an unjudged overall pass.
+        criteria = list(package.get("criteria", []))
+        per_criterion = artifact_row.get("criteria_verdicts")
+        if not isinstance(per_criterion, list) or len(per_criterion) != len(criteria):
+            return None
+        if _normalize_verdict(artifact_row.get("verdict")) != aggregate_criteria_verdicts(
+            len(criteria), [_normalize_verdict(item) for item in per_criterion]
         ):
             return None
         return result

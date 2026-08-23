@@ -2,6 +2,23 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与语义化版本。
 
+## [0.2.2] - 2026-08-24
+
+### 修复
+- 普通 L2 任务不再因为带工程根就在 `load`/`resume` 后被静默升级为全局复核；
+  `_enforce_policy` 只恢复创建时冻结的 gate 决策，不再用 `project_root + autonomy`
+  重新推导（消除 review 过度）。
+- 命中核心风险关键词（支付/鉴权/签名/崩溃/数据写入等）的小改动强制独立验收，
+  创建与恢复口径一致，不再因规模分低而漏掉（消除 review 不足）。
+- 独立验收要求逐条判定：结果必须为每条 criterion 提供 `criteria_verdicts`，
+  按 fail>needs_more>pending>pass 归总，且顶层 `verdict` 必须与归总一致；
+  `record_file` 与 `result` 双重校验，缺项或只给总体 pass 一律拒绝。
+
+### 验证
+- selftest 258 条断言：内核 183 + iOS 插件 75，新增过度复核、关键词接线、
+  逐条验收的正负向断言。
+- fresh-clone managed-host smoke 通过。
+
 ## [0.2.1] - 2026-08-21
 
 ### [breaking-entry] 宿主证明分权

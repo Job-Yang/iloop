@@ -951,6 +951,23 @@ def test_policy_and_constitution_cannot_be_forged_by_cli_state() -> None:
               any("requirements are not host attested" in item
                   for item in fully_tampered))
 
+        # v0.2.2 #1: 普通 L2（局部 bug）不因带工程根就在恢复后被升级为全局复核
+        local = runtime.start("修复局部 UI 显示 bug", executor_id="main-agent")
+        check("过度复核: 普通 L2 局部修复创建时不要求全局复核",
+              not local.global_review_required)
+        local_restored = runtime.load(local.id)
+        check("过度复核: 普通 L2 恢复后仍不被静默升级为全局复核",
+              not local_restored.global_review_required
+              and local_restored.global_review_status == "not_required")
+
+        # v0.2.2 #3: 命中核心风险关键词的小改动强制独立验收（规模再小也要）
+        risky = runtime.start("修复登录鉴权判断", executor_id="main-agent")
+        check("关键词接线: 命中鉴权关键词的小改动强制独立验收",
+              risky.independent_acceptance_required)
+        risky_restored = runtime.load(risky.id)
+        check("关键词接线: 核心关键词验收要求在恢复后仍然成立",
+              risky_restored.independent_acceptance_required)
+
         memory = ProjectMemory(d, project_root=d)
         attestation = Path(d) / "constitution.json"
         attestation.write_text(
@@ -1103,6 +1120,7 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
             "subject_fingerprint": package.subject_fingerprint,
             "reviewer": "external-agent",
             "verdict": "pass",
+            "criteria_verdicts": ["pass"],
             "reasons": ["observed evidence"],
             "expires_at": time.time() + 3600,
         }
@@ -1179,6 +1197,43 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
         except ValueError:
             expired_rejected = True
         check("独立验收: 过期验收包不能凭旧 challenge 生成新结论", expired_rejected)
+
+        # v0.2.2 #2: 逐条验收 —— 总体 pass 必须覆盖每条 criterion
+        per_store = AcceptanceStore(Path(d) / "per-criterion.json")
+        per_pkg = per_store.prepare(AcceptancePackage(
+            "case-per", "目标", ["标准A", "标准B"],
+            [observed("标准通过", capability="build")],
+            executor_id="main-agent",
+        ))
+        base_row = {
+            "package_id": per_pkg.package_id,
+            "case_id": per_pkg.case_id,
+            "review_token": per_pkg.review_token,
+            "subject_fingerprint": per_pkg.subject_fingerprint,
+            "reviewer": "external-agent",
+            "expires_at": time.time() + 3600,
+            "reasons": ["ok"],
+        }
+        per_path = Path(d) / "per-review.json"
+
+        def _try_record(extra: dict) -> bool:
+            per_path.write_text(
+                __import__("json").dumps({**base_row, **extra}), encoding="utf-8"
+            )
+            try:
+                per_store.record_file(per_path, verify_attestation=lambda p, r: True)
+                return True
+            except ValueError:
+                return False
+
+        check("逐条验收: 缺 criteria_verdicts 的总体 pass 被拒",
+              not _try_record({"verdict": "pass"}))
+        check("逐条验收: criteria_verdicts 数量与标准不符被拒",
+              not _try_record({"verdict": "pass", "criteria_verdicts": ["pass"]}))
+        check("逐条验收: 有一条 fail 却报总体 pass 被拒",
+              not _try_record({"verdict": "pass", "criteria_verdicts": ["pass", "fail"]}))
+        check("逐条验收: 逐条全 pass 且顶层一致才通过",
+              _try_record({"verdict": "pass", "criteria_verdicts": ["pass", "pass"]}))
 
 
 def test_global_review_finds_shared_consumers_and_requires_record() -> None:
