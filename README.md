@@ -88,11 +88,11 @@ Agent 的结论必须落到证据。收敛时检查四件事：
 3. **机制说得通**：能解释为什么会发生。
 4. **有反证**：换一个关键条件，现象应该消失或发生变化。
 
-`wrapup` 是收口门禁，不是总结命令。任务步骤、运行证据、Case、四关、全局复核和必要的独立验收没有全部通过时，任务不能标记完成。
+最终收口是一道硬门禁。任务步骤、运行证据、Case、四关、全局复核和必要的独立验收没有全部通过时，任务不能标记完成。
 
 ### 2. 工作流与放权等级
 
-`plan` 根据任务选择 flow，并给出所需文档、取证方向、升级条件和下一步建议。flow 不是教条清单，而是让 Agent 在开工前先确定“这类问题应该怎么想”。
+iLoop 会根据任务选择 flow，并给出所需文档、取证方向、升级条件和下一步建议。flow 不是教条清单，而是让 Agent 在开工前先确定“这类问题应该怎么想”。
 
 - **L1 只看不改**：调查、取证、分析。
 - **L2 动手改**：最小改动、可回滚、改后验证。
@@ -147,105 +147,23 @@ DeploymentProfile
 
 ---
 
-## 快速开始
+## 安装和使用
 
-前置条件：
+准备好 Python 3.9+ 和一个能读取文件、执行本地命令的 Coding Agent。iOS 开发还需要 macOS 与 Xcode；模拟器和真机能力所需的公开工具，由 Agent 在实际用到时检查和安装。
 
-- Python 3.9+。内核只用标准库，不需要 `pip install`。
-- 使用 iOS 插件需要 macOS + Xcode。
-- iOS 编译、运行和模拟器 UI 自动化使用公开的 [XcodeBuildMCP](https://github.com/getsentry/XcodeBuildMCP) CLI。
-- 真机 WDA UI 自动化额外需要 `iproxy`。
+把下面这句话发给你的 Agent：
 
-```bash
-git clone https://github.com/Job-Yang/iloop.git
-cd iloop
+> 请从 https://github.com/Job-Yang/iloop 安装 iLoop，读取仓库里的 AGENT_PROMPT.md，并接入我当前的工程。安装和环境检查由你完成，完成后告诉我可以直接交给你哪些任务。
 
-# 平台无关的内核自测（Linux/macOS 均可）
-python3 -m host_cli selftest
+安装完成后，直接用平时和同事沟通的方式描述任务：
 
-# 看 iLoop 会怎么处理一个任务
-python3 -m host_cli plan "帮我修复下单页崩溃"
-```
+> 帮我修复下单页崩溃，不能改公共 API。完成标准是编译通过，应用拉起后不再崩溃。
+>
+> 这个按钮偶尔不显示，帮我查清原因并修好。UI 改动要给我看最终截图。
+>
+> 基于 iLoop 做一个适合我们团队的代码排查助手。
 
-需要执行 iOS build/run/UI 时，再在 macOS 安装公开执行底座：
-
-```bash
-brew tap getsentry/xcodebuildmcp
-brew install xcodebuildmcp
-
-# iOS 环境体检
-python3 -m host_cli doctor
-
-# 创建可恢复任务；能力结果、轮次和看板写入 ~/.iloop/data/
-export ILOOP_PROJECT_ROOT=/path/to/your/app
-python3 -m host_cli run "帮我修复下单页崩溃" \
-  constraints="不改公共 API" \
-  acceptance="编译通过;拉起无 crash"
-
-# 中断或换会话后恢复
-python3 -m host_cli tasks
-python3 -m host_cli resume <task_id> caps=build,run,logs \
-  workspace=App.xcworkspace scheme=App sim_udid=<simulator-id> \
-  subjects=Sources/Feature.swift,Tests/FeatureTests.swift
-
-# 查看证据缺口给出的下一动作；重构收口前逐项复核完整 diff
-python3 -m host_cli next <task_id>
-python3 -m host_cli global-review prepare <task_id> project_root=$ILOOP_PROJECT_ROOT
-
-# 高影响改动：生成验收包；本地 review 只做 preflight
-python3 -m host_cli accept prepare <task_id>
-python3 -m host_cli accept review <task_id>
-```
-
-扩展助手可直接由 Recipe 驱动：
-
-```bash
-python3 -m host_cli run "处理这次故障" \
-  assistant_id=team.oncall.agent event_id=evt-123
-
-# 中断后继续剩余 Action
-python3 -m host_cli resume <task_id> recipe=true
-
-# 根因冻结后推进处置、验证与观察
-python3 -m host_cli case disposition <task_id> reason="选择最安全可用动作"
-python3 -m host_cli case advance <task_id> plan=plan-r1 status=executing
-python3 -m host_cli case advance <task_id> plan=plan-r1 status=completed
-python3 -m host_cli case verify <task_id> evidence=<evidence-id> passed=true
-```
-
-`host_cli` 是开源版默认入口。它把本地执行事实的完整性记录放在任务目录之外的
-`~/.iloop/host-trust/`，防止仅编辑任务状态文件改变结论；它不是同一 OS 用户下的
-独立身份边界。`independent_review`、`user_confirmation` 和
-`evidence_subjects` 必须来自外部 Agent 宿主，默认本地账本拒绝签发和验证。
-内置 `accept review` 只启动只读 preflight，永远不签发最终 `pass`。
-
-`python3 -m cli` 保留为低层 fail-closed 调试入口：它可以规划和取证，但不能
-自行给 Task policy、平台完成或独立验收签字，因此不能完成 `wrapup`。
-
-宿主集成入口只有一个：
-
-```python
-runtime = Runtime(
-    data_dir,
-    registry,
-    plugin,
-    project_root=project_root,
-    attestation_recorder=host.record,  # 只记录宿主实际观察到的事实
-    attestation_verifier=host.verify,  # 受信状态必须保存在任务进程外
-)
-```
-
-`host.record(kind, path, payload)` 与 `host.verify(kind, path, payload)` 必须按
-事实类型分权；尤其不能向执行任务的 Agent 暴露 `independent_review`、
-`user_confirmation` 或任意 `evidence_subjects` 的签发入口。外部验收结果通过
-`runtime.record_external_acceptance(task, result_path)` 回写。把本地文件哈希
-原样写回同一目录不构成宿主证明。
-
-`project_root` 用于隔离不同工程的数据；也可固定设置 `ILOOP_PROJECT_ROOT`。任务、证据和看板默认写入 `~/.iloop/data/<project-id>/`，不污染业务仓。
-
-然后把仓根的 [AGENT_PROMPT.md](AGENT_PROMPT.md) 作为项目规则或 Agent
-入口加载到 Claude Code、Codex、Cursor 或自建宿主。默认调用
-`python3 -m host_cli`；提示词、内核、宿主适配和插件一起随仓库分发。
+任务怎么规划、调用哪些工具、如何保存进度、什么时候需要独立验收，都由 Agent 按 [AGENT_PROMPT.md](AGENT_PROMPT.md) 执行。普通用户不需要学习 iLoop 的 CLI；宿主接入、信任边界和底层协议分别见 [DESIGN.md](DESIGN.md) 与 [SPEC.md](SPEC.md)。
 
 ---
 
@@ -263,10 +181,10 @@ Agent 会按入口协议自动完成：
 
 1. 判断这是公共核心能力还是业务扩展；归属不清先让用户选择。
 2. 读取 [EXTENDING.md](EXTENDING.md)。
-3. 执行 `extension-init` 创建隔离扩展。
+3. 创建隔离扩展。
 4. 只修改扩展目录，不改 iLoop 核心。
-5. 执行 `extension-validate` 检查命名空间和越界。
-6. 用一个真实任务再次运行 `plan`，确认新 flow 能被命中。
+5. 检查命名空间、依赖和越界修改。
+6. 用一个真实任务确认新 flow 能被命中并跑通。
 
 扩展作者真正需要关心的只有业务目标、输入、输出和验收口径。内核里的接口规范是 Agent 和插件之间的“插座标准”，不是普通用户的必修课。
 
