@@ -30,13 +30,13 @@ iLoop 把这些缺失的部分接起来：
 
 这套做法叫 **VDD（Verification-Driven Development，面向验证的开发）**：完成的定义不是“代码写完了”，而是“结果被验过了”。
 
-[完整设计思路](DESIGN.md) · [VDD 方法论](docs/VDD.md) · [二次开发](EXTENDING.md)
+[完整设计思路](DESIGN.md) · [VDD 方法论](docs/VDD.md) · [二次开发](EXTENDING.md) · [版本变化](CHANGELOG.md)
 
 ---
 
 ## 它能干什么
 
-iLoop 不是另一个更会生成代码的模型。它给现有 Agent 补上研发交付所需的工作循环：
+iLoop 给现有 Agent 补上研发交付所需的工作循环：
 
 - **按任务选工作流**：排查、修复、需求、重构、验收、环境问题走不同的路径，不让 Agent 一上来凭感觉乱做。
 - **按风险决定放权**：L1 只看不改、L2 小步修改、L3 授权后连续执行。
@@ -49,7 +49,7 @@ iLoop 不是另一个更会生成代码的模型。它给现有 Agent 补上研�
 - **从整体复核改动**：收口读取完整 diff，检查公共定义、调用方、共享边界和删除逻辑，防止局部补丁都对、整体架构却持续变坏。
 - **用原子动作装配助手**：把应用动作、平台能力和部署位置拆开，同一组动作可以组成不同助手，同一助手也可以部署到不同节点。
 
-开源版当前提供平台无关内核和一个 iOS 官方插件，支持：
+开源版包含平台无关内核和一个 iOS 官方插件，支持：
 
 - 模拟器与真机的 build / install / launch
 - 截图、UI 层级树、日志和 crash report
@@ -88,6 +88,8 @@ Agent 的结论必须落到证据。收敛时检查四件事：
 3. **机制说得通**：能解释为什么会发生。
 4. **有反证**：换一个关键条件，现象应该消失或发生变化。
 
+`wrapup` 是收口门禁，不是总结命令。任务步骤、运行证据、Case、四关、全局复核和必要的独立验收没有全部通过时，任务不能标记完成。
+
 ### 2. 工作流与放权等级
 
 `plan` 根据任务选择 flow，并给出所需文档、取证方向、升级条件和下一步建议。flow 不是教条清单，而是让 Agent 在开工前先确定“这类问题应该怎么想”。
@@ -111,7 +113,11 @@ iLoop 把记忆拆成不同用途：
 
 低风险改动由主 Agent 自核；公共逻辑或高风险链路触发独立验收。验收 Agent 只拿验收标准和证据，不拿执行过程，避免被原来的推理路径带偏。
 
-### 5. 判断力、业务和平台分开
+### 5. 全局复核对照固定目标
+
+重大改动开始前，iLoop 会记录这次任务的核心目标、设计决策和不改边界。后续 Review 只做三种判断：符合目标就不改，偏离目标就改回，原目标没有覆盖就先补齐约定。这样全局复核有一把稳定的尺子，不会因为对话变长而忽松忽紧。
+
+### 6. 判断力、业务和平台分开
 
 ```text
 稳定判断力：VDD / 工作流 / 病例 / 验收 / 错题本
@@ -121,7 +127,7 @@ iLoop 把记忆拆成不同用途：
 
 换业务只替换领域层，换平台只替换执行插件，主循环不用重写。
 
-### 6. 助手、平台和部署正交
+### 7. 助手、平台和部署正交
 
 `ActionSpec` 描述一个应用动作需要什么输入、可能产生什么副作用、风险多高，以及依赖哪些底层 Driver Capability。`AssistantRecipe` 只声明动作组合，不写本地/远端分支；`ProviderRegistry` 再把 build、logs、screenshot 等 Driver Capability 路由到具体 Provider。
 
@@ -243,7 +249,7 @@ runtime = Runtime(
 
 ---
 
-## 二次开发：不是让人手写插件，而是让 Agent 自己接
+## 二次开发交给 Agent
 
 扩展机制首先是**给 Agent 看的开发协议**。
 
@@ -266,29 +272,10 @@ Agent 会按入口协议自动完成：
 
 ---
 
-## 当前状态
+## 能力边界
 
-版本 `0.3.0`，当前范围是**能力装配内核 + 本地完整性宿主入口 + iOS 官方 Provider**。
+iLoop 核心负责反馈闭环、任务恢复、证据与验收、助手装配和本地执行契约。具体的 Oncall、Bugfix、稳定性助手，以及 GitHub、Sentry、Slack、CI 等平台接入，由扩展提供。
 
-- selftest 307 条断言全绿：内核 232 + iOS 插件 75。
-- 公开 CI 额外运行 fresh-clone managed-host 旅程，覆盖低风险 Task 的四关与最终 `wrapup`，并验证高风险任务在缺外部 reviewer 时 fail closed。
-- Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
-- Task 绑定 `assistant_id`；Recipe 引用不存在的 Action、风险冲突、缺 Provider 或 Provider 歧义都会在装配阶段 fail closed。
-- Case 已拆成 diagnosis / disposition / verification / observation 四段状态；根因按 revision 冻结，重开诊断会清空四关并废止旧处置计划。
-- 同一 Recipe 可在不同 `DeploymentProfile` 下选择不同 Provider；本地 worker 已跑通完整多动作链。远端队列和 worker transport 仍明确留在核心之外。
-- `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
-- 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
-- 设计契约（`design_contract`：核心目标/核心设计决策/不改边界）在计划期冻结进 host-attested policy，随任务恢复；`plan` 命中大任务/重构时外显评审三裁决协议（符合→不改、偏离→改回、基线缺口→先改基线），让多轮评审对照固定尺子而非最新一句话，治过度改与硬挤问题。这是软基线，可留空、不阻断收口。
-- 外部 Evidence、平台回读、用户确认和独立验收均绑定 task/run/flow/subject、产物哈希与有效期；CLI 传入的 `subjects` 不会进入证据，覆盖范围只能由插件实际产出或进程外宿主证明。
-- inputs manifest、Constitution、结构化 blocker、records 和 UI Flow 已进入工程数据层。
-- 模拟器 build/run/install/launch/UI tree/tap/swipe/type/screenshot/probe 统一走 XcodeBuildMCP CLI。
-- 已用 XcodeBuildMCP 生成公开结构的 SwiftUI fixture，真实跑通模拟器 build-and-run、UI tree、截图、tap 和本次 run 绑定日志。
-- `logs` 只归档本次 `run` 绑定的动态日志；没有真实日志时明确失败。
-- 真机 build/install/launch 走 XcodeBuildMCP；固定版本、官方 commit 与 origin 的公开 WDA 由 `ui_prepare/ui_status/ui_stop` 管理；crash 走 `devicectl`。
-- 真机已发现并验证到一台已配对的 iPhone；设备构建已进入 provisioning 阶段。完整真机 build/install/launch/WDA E2E 仍等待有效 Apple Developer 登录态创建 `dev.iloop.e2e` 的 development profile；真机动作目前使用 WDA 坐标，不与模拟器的语义 `elementRef` 冒充一致。
-
-## v0.3 边界
-
-`0.3` 已完成四个里程碑：应用动作与 Recipe、Provider 注册表、版本化 Resolve Case、Deployment 与本地签名执行契约。远端 transport、具体 Oncall/Bugfix/Stability 配方，以及 GitHub/Sentry/Slack/CI 等平台接入继续通过公开扩展提供，不进入核心。完整范围和验收记录见 [docs/ROADMAP-v0.3.md](docs/ROADMAP-v0.3.md)。
+跨节点任务可以使用签名信封和回执约束输入与结果，但远端队列、Worker 拉取、节点身份和密钥分发不在核心内。iOS 真机执行还需要可用的 Apple Developer 签名、已配对设备和 `iproxy`；模拟器与真机使用不同的 UI 自动化路径，不能把一边的控件引用直接复用到另一边。
 
 MIT License。欢迎使用、修改和二次开发。
