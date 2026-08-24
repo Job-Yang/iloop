@@ -93,7 +93,7 @@
     "name": "事件驱动诊断",
     "autonomy": "L1",
     "when_keywords": ["oncall", "告警", "值班", "工单", "线上问题", "alert"],
-    "guidance": "事件源→病例建档→证据驱动诊断→按代价处置→通知渠道。飞书/告警平台是插件实现。",
+    "guidance": "事件源→病例建档→证据驱动诊断→按代价处置→通知渠道。企业 IM/告警平台是插件实现。",
     "required_docs": ["SPEC.md", "prompts/capability-gate.md", "prompts/triage-impact.md"],
     "evidence_strategy": "拉事件→建档→证据排除→四关收敛→结论通知",
     "escalate_when": "缺平台授权时走能力 Gate 升级，不用低可信数据伪装收口",

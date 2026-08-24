@@ -47,6 +47,7 @@ iLoop 不是另一个更会生成代码的模型。它给现有 Agent 补上研�
 - **沉淀长期经验**：工程坑进入错题本，下次先召回，不从零再踩一次。
 - **展示交付过程**：轮次、证据、止损和验收进入提效看板，而不是只留下聊天记录。
 - **从整体复核改动**：收口读取完整 diff，检查公共定义、调用方、共享边界和删除逻辑，防止局部补丁都对、整体架构却持续变坏。
+- **用原子动作装配助手**：把应用动作、平台能力和部署位置拆开，同一组动作可以组成不同助手，同一助手也可以部署到不同节点。
 
 开源版当前提供平台无关内核和一个 iOS 官方插件，支持：
 
@@ -54,6 +55,8 @@ iLoop 不是另一个更会生成代码的模型。它给现有 Agent 补上研�
 - 截图、UI 层级树、日志和 crash report
 - 基于 Appium WebDriverAgent 的真机 UI 自动化
 - 可复用 UI Flow（`verified` 由宿主证明的运行态证据写入），以及 Task/Case/Capability Gate/独立验收/全局复核的硬收口
+- `ActionSpec` / `AssistantRecipe` / Provider Registry，以及版本化 Resolve Case
+- 签名 `TaskEnvelope`、防重放账本和绑定完整任务指纹的 `WorkerReceipt`
 - 本机 Xcode 自动发现，不依赖全局 `xcode-select`
 
 ---
@@ -118,6 +121,22 @@ iLoop 把记忆拆成不同用途：
 
 换业务只替换领域层，换平台只替换执行插件，主循环不用重写。
 
+### 6. 助手、平台和部署正交
+
+`ActionSpec` 描述一个应用动作需要什么输入、可能产生什么副作用、风险多高，以及依赖哪些底层 Driver Capability。`AssistantRecipe` 只声明动作组合，不写本地/远端分支；`ProviderRegistry` 再把 build、logs、screenshot 等 Driver Capability 路由到具体 Provider。
+
+```text
+AssistantRecipe
+  -> ActionSpec
+      -> Driver Capability
+          -> Provider
+
+DeploymentProfile
+  -> target node + available providers
+```
+
+任务信封会签入 assistant、Recipe 指纹、有序动作清单、输入、部署、节点、诊断 revision、Git 基线、policy 和有效期。Worker 回执绑定完整任务摘要；成功回执必须逐项覆盖签名动作清单，Provider 没有真实产物时只能记为执行记录，不能冒充 observed evidence。
+
 更完整的推导见 [DESIGN.md](DESIGN.md)。
 
 ---
@@ -170,6 +189,22 @@ python3 -m host_cli global-review prepare <task_id> project_root=$ILOOP_PROJECT_
 # 高影响改动：生成验收包；本地 review 只做 preflight
 python3 -m host_cli accept prepare <task_id>
 python3 -m host_cli accept review <task_id>
+```
+
+扩展助手可直接由 Recipe 驱动：
+
+```bash
+python3 -m host_cli run "处理这次故障" \
+  assistant_id=team.oncall.agent event_id=evt-123
+
+# 中断后继续剩余 Action
+python3 -m host_cli resume <task_id> recipe=true
+
+# 根因冻结后推进处置、验证与观察
+python3 -m host_cli case disposition <task_id> reason="选择最安全可用动作"
+python3 -m host_cli case advance <task_id> plan=plan-r1 status=executing
+python3 -m host_cli case advance <task_id> plan=plan-r1 status=completed
+python3 -m host_cli case verify <task_id> evidence=<evidence-id> passed=true
 ```
 
 `host_cli` 是开源版默认入口。它把本地执行事实的完整性记录放在任务目录之外的
@@ -233,11 +268,14 @@ Agent 会按入口协议自动完成：
 
 ## 当前状态
 
-版本 `0.2.3`，当前范围是**平台无关内核 + 本地完整性宿主入口 + iOS 官方插件**。
+版本 `0.3.0`，当前范围是**能力装配内核 + 本地完整性宿主入口 + iOS 官方 Provider**。
 
-- selftest 262 条断言全绿：内核 187 + iOS 插件 75。
+- selftest 307 条断言全绿：内核 232 + iOS 插件 75。
 - 公开 CI 额外运行 fresh-clone managed-host 旅程，覆盖低风险 Task 的四关与最终 `wrapup`，并验证高风险任务在缺外部 reviewer 时 fail closed。
 - Task、Case、Gate、Ledger、Evidence 可持久化，`run/resume/tasks` 可跨会话恢复。
+- Task 绑定 `assistant_id`；Recipe 引用不存在的 Action、风险冲突、缺 Provider 或 Provider 歧义都会在装配阶段 fail closed。
+- Case 已拆成 diagnosis / disposition / verification / observation 四段状态；根因按 revision 冻结，重开诊断会清空四关并废止旧处置计划。
+- 同一 Recipe 可在不同 `DeploymentProfile` 下选择不同 Provider；本地 worker 已跑通完整多动作链。远端队列和 worker transport 仍明确留在核心之外。
 - `wrapup` 不可绕过：步骤证据、平台回读、Case resolved、四关、全局影响复核和必要的外部验收必须全部通过。
 - 全局视角在 Task 创建时固定 Git commit，读取任务期完整 diff；识别公共定义、Objective-C selector、动态路由/DI、行为配置文件、仓内调用方和删除逻辑，并给出受影响测试建议。L2/L3 改动逐项覆盖定义与调用方，后续提交或补丁会自动让旧结论失效。
 - 设计契约（`design_contract`：核心目标/核心设计决策/不改边界）在计划期冻结进 host-attested policy，随任务恢复；`plan` 命中大任务/重构时外显评审三裁决协议（符合→不改、偏离→改回、基线缺口→先改基线），让多轮评审对照固定尺子而非最新一句话，治过度改与硬挤问题。这是软基线，可留空、不阻断收口。
@@ -249,8 +287,8 @@ Agent 会按入口协议自动完成：
 - 真机 build/install/launch 走 XcodeBuildMCP；固定版本、官方 commit 与 origin 的公开 WDA 由 `ui_prepare/ui_status/ui_stop` 管理；crash 走 `devicectl`。
 - 真机已发现并验证到一台已配对的 iPhone；设备构建已进入 provisioning 阶段。完整真机 build/install/launch/WDA E2E 仍等待有效 Apple Developer 登录态创建 `dev.iloop.e2e` 的 development profile；真机动作目前使用 WDA 坐标，不与模拟器的语义 `elementRef` 冒充一致。
 
-## 下一步
+## v0.3 边界
 
-`0.3` 把开源版从「单 Runtime 验证闭环内核」推进到「用原子应用能力装配多个助手」的平台，分四个里程碑推进（应用动作契约与助手 Recipe → Provider 注册表 → 版本化 Case 生命周期 → Deployment 与跨节点任务信封）。完整排期、每个里程碑的范围/验收/不做边界，以及哪些进核心、哪些走扩展、哪些只留内部，见 [docs/ROADMAP-v0.3.md](docs/ROADMAP-v0.3.md)。
+`0.3` 已完成四个里程碑：应用动作与 Recipe、Provider 注册表、版本化 Resolve Case、Deployment 与本地签名执行契约。远端 transport、具体 Oncall/Bugfix/Stability 配方，以及 GitHub/Sentry/Slack/CI 等平台接入继续通过公开扩展提供，不进入核心。完整范围和验收记录见 [docs/ROADMAP-v0.3.md](docs/ROADMAP-v0.3.md)。
 
 MIT License。欢迎使用、修改和二次开发。

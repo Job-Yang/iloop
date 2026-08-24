@@ -52,7 +52,18 @@ class EvidenceArtifact:
         expected_bindings: Optional[Dict[str, object]] = None,
     ) -> bool:
         """Observed is provenance, not verdict. Only successful observations support completion."""
-        if not self.is_observed() or self.outcome != "success":
+        return self.supports_outcome(
+            "success", verify_attestation, expected_bindings
+        )
+
+    def supports_outcome(
+        self,
+        expected_outcome: str,
+        verify_attestation: Optional[Callable[[Path, dict], bool]] = None,
+        expected_bindings: Optional[Dict[str, object]] = None,
+    ) -> bool:
+        """Validate a durable observed outcome without changing its semantics."""
+        if not self.is_observed() or self.outcome != expected_outcome:
             return False
         if self.created_at > time.time() + 5:
             return False
@@ -126,6 +137,9 @@ class EvidenceArtifact:
             "gates": self.metadata.get("gates", []),
             "created_at": self.created_at,
         }
+        for key in ("diagnosis_revision", "disposition_plan_id"):
+            if key in self.metadata:
+                expected_receipt[key] = self.metadata[key]
         return all(
             row.get(
                 key,

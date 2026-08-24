@@ -18,11 +18,29 @@
 
 from .evidence import EvidenceArtifact, EvidenceKind
 from .capability import Capability, CapabilityResult, CapabilityStatus, Plugin, unsupported
+from .action import (
+    ActionCatalog, ActionHandler, ActionResult, ActionRisk, ActionSideEffect,
+    ActionSpec,
+)
+from .recipe import (
+    AssistantAssembly, AssistantRecipe, RecipeCatalog,
+)
+from .provider import ProviderRegistry
+from .deployment import (
+    DeploymentAssembly, DeploymentProfile, assemble_deployment,
+)
+from .execution import (
+    LocalRecipeWorker, ReplayGuard, TaskEnvelope, WorkerEvidence, WorkerReceipt,
+)
 from .flow import Flow, Autonomy, FlowRegistry
 from .lesson import Lesson, LessonBook
 from .gate import FourGate, GateResult
 from .experts import Expert, ExpertRegistry
-from .case import Case, CaseStatus, Hypothesis, HypothesisStatus, TestSpec
+from .case import (
+    Case, CaseStatus, DiagnosisRevision, DiagnosisStatus, DispositionKind,
+    DispositionPlan, DispositionStatus, Hypothesis, HypothesisStatus,
+    ObservationStatus, TestSpec, VerificationRecord, VerificationStatus,
+)
 from .ledger import Ledger, Round, RoundStatus, render, BRAND, PHASES
 from .acceptance import (
     RiskLevel, assess_risk, needs_independent_review,
@@ -37,7 +55,9 @@ from .runner import CommandRunner, CommandOutput
 from .extension import (
     Extension, scaffold_extension, load_extension, validate_extension,
     merge_into_registry, load_installed_extensions, load_extension_plugin,
-    load_installed_plugins, has_errors, ValidationIssue,
+    load_installed_plugins, load_extension_application,
+    load_extension_action_handlers, load_installed_application,
+    extension_provider_bindings, has_errors, ValidationIssue,
 )
 from .redline import (
     check_command, guard_command, guard_write_path, RedlineViolation,
@@ -72,11 +92,21 @@ def discover_developer_dir():
 __all__ = [
     "EvidenceArtifact", "EvidenceKind",
     "Capability", "CapabilityResult", "CapabilityStatus", "Plugin", "unsupported",
+    "ActionCatalog", "ActionHandler", "ActionResult", "ActionRisk",
+    "ActionSideEffect", "ActionSpec",
+    "AssistantAssembly", "AssistantRecipe", "RecipeCatalog",
+    "ProviderRegistry",
+    "DeploymentAssembly", "DeploymentProfile", "assemble_deployment",
+    "LocalRecipeWorker", "ReplayGuard", "TaskEnvelope", "WorkerEvidence",
+    "WorkerReceipt",
     "Flow", "Autonomy", "FlowRegistry",
     "Lesson", "LessonBook",
     "FourGate", "GateResult",
     "Expert", "ExpertRegistry",
-    "Case", "CaseStatus", "Hypothesis", "HypothesisStatus", "TestSpec",
+    "Case", "CaseStatus", "DiagnosisRevision", "DiagnosisStatus",
+    "DispositionKind", "DispositionPlan", "DispositionStatus",
+    "Hypothesis", "HypothesisStatus", "ObservationStatus", "TestSpec",
+    "VerificationRecord", "VerificationStatus",
     "Ledger", "Round", "RoundStatus", "render", "BRAND", "PHASES",
     "RiskLevel", "assess_risk", "needs_independent_review",
     "AcceptancePackage", "AcceptanceResult", "Verdict", "IndependentReviewer",
@@ -86,7 +116,9 @@ __all__ = [
     "CommandRunner", "CommandOutput", "discover_developer_dir",
     "Extension", "scaffold_extension", "load_extension", "validate_extension",
     "merge_into_registry", "load_installed_extensions", "load_extension_plugin",
-    "load_installed_plugins", "has_errors", "ValidationIssue",
+    "load_installed_plugins", "load_extension_application",
+    "load_extension_action_handlers", "load_installed_application",
+    "extension_provider_bindings", "has_errors", "ValidationIssue",
     "check_command", "guard_command", "guard_write_path", "RedlineViolation",
     "Dashboard",
     "TaskRecord", "TaskStatus", "TaskStep", "StepStatus", "TaskStore", "Runtime",
@@ -97,4 +129,4 @@ __all__ = [
     "HostTrustStore",
 ]
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"

@@ -45,8 +45,11 @@ python3 -m host_cli extension-init team.oncall
 ```text
 ~/.iloop/extensions/team.oncall/
 ├── manifest.json
-└── flows.json
-└── plugin.py              # 可选：manifest.provides.plugin 声明 Capability Plugin
+├── flows.json
+├── actions.json           # 应用动作契约
+├── recipes.json           # 助手动作组合
+├── application.py         # 可选：应用动作 handler
+└── plugin.py              # 可选：Driver Capability Provider
 ```
 
 从这一刻起：
@@ -66,8 +69,11 @@ Agent 根据目标自主选择最少的插口，不要求每个扩展都实现�
 | 用户要做什么 | 该实现什么 | 接入方式 |
 |---|---|---|
 | 增加一类业务任务 | 业务 flow | 写 `flows.json` |
-| 接公司内部日志、监控、CI | 平台插件 | 实现 `Plugin` / `Capability` |
-| 做 oncall 或事件驱动 Agent | Capability Plugin + 业务 flow | 由插件在 `invoke` 内接事件/通知平台 |
+| 定义可组合的业务动作 | `ActionSpec` | 写 `actions.json` |
+| 组合 Oncall/Bugfix/稳定性助手 | `AssistantRecipe` | 写 `recipes.json` |
+| 实现动作编排逻辑 | Action handler | 在 `application.py` 导出 `create_action_handlers(config)` |
+| 接日志、监控、CI、设备 | Provider | 实现 `Plugin` / Driver `Capability` |
+| 多 Provider 能力重叠 | 显式绑定 | 在 manifest 的 `provider_bindings` 指定 capability → platform_id |
 | 增加领域诊断方法 | 领域 flow | 把判断方法写入 `guidance` 与 `required_docs` |
 | 有复杂批处理逻辑 | 扩展脚本 | 放在扩展目录，由 flow 引用 |
 
@@ -84,7 +90,22 @@ flow 至少写清：
 - `escalate_when`：什么情况下必须停下问人；
 - `next_suggest`：收口后主动建议什么。
 
-### 平台插件负责“怎么执行”
+### Action 和 Recipe 负责“做什么”
+
+`actions.json` 中每个 `action_id` 必须带扩展命名空间，并声明输入、输出、风险、副作用、允许的助手和所需 Driver Capability。Action 用 `lifecycle_stage` 声明 diagnosis / disposition / verification / observation 阶段；处置 Action 还要声明 `disposition_kind`（`code_change / isolation / human_handoff / observe`）。`recipes.json` 只保存版本、有序动作列表、入口和是否持续观察，不能写部署分支。
+
+需要执行应用逻辑时，在 manifest 的 `provides.application` 指向 Python 模块：
+
+```python
+def create_action_handlers(config):
+    return {
+        "team.oncall.collect": lambda payload: {"case_id": "..."},
+    }
+```
+
+handler 必须是 callable，输出必须覆盖 ActionSpec 声明的字段。缺 Action、重复动作、风险不一致或 handler 非法都会拒绝装配。
+
+### Provider 负责“怎么执行”
 
 平台插件只负责接真实能力，例如 logs、metrics、build、screenshot、crash。它返回统一结果和证据，不负责决定病例是否收敛。
 
@@ -92,15 +113,13 @@ Capability Plugin 是宿主进程内执行的可信代码。安装第三方插�
 当前用户权限运行；只安装已审阅来源。需要隔离不可信插件时，由自定义宿主把
 插件放进独立进程或容器，不能依赖 Python 模块边界提供安全沙箱。
 
-需要运行时代码时，在 `manifest.json` 设置 `"provides": {"plugin": "plugin.py"}`，并导出 `create_plugin(config)`。返回对象必须满足 `Plugin` 协议；调用时通过 `platform=<platform_id>` 选择。加载器会拒绝路径逃逸、缺文件和不符合契约的返回值。
+需要运行时代码时，在 `manifest.json` 设置 `provides.plugin`，并导出 `create_plugin(config)`。返回对象必须满足 `Plugin` 协议。多个 Provider 可以同时装配；能力重叠时必须显式绑定，否则 fail closed。加载器会拒绝路径逃逸、缺文件、重复 `platform_id` 和不符合契约的返回值。
 
 如果能力不支持，返回 `unsupported`；不要假装成功。
 
 ### 领域判断先放 flow
 
-当前扩展自动发现只接入 flow 和 Capability Plugin。领域判断应先写进
-`guidance` / `required_docs`；`EventSource`、`Notifier` 和自定义专家属于
-手工宿主集成 API，尚不由扩展 manifest 自动加载。
+扩展自动发现会接入 flow、Action、Recipe、Action handler 和 Provider。领域判断仍应先写进 `guidance` / `required_docs`；`EventSource`、`Notifier` 和自定义专家属于手工宿主集成 API，尚不由扩展 manifest 自动加载。
 
 ---
 
@@ -115,9 +134,14 @@ python3 -m host_cli extension-validate ~/.iloop/extensions/team.oncall
 - 扩展名不符合 `<team>.<extension>`；
 - flow 没带扩展命名空间；
 - flow 与核心 ID 冲突；
-- manifest 或 flows 格式非法。
+- Action/Recipe 没有扩展命名空间；
+- Recipe 引用不存在的 Action 或风险声明冲突；
+- manifest、flows、actions 或 recipes 格式非法。
 
 校验通过只证明“扩展结构合法”，不证明业务真的能跑。
+跨扩展装配时还会检查 Provider binding 指向的 Provider 是否存在、是否真的声明
+对应能力；这一步依赖当前宿主已经加载的完整 Provider 集，不能由单包
+`extension-validate` 独立证明。
 
 ---
 
@@ -154,11 +178,11 @@ Agent 应当：
 1. 判断为业务扩展；
 2. 创建 `team.oncall`；
 3. 写 oncall flow；
-4. 在 Capability Plugin 中接入 webhook 输入；
-5. 在同一插件中接入 Slack 输出；
-6. 复用 `Case`、诊断专家、四道关卡和能力 Gate；
-7. 校验扩展；
-8. 用一条测试告警跑通“事件 → 病例 → 证据 → 结论 → 通知”。
+4. 用 `ActionSpec` 定义接警、诊断、处置、验证和通知动作；
+5. 用 `AssistantRecipe` 组合 Oncall 助手，不写部署分支；
+6. 用 Provider 接 webhook、日志和 Slack，重叠能力显式绑定；
+7. 复用版本化 `Case`、诊断专家、四道关卡和能力 Gate；
+8. 校验扩展，并用一条测试告警跑通“事件 → 病例 → 证据 → 结论 → 通知”。
 
 用户不需要手工理解内核协议。协议是 Agent 实现这些插口时使用的技术约束。
 

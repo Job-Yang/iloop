@@ -51,11 +51,13 @@ class FourGate:
         self,
         verify_attestation: Optional[Callable[[Path, dict], bool]] = None,
         expected_bindings: Optional[dict] = None,
+        min_created_at: float = 0.0,
     ) -> GateResult:
         detail = {}
         for g in GATES:
             detail[g] = any(
-                e.supports_gate(g, verify_attestation, expected_bindings)
+                e.created_at >= min_created_at
+                and e.supports_gate(g, verify_attestation, expected_bindings)
                 for e in self._bind[g]
             )
         missing = [g for g in GATES if not detail[g]]

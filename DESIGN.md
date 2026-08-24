@@ -300,6 +300,8 @@ iLoop 把一次诊断建成病例：
 
 每次 `tick` 只给出下一条最有区分度的检查；专家只能回答自己边界内的问题；新证据互相矛盾时 `reroute` 重分诊，而不是硬把旧结论圆回来。
 
+从 `0.3` 起，病例不再把“找到根因”当作终点。diagnosis、disposition、verification、observation 四段状态彼此独立：根因按 revision 冻结，处置计划只能绑定某一版根因；新候选、反证或观察回归会重开诊断、清空旧四关并废止旧计划。这样“曾经诊断正确”不能继续为后来已经变化的系统背书。
+
 这使诊断可以跨轮次、跨会话，甚至被新的事件继续唤醒。
 
 对应实现：`kernel/case.py`、`kernel/experts.py`。
@@ -311,18 +313,20 @@ iLoop 把一次诊断建成病例：
 通用性不是把所有能力都塞进核心，而是把边界切干净。
 
 ```text
-┌─────────────────────────────────────────────┐
-│ 判断力：VDD / 工作流 / 病例 / 验收 / 错题本 │
-├─────────────────────────────────────────────┤
-│ 业务层：领域材料 / 业务 flow / 专项脚本 / 角色│
-├─────────────────────────────────────────────┤
-│ 平台层：iOS / 日志 / 监控 / CI / IM / 设备   │
-└─────────────────────────────────────────────┘
+AssistantRecipe
+  -> ActionSpec（应用动作）
+      -> Driver Capability（执行端口）
+          -> Provider（iOS / 日志 / CI / IM）
+
+DeploymentProfile
+  -> target node + available providers
 ```
 
 - **判断力**回答“应该怎么想、怎样才算完成”；
-- **业务层**回答“这个领域是什么、目标和边界是什么”；
-- **平台层**回答“具体怎么编、怎么跑、怎么拿证据”。
+- **Recipe**回答“这个助手由哪些动作组成”，不关心在哪运行；
+- **Action**回答“要完成什么、输入输出和风险是什么”；
+- **Provider**回答“具体怎么编、怎么跑、怎么拿证据”；
+- **Deployment**回答“在哪个节点运行、那里有哪些 Provider”。
 
 换业务只替换业务层，换平台只替换执行插件，核心循环不需要重写。
 
@@ -338,12 +342,15 @@ iLoop 把一次诊断建成病例：
 
 普通使用者不需要先学习 `SPEC.md`。
 
-内核协议不是一套要背的理论，而是 Agent 与插件之间的**插座标准**。它只规定四类东西应该长什么样：
+内核协议不是一套要背的理论，而是 Agent 与扩展之间的**插座标准**。它规定：
 
 1. **证据**：从哪里来，是观测还是推断，产物在哪里；
 2. **能力**：插件支持 build、logs、screenshot 还是 crash，调用结果如何统一返回；
 3. **工作流**：一类任务何时命中、用哪档权限、读哪些文档、何时升级；
-4. **经验**：一条 lesson 如何保存和检索。
+4. **经验**：一条 lesson 如何保存和检索；
+5. **应用动作与助手**：Action 如何组合成 Recipe；
+6. **执行装配**：Capability 如何路由到 Provider；
+7. **跨节点契约**：Deployment、TaskEnvelope 和 WorkerReceipt 如何绑定完整任务。
 
 这样监控、日志、CI、IM、Android 或其他平台可以各自实现插件，而病例、验收、错题本和收口逻辑不需要认识任何具体平台。
 
@@ -388,7 +395,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 2. **读取扩展契约**：加载 `EXTENDING.md`，而不是凭入口提示词猜目录。
 3. **创建隔离空间**：运行 `extension-init <team.extension>`。
 4. **只改扩展目录**：核心整体只读，业务能力不 fork、不魔改入口。
-5. **实现业务层**：自动加载 flow 与 Capability Plugin；事件源、通知渠道或方法专家由自定义宿主手工接入。
+5. **实现业务层**：自动加载 flow、Action、Recipe、Action handler 与 Provider；事件源、通知渠道或方法专家由自定义宿主手工接入。
 6. **执行边界校验**：运行 `extension-validate`，检查命名空间、核心覆盖和格式。
 7. **拿真实任务验收**：再次运行 `plan`，确认真实业务请求能命中新 flow，再按该 flow 跑一次闭环。
 
@@ -452,12 +459,15 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 - 错题本、反循环、能力 Gate、红线守卫；
 - 提效看板；
 - Agent 驱动的扩展脚手架和校验器；
+- 应用动作 `ActionSpec`、助手 `AssistantRecipe` 与多 Provider 能力路由；
+- 版本化 Resolve Case：根因 revision、处置、验证和观察状态机；
+- 与 Recipe 正交的 `DeploymentProfile`，以及签名 TaskEnvelope、持久化防重放和 WorkerReceipt；
 - 可恢复运行时：Task 计划、当前阶段、Case/Gate、轮次账、证据索引和看板均落盘，`run/resume/tasks` 可跨会话继续；
 - 工程记忆：inputs manifest、Constitution、结构化 blocker、records；
 - 可复用 UI Flow：路径图、验证节点证据、转 Task；
 - iOS 官方插件：XcodeBuildMCP build/run/install/launch/单次绑定动态日志/模拟器 UI 自动化，以及固定版本 WDA 托管、screenshot、probe、crash；
 - 模拟器与真机执行路径，真机 UI 基于 Appium WebDriverAgent；
-- 200 条 selftest 断言（内核 144 + iOS 插件 56）。
+- 307 条 selftest 断言（内核 232 + iOS 插件 75）。
 
 ### 已真实验证
 
@@ -467,6 +477,8 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 - E2E 反馈已修复截图冷启动超时、宿主尾部非零覆盖真实产物、运行日志 home 路径解析、后台 helper 阻塞、进程组泄漏与重复语义控件误重绑；
 - oncall demo 从事件到病例、证据、四关、通知完整运行；
 - 扩展创建、校验和防覆盖核心 flow。
+- 两个不同助手的 Action 组合、双 Provider 路由、完整两动作本地 Recipe 回放；
+- Envelope 输入/Recipe/TTL/节点/Git 基线防篡改，Receipt 动作覆盖与 replay 防护。
 
 ### 仍需继续验证
 
@@ -474,6 +486,7 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 - 更多真机与系统版本覆盖；
 - WDA 首次真机签名与完整 elementRef 路径的多设备实测；
 - Android、Web、Lynx 等新平台应以插件方式逐个接入并真实验证，不能仅凭架构推断已经通用。
+- 远端 transport、worker 拉取和企业级节点身份仍由后续公开扩展验证，不把本地 HMAC 契约描述成已完成的远端系统。
 
 这也是 iLoop 对自己的要求：可以说架构为跨平台准备好了，但在某个平台真跑通之前，不能把“可以扩展”说成“已经支持”。
 

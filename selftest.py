@@ -43,6 +43,12 @@ from kernel import (  # noqa: E402
     Event,
     CapabilityGate,
     TaskStore,
+    ActionCatalog,
+    ActionRisk,
+    ActionSideEffect,
+    ActionSpec,
+    AssistantRecipe,
+    RecipeCatalog,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
 
@@ -98,6 +104,12 @@ def observed(
             "device_id": evidence.metadata.get("device_id", ""),
             "subjects": evidence.metadata.get("subjects", []),
             "gates": evidence.metadata.get("gates", []),
+            "diagnosis_revision": evidence.metadata.get(
+                "diagnosis_revision", 0
+            ),
+            "disposition_plan_id": evidence.metadata.get(
+                "disposition_plan_id", ""
+            ),
             "created_at": evidence.created_at,
         }, ensure_ascii=False),
         encoding="utf-8",
@@ -239,10 +251,10 @@ def test_experts_are_platform_free() -> None:
     experts = reg.method_experts()
     check("专家: 加载到 9 个方法专家", len(experts) == 9)
     check("专家: 有 coordinator", reg.coordinator() is not None)
-    # 开源核心红线：专家不能出现任何 bytedance 平台名
+    # 开源核心红线：专家不能出现任何企业内部平台名
     import json as _json
     raw = _json.dumps([e.__dict__ for e in experts], default=str, ensure_ascii=False).lower()
-    banned = ["tea", "slardar", "libra", "ditom", "argos", "bytedance", "byted", "任意门"]
+    banned = ["vendor_internal", "company_only", "private_platform"]
     hit = [b for b in banned if b in raw]
     check("专家: 方法层不含任何平台绑定词", hit == [])
     # 专家用 wants_capabilities 声明想要的证据类型（抽象接口，非平台）
@@ -310,6 +322,270 @@ def test_case_tick_consult_reroute() -> None:
     survivors = c.reroute("新证据与 h1 排除结论矛盾")
     check("病例reroute: 被排除候选重新打开", c.hypotheses["h1"].status.value == "open")
     check("病例reroute: 回到调查态且四关重置", c.status == CaseStatus.INVESTIGATING and not c.evaluate_gate().passed)
+
+
+def test_versioned_resolve_case_lifecycle() -> None:
+    from kernel import (
+        DiagnosisStatus, DispositionStatus, ObservationStatus,
+        VerificationStatus,
+    )
+    import json as _json
+
+    case = Case("case-versioned", "request timeout")
+    hypothesis = case.add_hypothesis("connection pool exhaustion")
+    diagnosis_evidence = observed(
+        "pool is exhausted",
+        metadata={"gates": ["mechanism"], "task_id": case.case_id},
+    )
+    case.attach(hypothesis.id, diagnosis_evidence)
+    case.bind_gate("mechanism", diagnosis_evidence)
+    for gate in ("time", "scope", "counter_evidence"):
+        case.bind_gate(
+            gate,
+            observed(gate, metadata={"gates": [gate]}),
+        )
+    resolved, _ = case.try_resolve(lambda path, row: True)
+    old_gate_evidence = {
+        gate: next(
+            item for item in case.evidence.values()
+            if gate in item.metadata.get("gates", [])
+        )
+        for gate in ("time", "scope", "mechanism", "counter_evidence")
+    }
+    plan = case.route_disposition(
+        {
+            "example.code_fix": "code_change",
+            "example.observe": "observe",
+        },
+        reason="bounded local repair is available",
+    )
+    case.advance_disposition(plan.plan_id, DispositionStatus.EXECUTING)
+    case.advance_disposition(plan.plan_id, DispositionStatus.COMPLETED)
+    stale_verification_rejected = False
+    try:
+        case.record_verification(
+            passed=True,
+            evidence_ids=[diagnosis_evidence.id],
+            summary="reused diagnosis evidence",
+            verify_attestation=lambda path, row: True,
+        )
+    except ValueError:
+        stale_verification_rejected = True
+    cross_task = observed(
+        "other task verification",
+        metadata={
+            "task_id": "other-task",
+            "diagnosis_revision": case.diagnosis_revision,
+            "disposition_plan_id": plan.plan_id,
+        },
+    )
+    case.attach(hypothesis.id, cross_task)
+    cross_task_rejected = False
+    try:
+        case.record_verification(
+            passed=True,
+            evidence_ids=[cross_task.id],
+            summary="wrong task",
+            verify_attestation=lambda path, row: True,
+        )
+    except ValueError:
+        cross_task_rejected = True
+    failed_verification = observed(
+        "repair still failing",
+        outcome="failure",
+        metadata={
+            "task_id": case.case_id,
+            "diagnosis_revision": case.diagnosis_revision,
+            "disposition_plan_id": plan.plan_id,
+        },
+    )
+    case.evidence[failed_verification.id] = failed_verification
+    case.record_verification(
+        passed=False,
+        evidence_ids=[failed_verification.id],
+        summary="first verification failed",
+        verify_attestation=lambda path, row: True,
+    )
+    case.retry_verification("new fix applied")
+    verification_retry_opened = (
+        case.verification_status == VerificationStatus.PENDING
+    )
+    verification = observed(
+        "repair verified",
+        metadata={
+            "task_id": case.case_id,
+            "diagnosis_revision": case.diagnosis_revision,
+            "disposition_plan_id": plan.plan_id,
+        },
+    )
+    case.attach(hypothesis.id, verification)
+    case.record_verification(
+        passed=True,
+        evidence_ids=[verification.id],
+        summary="targeted verification passed",
+        verify_attestation=lambda path, row: True,
+    )
+    verification.metadata["diagnosis_revision"] = 999
+    tampered_binding_rejected = not case.verification_is_valid(
+        lambda path, row: True
+    )
+    verification.metadata["diagnosis_revision"] = case.diagnosis_revision
+    verification_path = Path(verification.path)
+    verification_content = verification_path.read_text(encoding="utf-8")
+    verification_path.write_text("tampered", encoding="utf-8")
+    stale_observation_rejected = False
+    try:
+        case.start_observation(lambda path, row: True)
+    except ValueError:
+        stale_observation_rejected = True
+    verification_path.write_text(verification_content, encoding="utf-8")
+    case.start_observation(lambda path, row: True)
+    verification_overwrite_rejected = False
+    try:
+        case.record_verification(
+            passed=False,
+            evidence_ids=[verification.id],
+            summary="late conflicting write",
+            verify_attestation=lambda path, row: True,
+        )
+    except ValueError:
+        verification_overwrite_rejected = True
+    stale_finish_rejected = False
+    try:
+        case.finish_observation(
+            stable=True,
+            evidence_ids=[verification.id],
+            verify_attestation=lambda path, row: True,
+        )
+    except ValueError:
+        stale_finish_rejected = True
+    observation = observed(
+        "observation stable",
+        metadata={
+            "task_id": case.case_id,
+            "diagnosis_revision": case.diagnosis_revision,
+            "disposition_plan_id": plan.plan_id,
+        },
+    )
+    case.attach(hypothesis.id, observation)
+    observation_path = Path(observation.path)
+    observation_content = observation_path.read_text(encoding="utf-8")
+    observation_path.write_text("tampered again", encoding="utf-8")
+    changed_observation_rejected = False
+    try:
+        case.finish_observation(
+            stable=True,
+            evidence_ids=[observation.id],
+            verify_attestation=lambda path, row: True,
+        )
+    except ValueError:
+        changed_observation_rejected = True
+    observation_path.write_text(observation_content, encoding="utf-8")
+    case.finish_observation(
+        stable=True,
+        evidence_ids=[observation.id],
+        verify_attestation=lambda path, row: True,
+    )
+    check(
+        "M3: diagnosis→disposition→verification→observation 正交推进",
+        resolved
+        and case.diagnosis_status == DiagnosisStatus.FROZEN
+        and case.diagnosis_revision == 1
+        and plan.action_id == "example.code_fix"
+        and case.disposition_status == DispositionStatus.COMPLETED
+        and case.verification_status == VerificationStatus.PASSED
+        and case.observation_status == ObservationStatus.STABLE
+        and stale_verification_rejected
+        and cross_task_rejected
+        and verification_retry_opened
+        and stale_observation_rejected
+        and stale_finish_rejected
+        and changed_observation_rejected
+        and tampered_binding_rejected
+        and verification_overwrite_rejected,
+    )
+
+    case.reopen_diagnosis("new evidence contradicts revision 1")
+    for gate, evidence in old_gate_evidence.items():
+        case.bind_gate(gate, evidence)
+    stale_gate_rejected = not case.try_resolve(
+        lambda path, row: True
+    )[0]
+    replacement = case.add_hypothesis("upstream rate limiting")
+    contradiction = observed("pool remains healthy", evidence_id="ev-contradiction")
+    case.attach(hypothesis.id, contradiction, refutes=True)
+    case.attach(replacement.id, observed("upstream returned 429"))
+    for gate in ("time", "scope", "mechanism", "counter_evidence"):
+        case.bind_gate(
+            gate,
+            observed(f"revision 2 {gate}", metadata={"gates": [gate]}),
+        )
+    old_plan_rejected = False
+    try:
+        case.advance_disposition(plan.plan_id, DispositionStatus.EXECUTING)
+    except ValueError:
+        old_plan_rejected = True
+    resolved_again, _ = case.try_resolve(lambda path, row: True)
+    handoff = case.route_disposition([], reason="no trusted local write action")
+    check(
+        "M3: 根因翻新递增 revision 并使旧处置计划失效",
+        old_plan_rejected
+        and stale_gate_rejected
+        and resolved_again
+        and case.diagnosis_revision == 2
+        and case.disposition_progress[plan.plan_id]
+        == DispositionStatus.INVALIDATED
+        and handoff.kind.value == "human_handoff",
+    )
+    case.attach(
+        replacement.id,
+        observed("revision 2 contradicted"),
+        refutes=True,
+    )
+    direct_refutation_invalidated = False
+    try:
+        case.advance_disposition(
+            handoff.plan_id, DispositionStatus.EXECUTING
+        )
+    except ValueError:
+        direct_refutation_invalidated = True
+    check(
+        "M3: 直接反证冻结根因会自动重开并废止当前 plan",
+        direct_refutation_invalidated
+        and case.diagnosis_status == DiagnosisStatus.INVESTIGATING,
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "legacy-case.json"
+        payload = case.to_dict()
+        for key in (
+            "diagnosis_status", "diagnosis_started_at",
+            "diagnosis_revision", "diagnosis_revisions",
+            "disposition_status", "disposition_plans", "disposition_progress",
+            "disposition_completed_at",
+            "verification_status", "verifications", "observation_status",
+        ):
+            payload.pop(key, None)
+        payload["status"] = "resolved"
+        # A legacy resolved case must still have one surviving hypothesis.
+        payload["hypotheses"] = [{
+            **row,
+            "status": "supported",
+        } for row in payload["hypotheses"] if row["id"] == replacement.id]
+        path.write_text(_json.dumps(payload), encoding="utf-8")
+        migrated = Case.load(path)
+        check(
+            "M3: 旧非版本化 resolved Case 读取时迁移为冻结 revision 1",
+            migrated.diagnosis_status == DiagnosisStatus.FROZEN
+            and migrated.diagnosis_revision == 1
+            and len(migrated.diagnosis_revisions) == 1
+            and set(migrated.diagnosis_revisions[0].evidence_ids)
+            >= {
+                evidence_id
+                for ids in payload["gate_bindings"].values()
+                for evidence_id in ids
+            },
+        )
 
 
 def test_score_change_quantified() -> None:
@@ -452,7 +728,9 @@ def test_channel_and_gate() -> None:
 def test_extension_mechanism() -> None:
     from kernel import (scaffold_extension, load_extension, validate_extension,
                         has_errors, merge_into_registry, FlowRegistry,
-                        load_extension_plugin, load_installed_plugins)
+                        load_extension_plugin, load_installed_plugins,
+                        load_extension_application, extension_provider_bindings,
+                        load_installed_application, ActionCatalog, RecipeCatalog)
     with tempfile.TemporaryDirectory() as d:
         ext = scaffold_extension("team.oncall", d)
         loaded = load_extension(ext.root)
@@ -468,7 +746,24 @@ def test_extension_mechanism() -> None:
         manifest_path = ext.root / "manifest.json"
         manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
         manifest["provides"]["plugin"] = "plugin.py"
+        manifest["provides"]["application"] = "application.py"
+        manifest["provides"]["provider_bindings"] = {"probe": "team_demo"}
         manifest_path.write_text(__import__("json").dumps(manifest), encoding="utf-8")
+        (ext.root / "actions.json").write_text(
+            __import__("json").dumps([{
+                "action_id": "team.oncall.collect",
+                "description": "Collect evidence",
+                "required_capabilities": ["probe"],
+            }]),
+            encoding="utf-8",
+        )
+        (ext.root / "recipes.json").write_text(
+            __import__("json").dumps([{
+                "assistant_id": "team.oncall.agent",
+                "actions": ["team.oncall.collect"],
+            }]),
+            encoding="utf-8",
+        )
         (ext.root / "plugin.py").write_text(
             "from kernel import Capability, CapabilityResult, CapabilityStatus\n"
             "class Demo:\n"
@@ -479,9 +774,30 @@ def test_extension_mechanism() -> None:
             "def create_plugin(config): return Demo()\n",
             encoding="utf-8",
         )
+        (ext.root / "application.py").write_text(
+            "def create_action_handlers(config):\n"
+            " return {'team.oncall.collect': lambda payload: {'result': 'ok'}}\n",
+            encoding="utf-8",
+        )
         plugin = load_extension_plugin(load_extension(ext.root))
         check("扩展: 声明式 Capability Plugin 可动态加载",
               plugin is not None and plugin.platform_id == "team_demo")
+        action_catalog = ActionCatalog()
+        recipe_catalog = RecipeCatalog(action_catalog)
+        counts = load_extension_application(
+            load_extension(ext.root), action_catalog, recipe_catalog
+        )
+        bindings = extension_provider_bindings(load_extension(ext.root))
+        check(
+            "扩展: action/recipe/provider binding 声明可装配",
+            counts == (1, 1)
+            and recipe_catalog.get("team.oncall.agent").actions
+            == ("team.oncall.collect",)
+            and recipe_catalog.execute(
+                "team.oncall.agent", "team.oncall.collect", {}
+            ).outputs["result"] == "ok"
+            and bindings[Capability.PROBE] == "team_demo",
+        )
         bad = Path(d) / "team.bad"
         bad.mkdir()
         (bad / "manifest.json").write_text("{broken", encoding="utf-8")
@@ -491,6 +807,154 @@ def test_extension_mechanism() -> None:
             "扩展: 损坏相邻扩展不阻断合法插件加载",
             any(item.platform_id == "team_demo" for item in plugins)
             and any("team.bad" in issue.message for issue in plugin_issues),
+        )
+        aggregate_actions = ActionCatalog()
+        aggregate_recipes = RecipeCatalog(aggregate_actions)
+        aggregate_counts, _, app_issues = load_installed_application(
+            d, aggregate_actions, aggregate_recipes
+        )
+        check(
+            "扩展: 损坏邻居不阻断合法 application 装配",
+            aggregate_counts == (1, 1)
+            and any("team.bad" in issue.message for issue in app_issues)
+            and aggregate_recipes.execute(
+                "team.oncall.agent", "team.oncall.collect", {}
+            ).outputs["result"] == "ok",
+        )
+        malformed_provides = Path(d) / "team.provides"
+        malformed_provides.mkdir()
+        (malformed_provides / "manifest.json").write_text(
+            __import__("json").dumps({
+                "name": "team.provides",
+                "provides": [],
+            }),
+            encoding="utf-8",
+        )
+        malformed_ext = load_extension(malformed_provides)
+        check(
+            "扩展: 非对象 provides 返回结构化错误而非崩溃",
+            has_errors(validate_extension(malformed_ext)),
+        )
+        invalid_recipe = scaffold_extension("team.invalid_recipe", d)
+        invalid_recipe.manifest["provides"]["provider_bindings"] = {
+            "probe": "invalid_provider"
+        }
+        (invalid_recipe.root / "manifest.json").write_text(
+            __import__("json").dumps(invalid_recipe.manifest),
+            encoding="utf-8",
+        )
+        (invalid_recipe.root / "recipes.json").write_text(
+            __import__("json").dumps([{
+                "assistant_id": "team.invalid_recipe.agent",
+                "actions": ["missing.action"],
+            }]),
+            encoding="utf-8",
+        )
+        isolated_actions = ActionCatalog()
+        isolated_recipes = RecipeCatalog(isolated_actions)
+        isolated_counts, isolated_bindings, isolated_issues = load_installed_application(
+            d, isolated_actions, isolated_recipes
+        )
+        check(
+            "扩展: 语义无效 Recipe 被隔离且合法助手继续可用",
+            isolated_counts == (1, 1)
+            and any(
+                "recipe assembly failed" in issue.message
+                for issue in isolated_issues
+            )
+            and isolated_recipes.get("team.oncall.agent") is not None
+            and isolated_bindings[Capability.PROBE] == "team_demo",
+        )
+        bad_handler = scaffold_extension("team.bad_handler", d)
+        bad_handler.manifest["provides"]["application"] = "application.py"
+        (bad_handler.root / "manifest.json").write_text(
+            __import__("json").dumps(bad_handler.manifest),
+            encoding="utf-8",
+        )
+        (bad_handler.root / "actions.json").write_text(
+            __import__("json").dumps([{
+                "action_id": "team.bad_handler.run",
+                "description": "Bad handler fixture",
+            }]),
+            encoding="utf-8",
+        )
+        (bad_handler.root / "application.py").write_text(
+            "def create_action_handlers(config):\n"
+            " return {'team.bad_handler.run': 'not-callable'}\n",
+            encoding="utf-8",
+        )
+        isolated_actions = ActionCatalog()
+        isolated_recipes = RecipeCatalog(isolated_actions)
+        counts_after_bad_handler, _, handler_issues = load_installed_application(
+            d, isolated_actions, isolated_recipes
+        )
+        check(
+            "扩展: 非 callable handler 只隔离所属扩展",
+            counts_after_bad_handler == (1, 1)
+            and any(
+                "non-callable handlers" in issue.message
+                for issue in handler_issues
+            ),
+        )
+        exiting = scaffold_extension("team.system_exit", d)
+        exiting.manifest["provides"]["application"] = "application.py"
+        exiting.manifest["provides"]["plugin"] = "plugin.py"
+        (exiting.root / "manifest.json").write_text(
+            __import__("json").dumps(exiting.manifest),
+            encoding="utf-8",
+        )
+        (exiting.root / "application.py").write_text(
+            "raise SystemExit(23)\n", encoding="utf-8"
+        )
+        (exiting.root / "plugin.py").write_text(
+            "raise SystemExit(24)\n", encoding="utf-8"
+        )
+        exit_actions = ActionCatalog()
+        exit_recipes = RecipeCatalog(exit_actions)
+        exit_counts, _, exit_issues = load_installed_application(
+            d, exit_actions, exit_recipes
+        )
+        exit_plugin_issues = []
+        exit_plugins = load_installed_plugins(
+            d, issues=exit_plugin_issues
+        )
+        check(
+            "扩展: SystemExit 只隔离所属 application/plugin",
+            exit_counts == (1, 1)
+            and any(
+                "team.system_exit" in issue.message
+                for issue in exit_issues
+            )
+            and any(
+                "team.system_exit" in issue.message
+                for issue in exit_plugin_issues
+            )
+            and any(
+                item.platform_id == "team_demo"
+                for item in exit_plugins
+            ),
+        )
+        conflicting = scaffold_extension("team.binding", d)
+        conflicting.manifest["provides"]["provider_bindings"] = {
+            "probe": "other_provider"
+        }
+        (conflicting.root / "manifest.json").write_text(
+            __import__("json").dumps(conflicting.manifest),
+            encoding="utf-8",
+        )
+        conflict_actions = ActionCatalog()
+        conflict_recipes = RecipeCatalog(conflict_actions)
+        _, conflict_bindings, conflict_issues = load_installed_application(
+            d, conflict_actions, conflict_recipes
+        )
+        check(
+            "扩展: 冲突 Provider binding 被移除且不阻断无关装配",
+            conflict_bindings[Capability.PROBE] == ""
+            and conflict_recipes.get("team.oncall.agent") is not None
+            and any(
+                "conflicting provider binding" in issue.message
+                for issue in conflict_issues
+            ),
         )
 
 
@@ -536,6 +1000,91 @@ def test_extension_auto_loads_into_plan() -> None:
             "扩展: 安装目录被 plan 自动加载并命中",
             hit is not None and hit.flow_id == "team.oncall.example",
         )
+
+
+def test_cli_explicit_provider_ignores_other_bindings() -> None:
+    import json as _json
+    import os as _os
+    from cli import _runtime, cmd_resume, cmd_run
+    from kernel import scaffold_extension
+
+    with tempfile.TemporaryDirectory() as d:
+        for name, platform_id, capability in (
+            ("team.selected", "selected", "probe"),
+            ("team.other", "other", "logs"),
+        ):
+            ext = scaffold_extension(name, d)
+            manifest_path = ext.root / "manifest.json"
+            manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["provides"]["plugin"] = "plugin.py"
+            manifest["provides"]["provider_bindings"] = {
+                capability: platform_id
+            }
+            manifest_path.write_text(
+                _json.dumps(manifest), encoding="utf-8"
+            )
+            (ext.root / "plugin.py").write_text(
+                "from kernel import Capability, CapabilityResult, CapabilityStatus\n"
+                "class Demo:\n"
+                f" platform_id='{platform_id}'\n"
+                f" def capabilities(self): return [Capability.{capability.upper()}]\n"
+                " def invoke(self, capability, **kwargs):\n"
+                "  return CapabilityResult(self.platform_id, capability.value, CapabilityStatus.SUCCESS, 'ok')\n"
+                "def create_plugin(config): return Demo()\n",
+                encoding="utf-8",
+            )
+        missing = scaffold_extension("team.missing", d)
+        missing.manifest["provides"]["provider_bindings"] = {
+            "screenshot": "missing_provider"
+        }
+        (missing.root / "manifest.json").write_text(
+            _json.dumps(missing.manifest), encoding="utf-8"
+        )
+        old_extensions = _os.environ.get("ILOOP_EXTENSIONS_DIR")
+        old_data = _os.environ.get("ILOOP_DATA_DIR")
+        _os.environ["ILOOP_EXTENSIONS_DIR"] = d
+        _os.environ["ILOOP_DATA_DIR"] = str(Path(d) / "data")
+        try:
+            runtime = _runtime(False, {"platform": "selected"})
+            routed = runtime.providers.resolve(Capability.PROBE)
+            check(
+                "M2: 显式 Provider 不应用其他扩展的 binding",
+                routed is not None and routed.platform_id == "selected",
+            )
+            default_runtime = _runtime(False, {})
+            missing_binding_blocked = False
+            try:
+                default_runtime.providers.resolve(Capability.SCREENSHOT)
+            except ValueError as error:
+                missing_binding_blocked = "blocked" in str(error)
+            check(
+                "M2: 缺失 Provider binding 只阻塞相关能力",
+                missing_binding_blocked
+                and default_runtime.providers.resolve(Capability.PROBE)
+                .platform_id == "selected",
+            )
+            run_status = cmd_run(
+                "回归",
+                False,
+                {"platform": "selected", "caps": "probe"},
+            )
+            task = TaskStore(Path(d) / "data").list()[0]
+            resume_status = cmd_resume(task.id, False, {})
+            check(
+                "M2: 显式 Provider 选择随 Task 持久化恢复",
+                run_status == 0
+                and resume_status == 0
+                and task.execution_context["platform"] == "selected",
+            )
+        finally:
+            if old_extensions is None:
+                _os.environ.pop("ILOOP_EXTENSIONS_DIR", None)
+            else:
+                _os.environ["ILOOP_EXTENSIONS_DIR"] = old_extensions
+            if old_data is None:
+                _os.environ.pop("ILOOP_DATA_DIR", None)
+            else:
+                _os.environ["ILOOP_DATA_DIR"] = old_data
 
 
 def test_redline_guards() -> None:
@@ -841,6 +1390,1493 @@ def test_runtime_task_resume_and_evidence() -> None:
         migrated = runtime.load(task.id)
         check("断点: 旧 Task 缺新增路径字段时自动迁移",
               migrated.global_review_path.endswith("global-review.json"))
+
+
+def test_action_recipe_assembly_and_task_binding() -> None:
+    from kernel import CapabilityResult, Runtime, TaskStatus
+
+    actions = ActionCatalog()
+    state = {"route_calls": 0, "observe_calls": 0}
+    actions.register(
+        ActionSpec(
+            action_id="diagnosis.route",
+            description="Route a symptom to a diagnosis",
+            inputs={"symptom": "string"},
+            outputs={"route": "string"},
+            required_capabilities=(Capability.LOGS,),
+        ),
+        lambda payload: {
+            "route": "runtime" if payload["symptom"] else "unknown",
+            "calls": state.__setitem__(
+                "route_calls", state["route_calls"] + 1
+            ),
+        },
+    )
+    actions.register(
+        ActionSpec(
+            action_id="stability.observe",
+            description="Observe a resolved case",
+            risk=ActionRisk.MEDIUM,
+            side_effects=(ActionSideEffect.READ,),
+            outputs={"status": "string"},
+            required_capabilities=(Capability.CRASH,),
+        ),
+        lambda payload: {
+            "status": "stable",
+            "calls": state.__setitem__(
+                "observe_calls", state["observe_calls"] + 1
+            ),
+        },
+    )
+    recipes = RecipeCatalog(actions)
+    recipes.register(AssistantRecipe(
+        assistant_id="example.oncall",
+        actions=("diagnosis.route",),
+        ingress=("event",),
+    ))
+    recipes.register(AssistantRecipe(
+        assistant_id="example.stability",
+        actions=("diagnosis.route", "stability.observe"),
+        ingress=("schedule",),
+        continuous_observation=True,
+        action_risks={"stability.observe": ActionRisk.MEDIUM},
+    ))
+    actions.register(
+        ActionSpec(
+            action_id="example.high_risk",
+            description="High-risk read action",
+            risk=ActionRisk.HIGH,
+            side_effects=(ActionSideEffect.READ,),
+            required_capabilities=(Capability.LOGS,),
+        ),
+        lambda payload: {},
+    )
+    recipes.register(AssistantRecipe(
+        assistant_id="example.high_risk",
+        actions=("example.high_risk",),
+    ))
+    actions.register(
+        ActionSpec(
+            action_id="example.write_action",
+            description="Write action",
+            side_effects=(ActionSideEffect.WORKSPACE_WRITE,),
+        ),
+        lambda payload: {},
+    )
+    recipes.register(AssistantRecipe(
+        assistant_id="example.writer",
+        actions=("example.write_action",),
+    ))
+    actions.register(
+        ActionSpec(
+            action_id="example.pure_action",
+            description="Pure action",
+            outputs={"value": "string"},
+        ),
+        lambda payload: {"value": "ok"},
+    )
+    recipes.register(AssistantRecipe(
+        assistant_id="example.pure",
+        actions=("example.pure_action",),
+    ))
+    oncall = recipes.assemble("example.oncall")
+    stability = recipes.assemble("example.stability")
+    check(
+        "M1: 两个助手装配出不同动作与 Driver 能力集",
+        [item.action_id for item in oncall.actions] == ["diagnosis.route"]
+        and {item.action_id for item in stability.actions}
+        == {"diagnosis.route", "stability.observe"}
+        and oncall.required_capabilities == (Capability.LOGS,)
+        and set(stability.required_capabilities)
+        == {Capability.LOGS, Capability.CRASH},
+    )
+    result_one = recipes.execute(
+        "example.oncall", "diagnosis.route", {"symptom": "timeout"}
+    )
+    result_two = recipes.execute(
+        "example.stability", "stability.observe", {}
+    )
+    check(
+        "M1: 助手动作独立执行且结果绑定所属助手",
+        result_one.assistant_id == "example.oncall"
+        and result_two.assistant_id == "example.stability"
+        and state == {"route_calls": 1, "observe_calls": 1},
+    )
+
+    unknown_rejected = duplicate_rejected = risk_rejected = False
+    try:
+        recipes.register(AssistantRecipe(
+            assistant_id="example.unknown",
+            actions=("missing.action",),
+        ))
+    except KeyError:
+        unknown_rejected = True
+    try:
+        AssistantRecipe(
+            assistant_id="example.duplicate",
+            actions=("diagnosis.route", "diagnosis.route"),
+        )
+    except ValueError:
+        duplicate_rejected = True
+    try:
+        recipes.register(AssistantRecipe(
+            assistant_id="example.risk",
+            actions=("diagnosis.route",),
+            action_risks={"diagnosis.route": ActionRisk.HIGH},
+        ))
+    except ValueError:
+        risk_rejected = True
+    check(
+        "M1: unknown/duplicate/risk mismatch 装配均 fail closed",
+        unknown_rejected and duplicate_rejected and risk_rejected,
+    )
+    invalid_handler_rejected = False
+    try:
+        actions.register(
+            ActionSpec(
+                action_id="example.invalid_handler",
+                description="Invalid handler fixture",
+            ),
+            "not-callable",
+        )
+    except TypeError:
+        invalid_handler_rejected = True
+    check("M1: 非 callable action handler 在注册时拒绝",
+          invalid_handler_rejected)
+
+    class FakePlugin:
+        platform_id = "fake"
+        def capabilities(self):
+            return list(Capability)
+        def invoke(self, capability, **kwargs):
+            return CapabilityResult(
+                "fake", capability.value, CapabilityStatus.SUCCESS, "ok"
+            )
+
+    with tempfile.TemporaryDirectory() as d:
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        runtime = Runtime(
+            d,
+            registry,
+            FakePlugin(),
+            recipe_catalog=recipes,
+        )
+        l1_write_rejected = high_identity_rejected = False
+        try:
+            runtime.start(
+                "验证助手任务",
+                assistant_id="example.writer",
+            )
+        except ValueError:
+            l1_write_rejected = True
+        try:
+            runtime.start(
+                "验证助手任务",
+                assistant_id="example.high_risk",
+            )
+        except ValueError:
+            high_identity_rejected = True
+        high_task = runtime.start(
+            "验证助手任务",
+            assistant_id="example.high_risk",
+            executor_id="main-agent",
+        )
+        check(
+            "M1: Action 风险和副作用接入自治与独立验收 Gate",
+            l1_write_rejected
+            and high_identity_rejected
+            and high_task.independent_acceptance_required,
+        )
+        task = runtime.start(
+            "验证助手任务",
+            assistant_id="example.oncall",
+        )
+        raw_path = runtime.tasks.path_for(task.id)
+        raw = __import__("json").loads(raw_path.read_text(encoding="utf-8"))
+        raw["assistant_id"] = "example.stability"
+        raw_path.write_text(__import__("json").dumps(raw), encoding="utf-8")
+        restored = runtime.load(task.id)
+        policy = __import__("json").loads(
+            runtime._task_policy_path(task.id).read_text(encoding="utf-8")
+        )
+        card = runtime.tasks.resume_card(restored)
+        check(
+            "M1: Task assistant_id 由 policy 冻结并随 resume 恢复",
+            restored.assistant_id == "example.oncall"
+            and policy["assistant_id"] == "example.oncall"
+            and card["assistant_id"] == "example.oncall"
+            and policy["assistant_recipe_digest"]
+            == card["assistant_recipe_digest"]
+            == oncall.fingerprint(),
+        )
+        restored = runtime.execute_assistant(
+            restored, {"symptom": "timeout"}
+        )
+        action_result = __import__("json").loads(
+            runtime._action_result_path(
+                restored.id, "diagnosis.route"
+            ).read_text(encoding="utf-8")
+        )
+        check(
+            "M1: Runtime 按 Recipe 顺序执行 Action 并持久化输出",
+            [step.action_id for step in restored.steps]
+            == ["diagnosis.route"]
+            and restored.steps[0].status.value == "done"
+            and action_result["outputs"]["route"] == "runtime",
+        )
+        _, lifecycle_blockers = runtime.can_wrapup(restored)
+        outside_capability_rejected = False
+        try:
+            runtime.execute_capabilities(restored, ["build"])
+        except ValueError:
+            outside_capability_rejected = True
+        check(
+            "M1: 助手 Task 未完成处置和验证时不能收口",
+            "assistant case disposition is not completed"
+            in lifecycle_blockers
+            and "assistant case verification has not passed with valid evidence"
+            in lifecycle_blockers,
+        )
+        check(
+            "M1: 助手不能执行 Recipe 未声明的 Driver Capability",
+            outside_capability_rejected,
+        )
+        class OtherPlugin(FakePlugin):
+            platform_id = "other"
+            def invoke(self, capability, **kwargs):
+                return CapabilityResult(
+                    "other",
+                    capability.value,
+                    CapabilityStatus.SUCCESS,
+                    "ok",
+                )
+
+        rebound_runtime = Runtime(
+            d,
+            registry,
+            OtherPlugin(),
+            recipe_catalog=recipes,
+        )
+        rebound_raw = __import__("json").loads(
+            raw_path.read_text(encoding="utf-8")
+        )
+        rebound_raw["assistant_provider_bindings"] = {}
+        raw_path.write_text(
+            __import__("json").dumps(rebound_raw), encoding="utf-8"
+        )
+        provider_rebind_rejected = False
+        try:
+            rebound_runtime.load(task.id)
+        except ValueError:
+            provider_rebind_rejected = True
+        check(
+            "M1: 旧 Task 恢复时拒绝切换 Provider 绑定",
+            provider_rebind_rejected,
+        )
+
+        changed_actions = ActionCatalog()
+        changed_actions.register(
+            ActionSpec(
+                action_id="diagnosis.route",
+                description="Changed contract",
+                required_capabilities=(Capability.LOGS,),
+            ),
+            lambda payload: {},
+        )
+        changed_recipes = RecipeCatalog(changed_actions)
+        changed_recipes.register(AssistantRecipe(
+            assistant_id="example.oncall",
+            actions=("diagnosis.route",),
+            version="2",
+        ))
+        changed_runtime = Runtime(
+            d,
+            registry,
+            FakePlugin(),
+            recipe_catalog=changed_recipes,
+        )
+        recipe_upgrade_rejected = False
+        try:
+            changed_runtime.load(task.id)
+        except ValueError:
+            recipe_upgrade_rejected = True
+        check(
+            "M1: 旧 Task 恢复时拒绝静默切换新版 Recipe",
+            recipe_upgrade_rejected,
+        )
+        from kernel import HostTrustStore
+        trust = HostTrustStore(Path(d) / "trust")
+        managed = Runtime(
+            Path(d) / "managed",
+            registry,
+            FakePlugin(),
+            recipe_catalog=recipes,
+            attestation_recorder=trust.attest,
+            attestation_verifier=trust.verify,
+        )
+        managed_task = managed.start(
+            "验证助手任务",
+            assistant_id="example.oncall",
+        )
+        managed_task = managed.execute_assistant(
+            managed_task, {"symptom": "timeout"}
+        )
+        policy_task = managed.start(
+            "验证助手任务",
+            assistant_id="example.oncall",
+        )
+        policy_path = managed._task_policy_path(policy_task.id)
+        policy_row = __import__("json").loads(
+            policy_path.read_text(encoding="utf-8")
+        )
+        policy_row["assistant_id"] = "example.writer"
+        policy_row["assistant_recipe_digest"] = recipes.assemble(
+            "example.writer"
+        ).fingerprint()
+        policy_path.write_text(
+            __import__("json").dumps(policy_row), encoding="utf-8"
+        )
+        tampered_policy_rejected = False
+        try:
+            managed.load(policy_task.id)
+        except ValueError:
+            tampered_policy_rejected = True
+        check(
+            "M1: 执行前拒绝未验签 Task policy 重绑定助手",
+            tampered_policy_rejected,
+        )
+        result_path = managed._action_result_path(
+            managed_task.id, "diagnosis.route"
+        )
+        result_row = __import__("json").loads(
+            result_path.read_text(encoding="utf-8")
+        )
+        result_row["outputs"]["route"] = "tampered"
+        result_path.write_text(
+            __import__("json").dumps(result_row), encoding="utf-8"
+        )
+        _, tampered_wrapup_blockers = managed.can_wrapup(managed_task)
+        tampered_output_rejected = False
+        try:
+            managed.execute_assistant(managed_task, {"symptom": "timeout"})
+        except ValueError:
+            tampered_output_rejected = True
+        check(
+            "M1: 恢复时拒绝 Task 外部篡改的 Action 输出",
+            tampered_output_rejected
+            and any(
+                "action result is not host attested" in blocker
+                for blocker in tampered_wrapup_blockers
+            ),
+        )
+        pure_task = managed.start(
+            "验证助手任务",
+            assistant_id="example.pure",
+        )
+        pure_task = managed.execute_assistant(pure_task)
+        check(
+            "M1: 无 Driver Capability 的 Action 仍产出签名机器证据",
+            pure_task.steps[0].status.value == "done"
+            and bool(pure_task.steps[0].evidence_ids),
+        )
+
+        side_effect_count = {"value": 0}
+        def interrupted_write(payload):
+            side_effect_count["value"] += 1
+            raise KeyboardInterrupt()
+
+        side_actions = ActionCatalog()
+        side_actions.register(
+            ActionSpec(
+                action_id="example.external_write",
+                description="External write",
+                side_effects=(ActionSideEffect.EXTERNAL_WRITE,),
+            ),
+            interrupted_write,
+        )
+        side_recipes = RecipeCatalog(side_actions)
+        side_recipes.register(AssistantRecipe(
+            assistant_id="example.side_effect",
+            actions=("example.external_write",),
+        ))
+        side_runtime = Runtime(
+            Path(d) / "side-effect",
+            registry,
+            FakePlugin(),
+            project_root=ROOT,
+            recipe_catalog=side_recipes,
+            attestation_recorder=trust.attest,
+            attestation_verifier=trust.verify,
+        )
+        side_task = side_runtime.start(
+            "实现功能",
+            assistant_id="example.side_effect",
+        )
+        try:
+            side_runtime.execute_assistant(side_task)
+        except KeyboardInterrupt:
+            pass
+        side_task = side_runtime.load(side_task.id)
+        side_task = side_runtime.execute_assistant(side_task)
+        check(
+            "M1: Action 中断后不重复执行不确定外部副作用",
+            side_effect_count["value"] == 1
+            and side_task.status == TaskStatus.BLOCKED,
+        )
+        provider_count = {"value": 0}
+        class InterruptedProvider:
+            platform_id = "interrupted"
+            def capabilities(self):
+                return [Capability.PROBE]
+            def invoke(self, capability, **kwargs):
+                provider_count["value"] += 1
+                raise KeyboardInterrupt()
+
+        provider_actions = ActionCatalog()
+        provider_actions.register(
+            ActionSpec(
+                action_id="example.provider_side_effect",
+                description="Provider side effect",
+                side_effects=(ActionSideEffect.EXTERNAL_WRITE,),
+                required_capabilities=(Capability.PROBE,),
+            ),
+            lambda payload: {},
+        )
+        provider_recipes = RecipeCatalog(provider_actions)
+        provider_recipes.register(AssistantRecipe(
+            assistant_id="example.provider_interrupt",
+            actions=("example.provider_side_effect",),
+        ))
+        provider_runtime = Runtime(
+            Path(d) / "provider-interrupt",
+            registry,
+            InterruptedProvider(),
+            project_root=ROOT,
+            recipe_catalog=provider_recipes,
+            attestation_recorder=trust.attest,
+            attestation_verifier=trust.verify,
+        )
+        provider_task = provider_runtime.start(
+            "实现功能",
+            assistant_id="example.provider_interrupt",
+        )
+        try:
+            provider_runtime.execute_assistant(provider_task)
+        except KeyboardInterrupt:
+            pass
+        provider_task = provider_runtime.load(provider_task.id)
+        provider_task = provider_runtime.execute_assistant(provider_task)
+        check(
+            "M1: Provider 中断后 journal 阻止重复副作用",
+            provider_count["value"] == 1
+            and provider_task.status == TaskStatus.BLOCKED,
+        )
+        from concurrent.futures import ThreadPoolExecutor
+        concurrent_count = {"value": 0}
+        concurrent_actions = ActionCatalog()
+        concurrent_actions.register(
+            ActionSpec(
+                action_id="example.concurrent_write",
+                description="Concurrent external write",
+                side_effects=(ActionSideEffect.EXTERNAL_WRITE,),
+            ),
+            lambda payload: {
+                "count": concurrent_count.__setitem__(
+                    "value", concurrent_count["value"] + 1
+                )
+            },
+        )
+        concurrent_recipes = RecipeCatalog(concurrent_actions)
+        concurrent_recipes.register(AssistantRecipe(
+            assistant_id="example.concurrent",
+            actions=("example.concurrent_write",),
+        ))
+        concurrent_runtime = Runtime(
+            Path(d) / "concurrent",
+            registry,
+            FakePlugin(),
+            project_root=ROOT,
+            recipe_catalog=concurrent_recipes,
+            attestation_recorder=trust.attest,
+            attestation_verifier=trust.verify,
+        )
+        concurrent_task = concurrent_runtime.start(
+            "实现功能",
+            assistant_id="example.concurrent",
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(
+                lambda _: concurrent_runtime.execute_assistant(
+                    concurrent_task
+                ),
+                range(2),
+            ))
+        check(
+            "M1: 并发执行同一 Assistant Task 不重复外部副作用",
+            concurrent_count["value"] == 1
+            and all(
+                item.steps[0].status.value == "done"
+                for item in results
+            ),
+        )
+
+
+def test_provider_registry_routes_and_fails_closed() -> None:
+    from kernel import (
+        ActionCatalog, ActionSpec, AssistantRecipe, CapabilityResult,
+        ProviderRegistry, RecipeCatalog, Runtime,
+    )
+
+    class SplitProvider:
+        def __init__(self, platform_id, capabilities):
+            self.platform_id = platform_id
+            self._capabilities = list(capabilities)
+            self.calls = []
+        def capabilities(self):
+            return list(self._capabilities)
+        def invoke(self, capability, **kwargs):
+            self.calls.append(capability.value)
+            return CapabilityResult(
+                self.platform_id,
+                capability.value,
+                CapabilityStatus.SUCCESS,
+                f"{self.platform_id}:{capability.value}",
+            )
+
+    log_provider = SplitProvider("memory_logs", [Capability.LOGS])
+    ui_provider = SplitProvider("memory_ui", [Capability.SCREENSHOT])
+    providers = ProviderRegistry([log_provider, ui_provider])
+    actions = ActionCatalog()
+    actions.register(
+        ActionSpec(
+            action_id="example.collect",
+            description="Collect runtime and UI evidence",
+            required_capabilities=(
+                Capability.LOGS, Capability.SCREENSHOT,
+            ),
+        ),
+        lambda payload: {},
+    )
+    recipes = RecipeCatalog(actions)
+    recipes.register(AssistantRecipe(
+        assistant_id="example.verifier",
+        actions=("example.collect",),
+    ))
+    with tempfile.TemporaryDirectory() as d:
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        runtime = Runtime(
+            d,
+            registry,
+            recipe_catalog=recipes,
+            provider_registry=providers,
+        )
+        task = runtime.start(
+            "验证多 Provider 助手",
+            assistant_id="example.verifier",
+        )
+        task = runtime.execute_assistant(task)
+        evidence = [
+            item for item in runtime.evidence(task.id)
+            if item.capability in {"logs", "screenshot"}
+        ]
+        check(
+            "M2: 一个助手按 Driver Capability 路由两个 Provider",
+            [item.source for item in evidence]
+            == ["memory_logs", "memory_ui"],
+        )
+
+    missing_actions = ActionCatalog()
+    missing_actions.register(ActionSpec(
+        action_id="example.missing",
+        description="Needs an unavailable build provider",
+        required_capabilities=(Capability.BUILD,),
+    ))
+    missing_recipes = RecipeCatalog(missing_actions)
+    missing_recipes.register(AssistantRecipe(
+        assistant_id="example.missing_provider",
+        actions=("example.missing",),
+    ))
+    missing_rejected = False
+    with tempfile.TemporaryDirectory() as d:
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        runtime = Runtime(
+            d,
+            registry,
+            recipe_catalog=missing_recipes,
+            provider_registry=ProviderRegistry([log_provider]),
+        )
+        try:
+            runtime.start(
+                "验证缺失 Provider",
+                assistant_id="example.missing_provider",
+            )
+        except ValueError as error:
+            missing_rejected = "no provider for 'build'" in str(error)
+    check("M2: 缺 Provider 在 Task 创建前 fail closed", missing_rejected)
+
+    ambiguous = ProviderRegistry([
+        SplitProvider("logs_a", [Capability.LOGS]),
+        SplitProvider("logs_b", [Capability.LOGS]),
+    ])
+    ambiguous_rejected = False
+    try:
+        ambiguous.validate_capabilities([Capability.LOGS])
+    except ValueError as error:
+        ambiguous_rejected = "ambiguous provider" in str(error)
+    ambiguous.bind(Capability.LOGS, "logs_b")
+    check(
+        "M2: 重叠能力需显式 binding，绑定后稳定路由",
+        ambiguous_rejected
+        and ambiguous.resolve(Capability.LOGS).platform_id == "logs_b",
+    )
+
+
+def test_runtime_assistant_resolve_lifecycle() -> None:
+    from kernel import (
+        ActionCatalog, ActionSpec, AssistantRecipe, CapabilityResult,
+        DispositionStatus, HostTrustStore, HypothesisStatus, RecipeCatalog, Runtime,
+        TaskStatus,
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        evidence_root = root / "provider-evidence"
+        evidence_root.mkdir()
+
+        class EvidencePlugin:
+            platform_id = "lifecycle"
+            def capabilities(self):
+                return [
+                    Capability.RUN,
+                    Capability.VIEW_TREE,
+                    Capability.LOGS,
+                    Capability.COUNTER_PROBE,
+                ]
+            def invoke(self, capability, **kwargs):
+                target = evidence_root / (
+                    f"{capability.value}-{time.time_ns()}"
+                )
+                target.mkdir()
+                (target / "proof.txt").write_text(
+                    capability.value, encoding="utf-8"
+                )
+                return CapabilityResult(
+                    self.platform_id,
+                    capability.value,
+                    CapabilityStatus.SUCCESS,
+                    f"{capability.value} verified",
+                    str(target),
+                )
+
+        actions = ActionCatalog()
+        actions.register(
+            ActionSpec(
+                action_id="example.diagnose_case",
+                description="Collect all diagnosis gates",
+                required_capabilities=(
+                    Capability.RUN,
+                    Capability.VIEW_TREE,
+                    Capability.LOGS,
+                    Capability.COUNTER_PROBE,
+                ),
+                outputs={"diagnosed": "boolean"},
+            ),
+            lambda payload: {"diagnosed": True},
+        )
+        fix_count = {"value": 0}
+        def apply_fix(payload):
+            fix_count["value"] += 1
+            return {"fixed": True}
+
+        actions.register(
+            ActionSpec(
+                action_id="example.apply_fix",
+                description="Apply the selected fix",
+                disposition_kind="code_change",
+                lifecycle_stage="disposition",
+                outputs={"fixed": "boolean"},
+            ),
+            apply_fix,
+        )
+        actions.register(
+            ActionSpec(
+                action_id="example.verify_fix",
+                description="Verify the selected fix",
+                lifecycle_stage="verification",
+                required_capabilities=(Capability.RUN,),
+                outputs={"verified": "boolean"},
+            ),
+            lambda payload: {"verified": True},
+        )
+        recipes = RecipeCatalog(actions)
+        recipes.register(AssistantRecipe(
+            assistant_id="example.resolve_assistant",
+            actions=(
+                "example.diagnose_case",
+                "example.apply_fix",
+                "example.verify_fix",
+            ),
+        ))
+        registry = FlowRegistry()
+        registry.load_json(ROOT / "workflow" / "flows.json")
+        trust = HostTrustStore(root / "trust")
+        runtime = Runtime(
+            root / "data",
+            registry,
+            EvidencePlugin(),
+            recipe_catalog=recipes,
+            attestation_recorder=trust.attest,
+            attestation_verifier=trust.verify,
+        )
+        task = runtime.start(
+            "验证助手闭环",
+            assistant_id="example.resolve_assistant",
+        )
+        task = runtime.execute_assistant(task)
+        case = Case.load(task.case_path)
+        root_hypothesis = case.add_hypothesis("second hypothesis is root")
+        case.hypotheses["h1"].status = HypothesisStatus.REFUTED
+        resolved, _ = case.try_resolve(
+            lambda path, row: trust.verify("evidence", path, row),
+            {"task_id": task.id, "flow_id": task.flow_id},
+        )
+        plan = case.route_disposition(
+            recipes.assemble(task.assistant_id).disposition_actions()
+        )
+        case.save(task.case_path)
+        task = runtime.execute_assistant(task)
+        case = Case.load(task.case_path)
+        disposition_completed = (
+            case.disposition_progress.get(plan.plan_id)
+            == DispositionStatus.COMPLETED
+        )
+        evidence_by_id = {
+            item.id: item for item in runtime.evidence(task.id)
+        }
+        verification_step = next(
+            step for step in task.steps
+            if step.action_id == "example.verify_fix"
+        )
+        verification_id = next(
+            evidence_id for evidence_id in verification_step.evidence_ids
+            if evidence_by_id[evidence_id].capability == "run"
+        )
+        direct_capability_rejected = False
+        try:
+            runtime.execute_capabilities(task, ["run"])
+        except ValueError:
+            direct_capability_rejected = True
+        case = Case.load(task.case_path)
+        evidence_bound_to_root = (
+            verification_id
+            in case.hypotheses[root_hypothesis.id].evidence_ids
+            and case.diagnosis_status.value == "frozen"
+        )
+        case.record_verification(
+            passed=True,
+            evidence_ids=[verification_id],
+            summary="post-disposition run passed",
+            verify_attestation=lambda path, row: trust.verify(
+                "evidence", path, row
+            ),
+        )
+        case.save(task.case_path)
+        task = runtime.load(task.id)
+        first_can_wrapup, first_blockers = runtime.can_wrapup(task)
+
+        case = Case.load(task.case_path)
+        case.reopen_diagnosis("new evidence requires revision 2")
+        case.save(task.case_path)
+        task = runtime.execute_assistant(task)
+        case = Case.load(task.case_path)
+        resolved_again, _ = case.try_resolve(
+            lambda path, row: trust.verify("evidence", path, row),
+            {"task_id": task.id, "flow_id": task.flow_id},
+        )
+        second_plan = case.route_disposition(
+            recipes.assemble(task.assistant_id).disposition_actions()
+        )
+        case.save(task.case_path)
+        task = runtime.execute_assistant(task)
+        evidence_by_id = {
+            item.id: item for item in runtime.evidence(task.id)
+        }
+        verification_step = next(
+            step for step in task.steps
+            if step.action_id == "example.verify_fix"
+        )
+        second_verification_id = next(
+            evidence_id for evidence_id in verification_step.evidence_ids
+            if evidence_by_id[evidence_id].capability == "run"
+        )
+        case = Case.load(task.case_path)
+        case.record_verification(
+            passed=True,
+            evidence_ids=[second_verification_id],
+            summary="revision 2 verification passed",
+            verify_attestation=lambda path, row: trust.verify(
+                "evidence", path, row
+            ),
+        )
+        case.save(task.case_path)
+        task = runtime.load(task.id)
+        can_wrapup, blockers = runtime.can_wrapup(task)
+        completed = runtime.complete(task)
+        check(
+            "M1-M3: Assistant Runtime 完整生命周期可收口",
+            resolved
+            and disposition_completed
+            and direct_capability_rejected
+            and evidence_bound_to_root
+            and first_can_wrapup
+            and not first_blockers
+            and resolved_again
+            and second_plan.diagnosis_revision == 2
+            and fix_count["value"] == 2
+            and can_wrapup
+            and not blockers
+            and completed.status == TaskStatus.DONE,
+        )
+
+
+def test_deployment_envelope_receipt_and_local_replay() -> None:
+    from dataclasses import replace
+    from kernel import (
+        ActionCatalog, ActionSpec, AssistantRecipe, CapabilityResult,
+        DeploymentAssembly, DeploymentProfile, LocalRecipeWorker,
+        ProviderRegistry, RecipeCatalog,
+        ReplayGuard, TaskEnvelope, WorkerEvidence, WorkerReceipt,
+        assemble_deployment,
+    )
+
+    class NodeProvider:
+        def __init__(self, platform_id, capabilities):
+            self.platform_id = platform_id
+            self._capabilities = list(capabilities)
+            self.calls = []
+        def capabilities(self):
+            return list(self._capabilities)
+        def invoke(self, capability, **kwargs):
+            self.calls.append(capability.value)
+            return CapabilityResult(
+                self.platform_id,
+                capability.value,
+                CapabilityStatus.SUCCESS,
+                f"{self.platform_id}:{capability.value}",
+                metadata={"subjects": [kwargs["task_id"]]},
+            )
+
+    class LyingProvider(NodeProvider):
+        def invoke(self, capability, **kwargs):
+            return CapabilityResult(
+                "forged_source",
+                Capability.BUILD.value,
+                CapabilityStatus.SUCCESS,
+                "forged",
+            )
+
+    actions = ActionCatalog()
+    actions.register(
+        ActionSpec(
+            action_id="example.diagnose",
+            description="Produce a diagnosis",
+            inputs={"symptom": "string"},
+            outputs={"diagnosis": "string"},
+            required_capabilities=(Capability.LOGS,),
+        ),
+        lambda payload: {"diagnosis": f"root:{payload['symptom']}"},
+    )
+    actions.register(
+        ActionSpec(
+            action_id="example.verify",
+            description="Verify the proposed diagnosis",
+            inputs={"diagnosis": "string"},
+            outputs={"verified": "boolean"},
+            required_capabilities=(Capability.SCREENSHOT,),
+        ),
+        lambda payload: {"verified": payload["diagnosis"].startswith("root:")},
+    )
+    recipes = RecipeCatalog(actions)
+    recipe = AssistantRecipe(
+        assistant_id="example.resolve",
+        actions=("example.diagnose", "example.verify"),
+    )
+    recipes.register(recipe)
+    providers = ProviderRegistry([
+        NodeProvider("local_logs", [Capability.LOGS]),
+        NodeProvider("local_ui", [Capability.SCREENSHOT]),
+        NodeProvider("worker_logs", [Capability.LOGS]),
+        NodeProvider("worker_ui", [Capability.SCREENSHOT]),
+    ])
+    local_profile = DeploymentProfile(
+        deployment_id="deploy.local",
+        target_node="mac-local",
+        provider_ids=("local_logs", "local_ui"),
+    )
+    worker_profile = DeploymentProfile(
+        deployment_id="deploy.worker",
+        target_node="worker-1",
+        provider_ids=("worker_logs", "worker_ui"),
+    )
+    local_assembly = assemble_deployment(
+        local_profile, recipes, providers, "example.resolve"
+    )
+    worker_assembly = assemble_deployment(
+        worker_profile, recipes, providers, "example.resolve"
+    )
+    alternate_profile = DeploymentProfile(
+        deployment_id="deploy.local",
+        target_node="mac-local",
+        provider_ids=("local_logs", "local_ui"),
+        features={"mode": "alternate"},
+    )
+    alternate_assembly = assemble_deployment(
+        alternate_profile, recipes, providers, "example.resolve"
+    )
+    disposition_calls = {"value": 0}
+    disposition_actions = ActionCatalog()
+    disposition_actions.register(
+        ActionSpec(
+            action_id="example.remote_fix",
+            description="Remote write fixture",
+            side_effects=(ActionSideEffect.EXTERNAL_WRITE,),
+            disposition_kind="code_change",
+            lifecycle_stage="disposition",
+        ),
+        lambda payload: disposition_calls.__setitem__(
+            "value", disposition_calls["value"] + 1
+        ) or {},
+    )
+    disposition_recipes = RecipeCatalog(disposition_actions)
+    disposition_recipes.register(AssistantRecipe(
+        assistant_id="example.disposition",
+        actions=("example.remote_fix",),
+    ))
+    disposition_assembly = assemble_deployment(
+        local_profile,
+        disposition_recipes,
+        providers,
+        "example.disposition",
+    )
+    frozen_provider_rejected = False
+    try:
+        local_assembly.providers.bind(Capability.LOGS, "local_logs")
+    except ValueError:
+        frozen_provider_rejected = True
+    check(
+        "M4: 同一 Recipe 在两个 Deployment 装配不同 Provider 集",
+        local_assembly.assistant.recipe is recipe
+        and worker_assembly.assistant.recipe is recipe
+        and {
+            item.platform_id for item in local_assembly.providers.providers()
+        } == {"local_logs", "local_ui"}
+        and {
+            item.platform_id for item in worker_assembly.providers.providers()
+        } == {"worker_logs", "worker_ui"}
+        and frozen_provider_rejected,
+    )
+    lying = ProviderRegistry([
+        LyingProvider("honest_id", [Capability.LOGS])
+    ]).invoke(Capability.LOGS)
+    check(
+        "M4: Provider 谎报来源或能力时不能生成成功结果",
+        lying.status == CapabilityStatus.ERROR
+        and lying.platform == "honest_id"
+        and lying.capability == "logs",
+    )
+
+    secret = b"m4-contract-secret-with-32-bytes!!"
+    premature_disposition = TaskEnvelope.issue(
+        task_id="task-premature-disposition",
+        assistant_id="example.disposition",
+        deployment_id="deploy.local",
+        deployment_digest=disposition_assembly.fingerprint(),
+        target_node="mac-local",
+        diagnosis_revision=0,
+        base_commit="abc123",
+        policy={},
+        inputs={},
+        lifecycle_stage="disposition",
+        lifecycle={
+            "diagnosis_status": "investigating",
+            "disposition_plan_id": "",
+            "disposition_action_id": "example.remote_fix",
+            "disposition_status": "pending",
+        },
+        recipe_digest=disposition_assembly.assistant.fingerprint(),
+        execution_plan=("example.remote_fix",),
+        capability_plan=(),
+        evidence_plan=("action:example.remote_fix",),
+        secret=secret,
+    )
+    premature_rejected = False
+    try:
+        LocalRecipeWorker(
+            disposition_assembly,
+            secret=secret,
+            replay_guard=ReplayGuard(),
+            base_commit="abc123",
+        ).execute(premature_disposition)
+    except ValueError:
+        premature_rejected = True
+    check(
+        "M4: diagnosis 未冻结时拒绝 disposition 副作用",
+        premature_rejected and disposition_calls["value"] == 0,
+    )
+    concurrent_envelope = TaskEnvelope.issue(
+        task_id="task-concurrent-disposition",
+        assistant_id="example.disposition",
+        deployment_id="deploy.local",
+        deployment_digest=disposition_assembly.fingerprint(),
+        target_node="mac-local",
+        diagnosis_revision=1,
+        base_commit="abc123",
+        policy={},
+        inputs={},
+        lifecycle_stage="disposition",
+        lifecycle={
+            "diagnosis_status": "frozen",
+            "disposition_plan_id": "plan-concurrent",
+            "disposition_action_id": "example.remote_fix",
+            "disposition_status": "planned",
+        },
+        recipe_digest=disposition_assembly.assistant.fingerprint(),
+        execution_plan=("example.remote_fix",),
+        capability_plan=(),
+        evidence_plan=("action:example.remote_fix",),
+        secret=secret,
+    )
+
+    class SlowContainsSet(set):
+        def __contains__(self, item):
+            time.sleep(0.05)
+            return super().__contains__(item)
+
+    concurrent_guard = ReplayGuard()
+    concurrent_guard._consumed = SlowContainsSet()
+    concurrent_worker = LocalRecipeWorker(
+        disposition_assembly,
+        secret=secret,
+        replay_guard=concurrent_guard,
+        base_commit="abc123",
+    )
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    start = Barrier(2)
+
+    def execute_once():
+        start.wait()
+        try:
+            concurrent_worker.execute(concurrent_envelope)
+            return "success"
+        except ValueError as error:
+            return "replay" if "replay" in str(error) else str(error)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: execute_once(), range(2)))
+    check(
+        "M4: 并发消费同一 Envelope 仅执行一次外部副作用",
+        sorted(outcomes) == ["replay", "success"]
+        and disposition_calls["value"] == 1,
+    )
+    envelope = TaskEnvelope.issue(
+        task_id="task-m4",
+        assistant_id="example.resolve",
+        deployment_id="deploy.local",
+        deployment_digest=local_assembly.fingerprint(),
+        target_node="mac-local",
+        diagnosis_revision=3,
+        base_commit="abc123",
+        policy={"goal": "resolve timeout", "constraints": ["read-only logs"]},
+        inputs={"symptom": "timeout"},
+        lifecycle_stage="diagnosis",
+        lifecycle={"diagnosis_status": "investigating"},
+        recipe_digest=local_assembly.assistant.fingerprint(),
+        execution_plan=local_assembly.assistant.recipe.actions,
+        capability_plan=local_assembly.assistant.driver_plan(),
+        evidence_plan=local_assembly.assistant.evidence_plan(),
+        secret=secret,
+        ttl_seconds=300,
+    )
+    envelope = TaskEnvelope.from_dict(envelope.to_dict())
+    wrong_plan_envelope = TaskEnvelope.issue(
+        task_id="task-wrong-plan",
+        assistant_id="example.resolve",
+        deployment_id="deploy.local",
+        deployment_digest=local_assembly.fingerprint(),
+        target_node="mac-local",
+        diagnosis_revision=3,
+        base_commit="abc123",
+        policy={},
+        inputs={"symptom": "timeout"},
+        lifecycle_stage="diagnosis",
+        lifecycle={"diagnosis_status": "investigating"},
+        recipe_digest=local_assembly.assistant.fingerprint(),
+        execution_plan=local_assembly.assistant.recipe.actions,
+        capability_plan=local_assembly.assistant.driver_plan(),
+        evidence_plan=tuple(reversed(
+            local_assembly.assistant.evidence_plan()
+        )),
+        secret=secret,
+    )
+    calls_before = len(providers.get("local_logs").calls)
+    wrong_plan_rejected = False
+    try:
+        LocalRecipeWorker(
+            local_assembly,
+            secret=secret,
+            replay_guard=ReplayGuard(),
+            base_commit="abc123",
+        ).execute(wrong_plan_envelope)
+    except ValueError:
+        wrong_plan_rejected = True
+    check(
+        "M4: 错误 evidence plan 在 Provider 执行前拒绝",
+        wrong_plan_rejected
+        and len(providers.get("local_logs").calls) == calls_before,
+    )
+    with tempfile.TemporaryDirectory() as d:
+        worker = LocalRecipeWorker(
+            local_assembly,
+            secret=secret,
+            replay_guard=ReplayGuard(str(Path(d) / "replay.json")),
+            base_commit="abc123",
+        )
+        receipt = worker.execute(envelope)
+        receipt = WorkerReceipt.from_dict(receipt.to_dict())
+        receipt.verify(envelope, secret, target_node="mac-local")
+        replay_rejected = False
+        try:
+            worker.execute(envelope)
+        except ValueError as error:
+            replay_rejected = "replay" in str(error)
+        lock_named_path = Path(d) / "ledger.lock"
+        lock_named_guard = ReplayGuard(str(lock_named_path))
+        lock_named_guard.consume(envelope)
+        lock_named_replay_rejected = False
+        try:
+            lock_named_guard.consume(envelope)
+        except ValueError as error:
+            lock_named_replay_rejected = "replay" in str(error)
+        check(
+            "M4: 本地 worker 完整回放且任意后缀账本可持久化防重放",
+            receipt.status == "success"
+            and len(receipt.evidence) == 4
+            and [item.evidence_type for item in receipt.evidence]
+            == [
+                "execution_record", "action_result",
+                "execution_record", "action_result",
+            ]
+            and replay_rejected
+            and lock_named_replay_rejected
+            and lock_named_path.is_file()
+            and Path(f"{lock_named_path}.lock").is_file(),
+        )
+
+    tampered_rejected = input_rejected = expired_rejected = False
+    node_rejected = base_rejected = recipe_rejected = False
+    deployment_rejected = False
+    try:
+        replace(envelope, policy={"goal": "tampered"}).verify(
+            secret,
+            target_node="mac-local",
+            base_commit="abc123",
+            deployment_id="deploy.local",
+        )
+    except ValueError:
+        tampered_rejected = True
+    try:
+        replace(envelope, inputs={"symptom": "different"}).verify(
+            secret,
+            target_node="mac-local",
+            base_commit="abc123",
+            deployment_id="deploy.local",
+        )
+    except ValueError:
+        input_rejected = True
+    expired = TaskEnvelope.issue(
+        task_id="task-expired",
+        assistant_id="example.resolve",
+        deployment_id="deploy.local",
+        deployment_digest=local_assembly.fingerprint(),
+        target_node="mac-local",
+        diagnosis_revision=3,
+        base_commit="abc123",
+        policy={},
+        inputs={},
+        lifecycle_stage="diagnosis",
+        lifecycle={"diagnosis_status": "investigating"},
+        recipe_digest=local_assembly.assistant.fingerprint(),
+        execution_plan=local_assembly.assistant.recipe.actions,
+        capability_plan=local_assembly.assistant.driver_plan(),
+        evidence_plan=local_assembly.assistant.evidence_plan(),
+        secret=secret,
+        ttl_seconds=1,
+        now=100,
+    )
+    try:
+        expired.verify(
+            secret,
+            target_node="mac-local",
+            base_commit="abc123",
+            deployment_id="deploy.local",
+            now=102,
+        )
+    except ValueError:
+        expired_rejected = True
+    try:
+        envelope.verify(
+            secret,
+            target_node="other-node",
+            base_commit="abc123",
+            deployment_id="deploy.local",
+        )
+    except ValueError:
+        node_rejected = True
+    try:
+        envelope.verify(
+            secret,
+            target_node="mac-local",
+            base_commit="other",
+            deployment_id="deploy.local",
+        )
+    except ValueError:
+        base_rejected = True
+    try:
+        LocalRecipeWorker(
+            alternate_assembly,
+            secret=secret,
+            replay_guard=ReplayGuard(),
+            base_commit="abc123",
+        ).execute(envelope)
+    except ValueError:
+        deployment_rejected = True
+    altered_actions = ActionCatalog()
+    altered_actions.register(
+        ActionSpec(
+            action_id="example.diagnose",
+            description="Changed after dispatch",
+            inputs={"symptom": "string"},
+            outputs={"diagnosis": "string"},
+            required_capabilities=(Capability.LOGS,),
+        ),
+        lambda payload: {"diagnosis": "changed"},
+    )
+    altered_actions.register(
+        ActionSpec(
+            action_id="example.verify",
+            description="Verify the proposed diagnosis",
+            inputs={"diagnosis": "string"},
+            outputs={"verified": "boolean"},
+            required_capabilities=(Capability.SCREENSHOT,),
+        ),
+        lambda payload: {"verified": True},
+    )
+    altered_recipes = RecipeCatalog(altered_actions)
+    altered_recipes.register(recipe)
+    altered_assembly = assemble_deployment(
+        local_profile, altered_recipes, providers, "example.resolve"
+    )
+    mixed_assembly_rejected = False
+    try:
+        DeploymentAssembly(
+            profile=local_profile,
+            assistant=local_assembly.assistant,
+            providers=local_assembly.providers,
+            recipes=altered_recipes,
+        )
+    except ValueError:
+        mixed_assembly_rejected = True
+    copied_token_rejected = False
+    try:
+        DeploymentAssembly(
+            profile=local_profile,
+            assistant=replace(
+                altered_assembly.assistant,
+                catalog_token=local_assembly.assistant.catalog_token,
+            ),
+            providers=local_assembly.providers,
+            recipes=recipes,
+        )
+    except ValueError:
+        copied_token_rejected = True
+    try:
+        LocalRecipeWorker(
+            altered_assembly,
+            secret=secret,
+            replay_guard=ReplayGuard(),
+            base_commit="abc123",
+        ).execute(envelope)
+    except ValueError:
+        recipe_rejected = True
+    check(
+        "M4: Envelope 输入/Recipe/过期/节点/base 篡改均拒绝",
+        tampered_rejected and input_rejected and expired_rejected
+        and node_rejected and base_rejected and recipe_rejected
+        and deployment_rejected
+        and mixed_assembly_rejected and copied_token_rejected,
+    )
+
+    empty_success_rejected = failed_success_rejected = False
+    incomplete_success_rejected = capability_gap_rejected = False
+    receipt_tamper_rejected = wrong_order_rejected = False
+    try:
+        WorkerReceipt.issue(
+            envelope,
+            target_node="mac-local",
+            status="success",
+            evidence=[],
+            secret=secret,
+        )
+    except ValueError:
+        empty_success_rejected = True
+    failed_evidence = replace(receipt.evidence[0], outcome="failure")
+    try:
+        WorkerReceipt.issue(
+            envelope,
+            target_node="mac-local",
+            status="success",
+            evidence=[failed_evidence, *receipt.evidence[1:]],
+            secret=secret,
+        )
+    except ValueError:
+        failed_success_rejected = True
+    try:
+        WorkerReceipt.issue(
+            envelope,
+            target_node="mac-local",
+            status="success",
+            evidence=receipt.evidence[:-1],
+            secret=secret,
+        )
+    except ValueError:
+        incomplete_success_rejected = True
+    try:
+        WorkerReceipt.issue(
+            envelope,
+            target_node="mac-local",
+            status="success",
+            evidence=[
+                item for item in receipt.evidence
+                if not (
+                    item.evidence_type == "execution_record"
+                    and item.capability == "logs"
+                )
+            ],
+            secret=secret,
+        )
+    except ValueError:
+        capability_gap_rejected = True
+    try:
+        WorkerReceipt.issue(
+            envelope,
+            target_node="mac-local",
+            status="success",
+            evidence=[
+                receipt.evidence[0],
+                receipt.evidence[2],
+                receipt.evidence[1],
+                receipt.evidence[3],
+            ],
+            secret=secret,
+        )
+    except ValueError:
+        wrong_order_rejected = True
+    try:
+        replace(receipt, task_digest="0" * 64).verify(
+            envelope, secret, target_node="mac-local"
+        )
+    except ValueError:
+        receipt_tamper_rejected = True
+    check(
+        "M4: 成功 Receipt 强制类型化证据并绑定完整 Task digest",
+        empty_success_rejected
+        and failed_success_rejected
+        and incomplete_success_rejected
+        and capability_gap_rejected
+        and wrong_order_rejected
+        and receipt_tamper_rejected
+        and receipt.task_digest == envelope.task_digest(),
+    )
+    non_finite_ttl_rejected = False
+    try:
+        TaskEnvelope.issue(
+            task_id="task-nan",
+            assistant_id="example.resolve",
+            deployment_id="deploy.local",
+            deployment_digest=local_assembly.fingerprint(),
+            target_node="mac-local",
+            diagnosis_revision=1,
+            base_commit="abc123",
+            policy={},
+            inputs={"symptom": "timeout"},
+            lifecycle_stage="diagnosis",
+            lifecycle={"diagnosis_status": "investigating"},
+            recipe_digest=local_assembly.assistant.fingerprint(),
+            execution_plan=local_assembly.assistant.recipe.actions,
+            capability_plan=local_assembly.assistant.driver_plan(),
+            evidence_plan=local_assembly.assistant.evidence_plan(),
+            secret=secret,
+            ttl_seconds=float("nan"),
+        )
+    except ValueError:
+        non_finite_ttl_rejected = True
+    with tempfile.TemporaryDirectory() as d:
+        artifact = Path(d) / "observed.log"
+        artifact.write_text("observed", encoding="utf-8")
+        observed_item = WorkerEvidence(
+            evidence_type="observed",
+            capability="logs",
+            source="local_logs",
+            outcome="success",
+            artifact_sha256=__import__("hashlib").sha256(
+                artifact.read_bytes()
+            ).hexdigest(),
+            artifact_path=str(artifact),
+            metadata={"action_id": "example.diagnose"},
+        )
+        observed_receipt = WorkerReceipt.issue(
+            envelope,
+            target_node="mac-local",
+            status="success",
+            evidence=[
+                observed_item,
+                *receipt.evidence[1:],
+            ],
+            secret=secret,
+        )
+        artifact.write_text("changed", encoding="utf-8")
+        changed_artifact_rejected = False
+        try:
+            observed_receipt.verify(
+                envelope, secret, target_node="mac-local"
+            )
+        except ValueError:
+            changed_artifact_rejected = True
+    check(
+        "M4: 非有限 TTL 与变更后的 observed artifact 均拒绝",
+        non_finite_ttl_rejected and changed_artifact_rejected,
+    )
+    untrusted_payload = receipt.to_dict()
+    untrusted_payload["evidence"][0]["evidence_type"] = "observed"
+    untrusted_payload["evidence"][0]["artifact_path"] = (
+        "/definitely/missing/untrusted-artifact"
+    )
+    untrusted_receipt = WorkerReceipt.from_dict(untrusted_payload)
+    signature_checked_first = False
+    try:
+        untrusted_receipt.verify(
+            envelope, secret, target_node="mac-local"
+        )
+    except ValueError as error:
+        signature_checked_first = "signature mismatch" in str(error)
+    check(
+        "M4: Receipt 先验 HMAC 再访问 observed artifact",
+        signature_checked_first,
+    )
 
 
 def test_runtime_logs_follow_successful_run_id() -> None:
@@ -2357,6 +4393,7 @@ def run() -> int:
         test_case_state_machine,
         test_case_needs_unique_survivor,
         test_case_tick_consult_reroute,
+        test_versioned_resolve_case_lifecycle,
         test_score_change_quantified,
         test_ledger_anti_loop,
         test_brand_render,
@@ -2366,6 +4403,7 @@ def run() -> int:
         test_extension_mechanism,
         test_extension_cannot_clobber_core,
         test_extension_auto_loads_into_plan,
+        test_cli_explicit_provider_ignores_other_bindings,
         test_redline_guards,
         test_runner_blocks_dangerous_by_default,
         test_runner_does_not_wait_for_detached_child_output,
@@ -2377,6 +4415,10 @@ def run() -> int:
         test_flow_next_suggest,
         test_case_and_ledger_resume,
         test_runtime_task_resume_and_evidence,
+        test_action_recipe_assembly_and_task_binding,
+        test_provider_registry_routes_and_fails_closed,
+        test_runtime_assistant_resolve_lifecycle,
+        test_deployment_envelope_receipt_and_local_replay,
         test_runtime_logs_follow_successful_run_id,
         test_policy_and_constitution_cannot_be_forged_by_cli_state,
         test_attested_evidence_revalidates_exact_scope,

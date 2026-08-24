@@ -7,7 +7,7 @@
   python3 -m cli resume <task_id> [caps=...] [k=v ...]
   python3 -m cli tasks [--all]              # 可恢复任务与下一步
   python3 -m cli task show|step|complete ...
-  python3 -m cli case show|tick|evidence|gate|resolve <task_id>
+  python3 -m cli case show|tick|evidence|gate|resolve|disposition|advance|verify|observe <task_id>
   python3 -m cli next <task_id>
   python3 -m cli capability require|complete|cancel|status <task_id>
   python3 -m cli global-review prepare|show|record <task_id>
@@ -50,7 +50,8 @@ from kernel import (  # noqa: E402
     AcceptancePackage, AcceptanceStore, Verdict, EvidenceKind, CapabilityGate,
     GlobalReview, ProjectMemory, UIFlowStore, ACTION_CAPABILITY,
     THREE_VERDICT_PROTOCOL, design_contract_filled,
-    load_installed_plugins, HostTrustStore,
+    load_installed_plugins, load_installed_application,
+    ActionCatalog, RecipeCatalog, ProviderRegistry, HostTrustStore,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
 
@@ -89,37 +90,71 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
         data_dir=str(data_dir / "platform"),
         config=kwargs,
     )
-    platform = kwargs.get("platform", "ios_native")
-    if platform != "ios_native":
-        extensions_dir = os.environ.get(
-            "ILOOP_EXTENSIONS_DIR", str(Path.home() / ".iloop" / "extensions")
-        )
-        plugin_issues = []
-        candidates = load_installed_plugins(
-            extensions_dir,
-            kwargs,
-            issues=plugin_issues,
-        )
-        conflicts = [
-            issue.message for issue in plugin_issues
-            if f"platform_id '{platform}'" in issue.message
-        ]
-        if conflicts:
-            raise ValueError("; ".join(conflicts))
-        plugin = next((candidate for candidate in candidates
-                       if candidate.platform_id == platform), None)
-        if plugin is None:
-            details = "; ".join(issue.message for issue in plugin_issues)
-            suffix = f"; load errors: {details}" if details else ""
-            raise ValueError(
-                f"extension platform plugin not found: {platform}{suffix}"
+    extensions_dir = Path(os.environ.get(
+        "ILOOP_EXTENSIONS_DIR", str(Path.home() / ".iloop" / "extensions")
+    )).expanduser()
+    plugin_issues = []
+    candidates = load_installed_plugins(
+        extensions_dir,
+        kwargs,
+        issues=plugin_issues,
+    )
+    platform = kwargs.get("platform", "")
+    if platform:
+        selected = (
+            plugin if platform == "ios_native"
+            else next(
+                (item for item in candidates if item.platform_id == platform),
+                None,
             )
+        )
+        if selected is None:
+            raise ValueError(f"extension platform plugin not found: {platform}")
+        providers = ProviderRegistry([selected])
+    else:
+        providers = ProviderRegistry([plugin])
+        for candidate in candidates:
+            try:
+                providers.register(candidate)
+            except (Exception, SystemExit) as error:
+                plugin_issues.append(type("Issue", (), {
+                    "message": (
+                        f"{candidate.platform_id}: provider registration "
+                        f"failed: {error}"
+                    )
+                })())
+    actions = ActionCatalog()
+    recipes = RecipeCatalog(actions)
+    _, bindings, application_issues = load_installed_application(
+        extensions_dir, actions, recipes, kwargs
+    )
+    requested_assistant = str(kwargs.get("assistant_id", "")).strip()
+    if requested_assistant and application_issues:
+        try:
+            recipes.get(requested_assistant)
+        except KeyError:
+            raise ValueError("; ".join(
+                issue.message for issue in application_issues
+            ))
+    for capability, platform_id in bindings.items():
+        if platform and platform_id != selected.platform_id:
+            continue
+        if not platform_id:
+            providers.block(
+                capability, "conflicting extension provider bindings"
+            )
+            continue
+        try:
+            providers.bind(capability, platform_id)
+        except ValueError as error:
+            providers.block(capability, str(error))
     trust = _host_trust()
     return Runtime(
         data_dir,
         _registry(),
-        plugin,
         project_root=project_root,
+        recipe_catalog=recipes,
+        provider_registry=providers,
         attestation_verifier=trust.verify if trust else None,
         attestation_recorder=trust.attest if trust else None,
     )
@@ -141,6 +176,7 @@ def _print_resume_card(runtime: Runtime, task) -> None:
 def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
     runtime = _runtime(real, kwargs)
     capabilities = _split(kwargs.pop("caps", kwargs.pop("capabilities", "")))
+    assistant_id = kwargs.pop("assistant_id", "")
     executor_id = kwargs.pop("executor_id", "")
     if _host_trust() is not None and not executor_id:
         executor_id = os.environ.get("ILOOP_EXECUTOR_ID", "iloop-managed-host")
@@ -151,25 +187,60 @@ def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
         values = _split(raw)
         if values:
             design_contract[field] = values
+    execution_context = {}
+    if kwargs.get("platform"):
+        execution_context["platform"] = str(kwargs["platform"])
+    if assistant_id:
+        required_inputs = {
+            input_name
+            for spec in runtime.recipe_catalog.assemble(assistant_id).actions
+            for input_name in spec.inputs
+        }
+        execution_context.update({
+            key: str(kwargs[key])
+            for key in required_inputs
+            if key in kwargs
+        })
     task = runtime.start(
         task_text,
         constraints=_split(kwargs.pop("constraints", "")),
         acceptance=_split(kwargs.pop("acceptance", "")),
         capabilities=capabilities,
         executor_id=executor_id,
+        assistant_id=assistant_id,
+        execution_context=execution_context or None,
         design_contract=design_contract or None,
     )
-    if capabilities:
+    if assistant_id:
+        task = runtime.execute_assistant(
+            task, execution_context, **kwargs
+        )
+    elif capabilities:
         task = runtime.execute_capabilities(task, capabilities, **kwargs)
     _print_resume_card(runtime, task)
     return 1 if task.status == TaskStatus.BLOCKED else 0
 
 
 def cmd_resume(task_id: str, real: bool, kwargs: dict) -> int:
+    if not kwargs.get("platform"):
+        stored = TaskStore(
+            _data_dir(kwargs.get("project_root", ""))
+        ).load(task_id)
+        stored_platform = stored.execution_context.get("platform", "")
+        if stored_platform:
+            kwargs["platform"] = stored_platform
     runtime = _runtime(real, kwargs)
     task = runtime.load(task_id)
     capabilities = _split(kwargs.pop("caps", kwargs.pop("capabilities", "")))
-    if capabilities:
+    run_recipe = kwargs.pop("recipe", "").lower() in {"1", "true", "yes"}
+    if task.assistant_id and run_recipe:
+        execution_kwargs = {**kwargs, **task.execution_context}
+        task = runtime.execute_assistant(
+            task,
+            execution_kwargs,
+            **execution_kwargs,
+        )
+    elif capabilities:
         execution_kwargs = {**kwargs, **task.execution_context}
         task = runtime.execute_capabilities(
             task,
@@ -348,6 +419,8 @@ def cmd_case(action: str, task_id: str) -> int:
 
 
 def cmd_case_write(action: str, task_id: str, rest: list[str]) -> int:
+    from kernel import DispositionStatus
+
     runtime = _runtime(False, {})
     task = runtime.load(task_id)
     path = Path(task.case_path)
@@ -427,6 +500,90 @@ def cmd_case_write(action: str, task_id: str, rest: list[str]) -> int:
         case.bind_gate(gate, evidence)
         case.save(path)
         print(render("verify", f"{gate} 已绑定证据 {evidence_id}"))
+        return 0
+    if action == "disposition":
+        available_actions = _split(values.get("actions", ""))
+        if task.assistant_id:
+            available_actions = runtime.recipe_catalog.assemble(
+                task.assistant_id
+            ).disposition_actions()
+        plan = case.route_disposition(
+            available_actions,
+            reason=values.get("reason", ""),
+        )
+        case.save(path)
+        print(json.dumps({
+            "plan_id": plan.plan_id,
+            "diagnosis_revision": plan.diagnosis_revision,
+            "kind": plan.kind.value,
+            "action_id": plan.action_id,
+        }, ensure_ascii=False, indent=2))
+        return 0
+    if action == "advance":
+        if task.assistant_id:
+            print(render(
+                "blocked",
+                "assistant disposition is advanced only by its Recipe action",
+            ))
+            return 1
+        plan_id = values.get("plan", "")
+        status = values.get("status", "")
+        if not plan_id or not status:
+            print("usage: case advance <task_id> plan=<id> "
+                  "status=executing|completed")
+            return 2
+        case.advance_disposition(plan_id, DispositionStatus(status))
+        case.save(path)
+        print(render("verify", f"{plan_id} -> {status}"))
+        return 0
+    if action == "verify":
+        evidence_ids = _split(values.get("evidence", ""))
+        if not evidence_ids:
+            print("usage: case verify <task_id> evidence=<id,...> "
+                  "passed=true|false summary=...")
+            return 2
+        verifier = None
+        if runtime.attestation_verifier is not None:
+            verifier = lambda proof_path, row: runtime.attestation_verifier(
+                "evidence", proof_path, row
+            )
+        record = case.record_verification(
+            passed=values.get("passed", "").lower()
+            in {"1", "true", "yes"},
+            evidence_ids=evidence_ids,
+            summary=values.get("summary", ""),
+            verify_attestation=verifier,
+        )
+        case.save(path)
+        print(json.dumps(record.__dict__, ensure_ascii=False, indent=2))
+        return 0
+    if action == "verify-retry":
+        case.retry_verification(values.get("reason", "retry requested"))
+        case.save(path)
+        print(render("verify", "verification -> pending"))
+        return 0
+    if action == "observe":
+        status = values.get("status", "")
+        verifier = None
+        if runtime.attestation_verifier is not None:
+            verifier = lambda proof_path, row: runtime.attestation_verifier(
+                "evidence", proof_path, row
+            )
+        if status == "start":
+            case.start_observation(verifier)
+        elif status in {"stable", "regression"}:
+            case.finish_observation(
+                stable=status == "stable",
+                evidence_ids=_split(values.get("evidence", "")),
+                reason=values.get("reason", ""),
+                verify_attestation=verifier,
+            )
+        else:
+            print("usage: case observe <task_id> "
+                  "status=start|stable|regression [reason=...]")
+            return 2
+        case.save(path)
+        print(render("verify", f"observation -> {case.observation_status.value}"))
         return 0
     return 2
 
@@ -1090,7 +1247,10 @@ def cmd_extension_init(name: str, base_dir: str) -> int:
     from kernel import scaffold_extension
     ext = scaffold_extension(name, base_dir)
     print(render("connect", f"扩展包已创建: {ext.root}", result="只改此目录，核心整体只读"))
-    print(f"  下一步：编辑 {ext.root}/flows.json（flow_id 须以 {name}. 为前缀），再 extension-validate")
+    print(
+        f"  下一步：编辑 {ext.root}/flows.json、actions.json、recipes.json"
+        f"（ID 须以 {name}. 为前缀），再 extension-validate"
+    )
     return 0
 
 
@@ -1147,9 +1307,13 @@ def main(argv: list[str]) -> int:
         return cmd_task(rest[0], rest[1:])
     if cmd == "case":
         if len(rest) < 2:
-            print("usage: case show|tick|evidence|gate|resolve <task_id>")
+            print("usage: case show|tick|evidence|gate|resolve|disposition|"
+                  "advance|verify|verify-retry|observe <task_id>")
             return 2
-        if rest[0] in ("evidence", "gate"):
+        if rest[0] in (
+            "evidence", "gate", "disposition", "advance", "verify",
+            "verify-retry", "observe",
+        ):
             return cmd_case_write(rest[0], rest[1], rest[2:])
         return cmd_case(rest[0], rest[1])
     if cmd == "next":

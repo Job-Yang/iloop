@@ -75,6 +75,13 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 
 禁止因为当前目录是 iLoop 或用户可能是维护者就默认修改核心。
 
+扩展助手按四层装配：`AssistantRecipe → ActionSpec → Driver Capability → Provider`。
+Recipe 只声明有序动作，不写 deployment 分支；`DeploymentProfile` 只声明节点和
+可用 Provider，不复制 Recipe。多个 Provider 支持同一 Capability 时必须显式绑定。
+跨节点执行必须使用签名 `TaskEnvelope` 和 `WorkerReceipt`，输入、Recipe 指纹、
+动作/能力清单、诊断 revision、Git 基线和 TTL 缺一不可；核心只提供本地
+in-process worker，远端 transport 由宿主或扩展实现。
+
 ## 澄清 gate + 验收标准（所有任务都用，敏捷度不同）
 
 - **模糊先澄清**：目标有歧义/缺关键输入（设备 sim/real、验收口径、接口/PRD）时，先给候选点选澄清，不带歧义开干。
@@ -116,4 +123,4 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 - `prompts/build-and-run.md` — 构建·运行·取证细则
 - `prompts/triage-impact.md` — 影响面·崩溃巡检·升级
 - `prompts/record-wrapup.md` — 记录·沉淀·收口·红线细则
-- `prompts/capability-gate.md` — 权限缺失时的人机接力（通用，飞书等是插件实现）
+- `prompts/capability-gate.md` — 权限缺失时的人机接力（具体企业平台由插件实现）

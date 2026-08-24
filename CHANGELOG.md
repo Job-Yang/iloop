@@ -2,6 +2,41 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与语义化版本。
 
+## [0.3.0] - 2026-08-24
+
+### [breaking-entry] 入口协议
+- 入口新增 Action/Recipe/Provider/Deployment 装配边界；旧宿主会话不会热加载，
+  升级后需重新加载 `AGENT_PROMPT.md`。
+
+### 能力装配
+- 新增应用层 `ActionSpec`、版本化 `AssistantRecipe` 和装配校验；Task 将
+  `assistant_id` 冻结进宿主证明 policy，并在恢复时重新校验 Recipe 与 Provider。
+- 新增 `ProviderRegistry`，按 Driver Capability 路由多个 Provider；缺失、歧义、
+  重复 platform、Provider 谎报来源或能力均 fail closed。
+- 扩展 manifest 支持 actions、recipes、application handlers 和
+  provider bindings；损坏扩展隔离，跨扩展 Action/Recipe 两阶段装配。
+
+### Resolve 生命周期
+- Case 正交记录 diagnosis、disposition、verification、observation；根因按
+  revision 冻结，处置计划不可覆盖并绑定确切 revision。
+- 新候选、冻结根因反证或观察回归会重开诊断，清空旧四关并废止旧处置；
+  旧非版本化 Case 保持可读。
+
+### 部署与执行契约
+- 新增与 Recipe 正交的 `DeploymentProfile`。
+- `TaskEnvelope` 签入 task、assistant、deployment、target node、diagnosis
+  revision、Git 基线、policy、输入、Recipe 指纹、有序动作清单和 TTL。
+- 新增持久化 replay guard 和 `WorkerReceipt`；成功回执必须全成功、按顺序覆盖
+  签名动作清单并绑定完整 Task digest。没有真实产物的 Provider 返回只记为
+  execution record，不冒充 observed evidence。
+- replay guard 的检查与登记保持原子性，并发提交同一 Envelope 只允许一次执行。
+- 本地 in-process worker 已跑通完整两动作链；远端 transport/queue 保持在核心之外。
+
+### 验证
+- selftest 307 条断言：内核 232 + iOS 插件 75。
+- fresh-clone managed-host smoke 通过。
+- 分组代码审查发现的 Case 状态越权、扩展隔离和执行信任边界问题均补反向用例。
+
 ## [0.2.3] - 2026-08-24
 
 ### 方法论（对齐内部收官版 VDD）
@@ -107,7 +142,7 @@
 - 错题本 `LessonBook` 召回与沉淀 + 通用工程种子
 - 记账/外显 `Ledger`（`【iLoop】` 前缀协议 + 反循环闸门 3/6 轮）
 - 提效看板 `Dashboard`（记账渲染成自包含 HTML）
-- 事件源 + 通知接口 `channel`（oncall 通用抽取，飞书/Slack 是插件实现）
+- 事件源 + 通知接口 `channel`（oncall 通用抽取，企业 IM/Slack 是插件实现）
 - 能力 Gate `CapabilityGate`（权限缺失即停，不伪装收口）
 - 红线守卫 `redline`（危险命令拦截 + 禁止污染工程目录）
 - 扩展机制 `extension`（二开硬边界，核心只读，命名空间防覆盖）

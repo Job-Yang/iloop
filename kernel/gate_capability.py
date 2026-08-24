@@ -7,7 +7,7 @@
 动作：require / complete / close
 
 收口/验收前只检查：是否仍有未完成的 required operation。
-具体某个平台（飞书/自建）怎么授权，是插件的事，不进内核。
+具体企业平台怎么授权，是插件的事，不进内核。
 """
 
 from __future__ import annotations

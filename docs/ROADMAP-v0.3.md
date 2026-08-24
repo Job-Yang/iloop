@@ -1,6 +1,6 @@
 # iLoop 开源版 v0.3 Roadmap：从验证闭环内核到能力装配平台
 
-> 状态：草案 · 目标版本 `0.3.x` · 起点 `0.2.3`
+> 状态：M1-M4 已实现并通过发布复核 · 目标版本 `0.3.0` · 起点 `0.2.3`
 >
 > 这份路线图不是新构想，而是 2026-08-22《开源版对照内部 2.0 全局架构复核》结论的落地排期。它只回答一件事：开源版从「单 Runtime 验证闭环内核」走到「用原子应用能力装配多个助手」，该按什么顺序走、每步做到哪算完成、什么留在门外。
 
@@ -19,7 +19,7 @@
 
 所以 v0.3 从审计实施顺序的第二步起步。
 
-## 当前结构缺口（v0.3 要填的）
+## v0.2.3 的结构缺口
 
 1. 没有 Assistant 聚合根，Task 不记录属于哪个助手。
 2. Flow 不声明能力组合，核心 Flow 步骤硬编码在 Runtime，能力靠 CLI `caps=` 临时传入。
@@ -30,9 +30,9 @@
 
 ## 里程碑
 
-四个里程碑严格按依赖顺序推进，每个都能独立发一个 `0.3.x`、独立回归、独立回滚。不追求一次做完。
+四个里程碑按依赖顺序实现并逐段回归，最终合并为 `0.3.0` 发布候选。
 
-### M1 · 应用动作契约 + 助手 Recipe（`0.3.0`）
+### M1 · 应用动作契约 + 助手 Recipe
 
 **要解决**：缺口 1、2、4。让「助手 = 一组应用能力的声明式组合」在开源版第一次成立。
 
@@ -53,7 +53,7 @@
 - selftest 覆盖装配成功、装配 fail closed、Task↔assistant 绑定恢复。
 - 既有 262 断言零回归。
 
-### M2 · Provider 注册表（`0.3.1`）
+### M2 · Provider 注册表
 
 **要解决**：缺口 3。让一个助手能同时组合多个平台 Provider（日志、CI、代码库、设备……），按能力选择实现。
 
@@ -71,7 +71,7 @@
 - 某能力无 Provider 时装配阶段就报缺，而不是运行到一半才失败。
 - 重复 `platform_id` 仍 fail closed（沿用现有约束）。
 
-### M3 · 版本化 Resolve Case 生命周期（`0.3.2`）
+### M3 · 版本化 Resolve Case 生命周期
 
 **要解决**：缺口 5。把 Case 从「诊断假设 + 四关」扩成正交生命周期，并冻结根因版本。
 
@@ -89,7 +89,7 @@
 - 根因翻新后，基于旧 revision 的处置计划被拒。
 - 旧的非版本化 Case 仍可读（向后兼容）。
 
-### M4 · Deployment + Task Envelope + Worker Receipt（`0.3.3`）
+### M4 · Deployment + Task Envelope + Worker Receipt
 
 **要解决**：缺口 6。让「助手定义」与「在哪执行」分离，先本地/进程内跑通，再谈远端。
 
@@ -121,8 +121,8 @@
 - 远端 transport / worker 实现。
 
 **只留内部，不进开源**
-- 飞书、Slardar、TEA、Libra、Meego、Codebase 等平台 Adapter。
-- 抖音仓库选择、白名单、分支、群聊状态位、公司授权策略。
+- 企业内部 IM、监控、实验、项目管理和代码托管平台 Adapter。
+- 内部业务仓库选择、白名单、分支、群聊状态位和公司授权策略。
 - 内部节点身份、发布平台、运行账号配置。
 
 ## 风险与约束
@@ -131,3 +131,11 @@
 - **每个里程碑都要真跑通再进下一个**：M4 的远端执行必须等 M1–M3 的本地 Recipe 主链真实跑通，别先做远端队列。
 - **不破坏已有硬约束**：宿主 attestation 分权、fingerprint 失效、四关、逐条验收、iOS 插件行为在 v0.3 全程保持不变；每个里程碑收口都跑全量 selftest + fresh-clone smoke + 独立验收。
 - **设计契约先行**：每个里程碑本身就是一次大改动，开工前用 `design_contract` 钉死该里程碑的核心目标和不改边界，按三裁决评审，避免路线图自己跑偏。
+
+## 实现结果
+
+- M1：应用 Action 与 Driver Capability 分层；Recipe 成为 Runtime 的唯一助手编排源，生命周期阶段、风险/副作用 Gate 和 Task 装配指纹已接入。
+- M2：Runtime 支持多 Provider 路由；缺失、重叠和返回身份不一致均 fail closed；扩展支持 Action/Recipe/handler/provider binding。
+- M3：Case 已具备版本化 diagnosis、不可覆盖处置计划、verification 和 observation 状态机；重开后旧四关与旧计划失效。
+- M4：Deployment 与 Recipe 正交；Envelope 签入输入、Recipe/Deployment 指纹和有序 Action/Capability/Evidence 清单；本地 worker 跑通完整多动作链，Receipt 逐项核对成功证据并持久化防重放。
+- 保持边界：没有把内部业务枚举、SQLite 影子层、远端队列、节点身份或企业平台 Adapter 搬入核心。

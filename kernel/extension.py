@@ -12,15 +12,22 @@ import json
 import importlib.util
 import re
 import warnings
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from .flow import Flow, FlowRegistry
-from .capability import Plugin
+from .capability import Capability, Plugin
+from .action import (
+    ActionCatalog, ActionRisk, ActionSideEffect, ActionSpec,
+)
+from .recipe import AssistantRecipe, RecipeCatalog
 
 MANIFEST_NAME = "manifest.json"
 FLOWS_NAME = "flows.json"
+ACTIONS_NAME = "actions.json"
+RECIPES_NAME = "recipes.json"
 
 
 @dataclass
@@ -48,10 +55,17 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "name": name,
-        "version": "0.2.3",
-        "iloop_kernel": ">=0.2.3",
+        "version": "0.3.0",
+        "iloop_kernel": ">=0.3.0",
         "description": f"{name} iLoop extension",
-        "provides": {"flows": FLOWS_NAME, "plugin": None},
+        "provides": {
+            "flows": FLOWS_NAME,
+            "actions": ACTIONS_NAME,
+            "recipes": RECIPES_NAME,
+            "plugin": None,
+            "application": None,
+            "provider_bindings": {},
+        },
     }
     (root / MANIFEST_NAME).write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     # flow 必须带命名空间前缀，防覆盖核心
@@ -66,6 +80,8 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
         "evidence_strategy": "按你的领域定",
         "escalate_when": "命中你定义的卡口"
     }], ensure_ascii=False, indent=2), encoding="utf-8")
+    (root / ACTIONS_NAME).write_text("[]\n", encoding="utf-8")
+    (root / RECIPES_NAME).write_text("[]\n", encoding="utf-8")
     return Extension(name=name, root=root, manifest=manifest)
 
 
@@ -84,7 +100,8 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
         issues.append(ValidationIssue("error", f"扩展名非法: {ext.name}"))
 
     provides = ext.manifest.get("provides", {})
-    if not isinstance(provides, dict):
+    provides_valid = isinstance(provides, dict)
+    if not provides_valid:
         issues.append(ValidationIssue("error", "manifest.provides must be an object"))
         provides = {}
     requirement = str(ext.manifest.get("iloop_kernel", "")).strip()
@@ -132,14 +149,412 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
                 issues.append(ValidationIssue(
                     "error", f"flow '{fid}' schema invalid: {error}"
                 ))
-    plugin_path = provides.get("plugin")
-    if plugin_path:
-        candidate = (ext.root / plugin_path).resolve()
+    for code_key in ("plugin", "application"):
+        code_path = provides.get(code_key)
+        if not code_path:
+            continue
+        candidate = (ext.root / code_path).resolve()
         if ext.root.resolve() not in candidate.parents:
-            issues.append(ValidationIssue("error", "plugin path escapes extension root"))
+            issues.append(ValidationIssue(
+                "error", f"{code_key} path escapes extension root"
+            ))
         elif not candidate.is_file() or candidate.suffix != ".py":
-            issues.append(ValidationIssue("error", f"plugin file missing or not Python: {plugin_path}"))
+            issues.append(ValidationIssue(
+                "error",
+                f"{code_key} file missing or not Python: {code_path}",
+            ))
+    bindings = provides.get("provider_bindings", {})
+    if not isinstance(bindings, dict):
+        issues.append(ValidationIssue(
+            "error", "manifest.provides.provider_bindings must be an object"
+        ))
+    else:
+        for capability, platform_id in bindings.items():
+            try:
+                Capability(capability)
+            except ValueError:
+                issues.append(ValidationIssue(
+                    "error", f"unknown provider binding capability: {capability}"
+                ))
+            if not str(platform_id).strip():
+                issues.append(ValidationIssue(
+                    "error", f"provider binding '{capability}' has empty platform_id"
+                ))
+    for key in ("actions", "recipes"):
+        relative = provides.get(key)
+        if not relative:
+            continue
+        candidate = (ext.root / str(relative)).resolve()
+        if ext.root.resolve() not in candidate.parents:
+            issues.append(ValidationIssue("error", f"{key} path escapes extension root"))
+        elif not candidate.is_file() or candidate.suffix != ".json":
+            issues.append(ValidationIssue(
+                "error", f"{key} file missing or not JSON: {relative}"
+            ))
+    paths_valid = not any(
+        issue.level == "error"
+        and ("path escapes" in issue.message or "file missing" in issue.message)
+        for issue in issues
+    )
+    if paths_valid and provides_valid:
+        try:
+            _parse_application_contribution(ext)
+        except (
+            TypeError, ValueError, KeyError, OSError, json.JSONDecodeError,
+        ) as error:
+            issues.append(ValidationIssue(
+                "error", f"application contribution invalid: {error}"
+            ))
     return issues
+
+
+def _json_array(path: Path) -> list:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise TypeError(f"{path.name} must contain an array")
+    return payload
+
+
+def _parse_application_contribution(
+    ext: Extension,
+) -> Tuple[List[ActionSpec], List[AssistantRecipe]]:
+    provides = ext.manifest.get("provides", {})
+    action_rows = (
+        _json_array(ext.root / provides["actions"])
+        if provides.get("actions")
+        else []
+    )
+    recipe_rows = (
+        _json_array(ext.root / provides["recipes"])
+        if provides.get("recipes")
+        else []
+    )
+    actions = []
+    seen_actions = set()
+    for row in action_rows:
+        if not isinstance(row, dict):
+            raise TypeError("each action must be an object")
+        spec = ActionSpec(
+            action_id=str(row["action_id"]),
+            description=str(row["description"]),
+            risk=ActionRisk(row.get("risk", "low")),
+            side_effects=tuple(
+                ActionSideEffect(item)
+                for item in row.get("side_effects", ["none"])
+            ),
+            allowed_assistants=tuple(row.get("allowed_assistants", [])),
+            inputs=dict(row.get("inputs", {})),
+            outputs=dict(row.get("outputs", {})),
+            required_capabilities=tuple(
+                Capability(item)
+                for item in row.get("required_capabilities", [])
+            ),
+            disposition_kind=str(row.get("disposition_kind", "")),
+            lifecycle_stage=str(row.get(
+                "lifecycle_stage",
+                "disposition" if row.get("disposition_kind") else "diagnosis",
+            )),
+        )
+        if not spec.action_id.startswith(ext.name + "."):
+            raise ValueError(
+                f"action_id '{spec.action_id}' must start with '{ext.name}.'"
+            )
+        if spec.action_id in seen_actions:
+            raise ValueError(f"duplicate action_id '{spec.action_id}'")
+        seen_actions.add(spec.action_id)
+        actions.append(spec)
+    recipes = []
+    seen_recipes = set()
+    for row in recipe_rows:
+        if not isinstance(row, dict):
+            raise TypeError("each recipe must be an object")
+        recipe = AssistantRecipe(
+            assistant_id=str(row["assistant_id"]),
+            actions=tuple(row["actions"]),
+            version=str(row.get("version", "1")),
+            ingress=tuple(row.get("ingress", [])),
+            continuous_observation=bool(
+                row.get("continuous_observation", False)
+            ),
+            action_risks={
+                str(key): ActionRisk(value)
+                for key, value in row.get("action_risks", {}).items()
+            },
+        )
+        if not recipe.assistant_id.startswith(ext.name + "."):
+            raise ValueError(
+                f"assistant_id '{recipe.assistant_id}' must start with '{ext.name}.'"
+            )
+        if recipe.assistant_id in seen_recipes:
+            raise ValueError(
+                f"duplicate assistant_id '{recipe.assistant_id}'"
+            )
+        seen_recipes.add(recipe.assistant_id)
+        recipes.append(recipe)
+    return actions, recipes
+
+
+def load_extension_application(
+    ext: Extension,
+    actions: ActionCatalog,
+    recipes: RecipeCatalog,
+    config: Optional[dict] = None,
+) -> Tuple[int, int]:
+    """Load namespaced action and recipe declarations after validation."""
+    issues = validate_extension(ext)
+    if has_errors(issues):
+        raise ValueError("; ".join(issue.message for issue in issues))
+    action_specs, assistant_recipes = _parse_application_contribution(ext)
+    handlers = load_extension_action_handlers(ext, config)
+    unknown_handlers = sorted(set(handlers) - {
+        item.action_id for item in action_specs
+    })
+    if unknown_handlers:
+        raise ValueError(
+            "application declares handlers for unknown actions: "
+            + ", ".join(unknown_handlers)
+        )
+    for spec in action_specs:
+        actions.register(spec, handlers.get(spec.action_id))
+    for recipe in assistant_recipes:
+        recipes.register(recipe)
+    return len(action_specs), len(assistant_recipes)
+
+
+def _load_extension_module(ext: Extension, relative: str, role: str):
+    path = (ext.root / relative).resolve()
+    spec = importlib.util.spec_from_file_location(
+        f"iloop_extension_{ext.name.replace('.', '_')}_{role}", path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load extension {role}: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_extension_action_handlers(
+    ext: Extension,
+    config: Optional[dict] = None,
+) -> Dict[str, Callable]:
+    relative = ext.manifest.get("provides", {}).get("application")
+    if not relative:
+        return {}
+    module = _load_extension_module(ext, str(relative), "application")
+    factory = getattr(module, "create_action_handlers", None)
+    if not callable(factory):
+        raise TypeError(
+            f"{relative} must export create_action_handlers(config)"
+        )
+    handlers = factory(config or {})
+    if not isinstance(handlers, Mapping):
+        raise TypeError("create_action_handlers(config) must return a mapping")
+    return {str(key): value for key, value in handlers.items()}
+
+
+def extension_provider_bindings(ext: Extension) -> Dict[Capability, str]:
+    issues = validate_extension(ext)
+    if has_errors(issues):
+        raise ValueError("; ".join(issue.message for issue in issues))
+    rows = ext.manifest.get("provides", {}).get("provider_bindings", {})
+    return {
+        Capability(capability): str(platform_id)
+        for capability, platform_id in rows.items()
+    }
+
+
+def load_installed_application(
+    base_dir: str | Path,
+    actions: ActionCatalog,
+    recipes: RecipeCatalog,
+    config: Optional[dict] = None,
+) -> Tuple[Tuple[int, int], Dict[Capability, str], List[ValidationIssue]]:
+    """Load valid application declarations while isolating broken neighbors."""
+    base = Path(base_dir).expanduser()
+    if not base.exists():
+        return (0, 0), {}, []
+    valid = []
+    issues: List[ValidationIssue] = []
+    for root in sorted(path for path in base.iterdir() if path.is_dir()):
+        if not (root / MANIFEST_NAME).is_file():
+            continue
+        try:
+            ext = load_extension(root)
+            ext_issues = validate_extension(ext)
+        except (Exception, SystemExit) as error:
+            issues.append(ValidationIssue(
+                "error", f"{root.name}: application load failed: {error}"
+            ))
+            continue
+        if has_errors(ext_issues):
+            issues.extend(
+                ValidationIssue(item.level, f"{ext.name}: {item.message}")
+                for item in ext_issues
+            )
+            continue
+        valid.append(ext)
+
+    parsed = [(ext, *_parse_application_contribution(ext)) for ext in valid]
+    usable = []
+    handlers_by_extension = {}
+    for ext, action_specs, assistant_recipes in parsed:
+        try:
+            handlers = load_extension_action_handlers(ext, config)
+        except (Exception, SystemExit) as error:
+            issues.append(ValidationIssue(
+                "error", f"{ext.name}: action handler load failed: {error}"
+            ))
+            continue
+        unknown = sorted(
+            set(handlers) - {item.action_id for item in action_specs}
+        )
+        if unknown:
+            issues.append(ValidationIssue(
+                "error",
+                f"{ext.name}: handlers for unknown actions: "
+                f"{', '.join(unknown)}",
+            ))
+            continue
+        non_callable = sorted(
+            action_id for action_id, handler in handlers.items()
+            if not callable(handler)
+        )
+        if non_callable:
+            issues.append(ValidationIssue(
+                "error",
+                f"{ext.name}: non-callable handlers: "
+                f"{', '.join(non_callable)}",
+            ))
+            continue
+        handlers_by_extension[ext.name] = handlers
+        usable.append((ext, action_specs, assistant_recipes))
+
+    staging_actions = ActionCatalog()
+    for spec in actions.all():
+        staging_actions.register(spec)
+    existing_action_ids = {spec.action_id for spec in actions.all()}
+    action_counts = Counter(
+        spec.action_id
+        for _, action_specs, _ in usable
+        for spec in action_specs
+    )
+    valid_actions = []
+    invalid_extensions = set()
+    for ext, action_specs, _ in usable:
+        duplicates = [
+            spec.action_id for spec in action_specs
+            if (
+                spec.action_id in existing_action_ids
+                or action_counts[spec.action_id] > 1
+            )
+        ]
+        if duplicates:
+            invalid_extensions.add(ext.name)
+            for action_id in duplicates:
+                issues.append(ValidationIssue(
+                    "error", f"{ext.name}: duplicate action_id '{action_id}'"
+                ))
+            continue
+        try:
+            for spec in action_specs:
+                staging_actions.register(spec)
+        except (TypeError, ValueError) as error:
+            issues.append(ValidationIssue(
+                "error", f"{ext.name}: action assembly failed: {error}"
+            ))
+            invalid_extensions.add(ext.name)
+            continue
+        for spec in action_specs:
+            valid_actions.append((ext, spec))
+    existing_recipe_ids = {recipe.assistant_id for recipe in recipes.all()}
+    recipe_counts = Counter(
+        recipe.assistant_id
+        for _, _, assistant_recipes in usable
+        for recipe in assistant_recipes
+    )
+    for ext, _, assistant_recipes in usable:
+        duplicates = [
+            recipe.assistant_id for recipe in assistant_recipes
+            if (
+                recipe.assistant_id in existing_recipe_ids
+                or recipe_counts[recipe.assistant_id] > 1
+            )
+        ]
+        if duplicates:
+            invalid_extensions.add(ext.name)
+            for assistant_id in duplicates:
+                issues.append(ValidationIssue(
+                    "error",
+                    f"{ext.name}: duplicate assistant_id '{assistant_id}'",
+                ))
+
+    while True:
+        current_actions = ActionCatalog()
+        for spec in actions.all():
+            current_actions.register(spec)
+        for ext, action_specs, _ in usable:
+            if ext.name not in invalid_extensions:
+                for spec in action_specs:
+                    current_actions.register(spec)
+        current_recipes = RecipeCatalog(current_actions)
+        for recipe in recipes.all():
+            current_recipes.register(recipe)
+        newly_invalid = set()
+        for ext, _, assistant_recipes in usable:
+            if ext.name in invalid_extensions:
+                continue
+            try:
+                for recipe in assistant_recipes:
+                    current_recipes.register(recipe)
+            except (KeyError, TypeError, ValueError) as error:
+                issues.append(ValidationIssue(
+                    "error", f"{ext.name}: recipe assembly failed: {error}"
+                ))
+                newly_invalid.add(ext.name)
+        if not newly_invalid:
+            break
+        invalid_extensions.update(newly_invalid)
+
+    valid_recipes = [
+        (ext, recipe)
+        for ext, _, assistant_recipes in usable
+        if ext.name not in invalid_extensions
+        for recipe in assistant_recipes
+    ]
+
+    action_count = recipe_count = 0
+    bindings: Dict[Capability, str] = {}
+    binding_conflicts = set()
+    for ext, spec in valid_actions:
+        if ext.name in invalid_extensions:
+            continue
+        actions.register(
+            spec, handlers_by_extension[ext.name].get(spec.action_id)
+        )
+        action_count += 1
+    for ext, recipe in valid_recipes:
+        if ext.name in invalid_extensions:
+            continue
+        recipes.register(recipe)
+        recipe_count += 1
+    for ext, _, _ in usable:
+        if ext.name in invalid_extensions:
+            continue
+        for capability, platform_id in extension_provider_bindings(ext).items():
+            if capability in binding_conflicts:
+                continue
+            previous = bindings.get(capability)
+            if previous is not None and previous != platform_id:
+                issues.append(ValidationIssue(
+                    "error",
+                    f"conflicting provider binding for '{capability.value}': "
+                    f"{previous} and {platform_id}",
+                ))
+                bindings[capability] = ""
+                binding_conflicts.add(capability)
+                continue
+            bindings[capability] = platform_id
+    return (action_count, recipe_count), bindings, issues
 
 
 def merge_into_registry(reg: FlowRegistry, ext: Extension) -> int:
@@ -213,13 +628,7 @@ def load_extension_plugin(ext: Extension, config: Optional[dict] = None) -> Opti
     if has_errors(issues):
         raise ValueError("; ".join(issue.message for issue in issues))
     path = (ext.root / relative).resolve()
-    spec = importlib.util.spec_from_file_location(
-        f"iloop_extension_{ext.name.replace('.', '_')}", path
-    )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load extension plugin: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _load_extension_module(ext, relative, "plugin")
     factory = getattr(module, "create_plugin", None)
     if not callable(factory):
         raise TypeError(f"{path} must export create_plugin(config)")
@@ -244,7 +653,7 @@ def load_installed_plugins(
             continue
         try:
             plugin = load_extension_plugin(load_extension(root), config)
-        except Exception as error:
+        except (Exception, SystemExit) as error:
             message = (
                 f"{root.name}: plugin load failed: "
                 f"{type(error).__name__}: {error}"

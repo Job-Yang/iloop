@@ -25,6 +25,7 @@ class StepStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     DONE = "done"
+    SKIPPED = "skipped"
     FAILED = "failed"
 
 
@@ -33,6 +34,7 @@ class TaskStep:
     title: str
     id: str = ""
     capability: str = ""
+    action_id: str = ""
     status: StepStatus = StepStatus.PENDING
     summary: str = ""
     evidence_ids: List[str] = field(default_factory=list)
@@ -52,6 +54,9 @@ class TaskRecord:
     goal: str
     flow_id: str
     autonomy: str
+    assistant_id: str = ""
+    assistant_recipe_digest: str = ""
+    assistant_provider_bindings: Dict[str, str] = field(default_factory=dict)
     status: TaskStatus = TaskStatus.OPEN
     current_stage: str = "investigate"
     constraints: List[str] = field(default_factory=list)
@@ -83,7 +88,10 @@ class TaskRecord:
         self.steps = [s if isinstance(s, TaskStep) else TaskStep(**s) for s in self.steps]
 
     def next_step(self) -> Optional[TaskStep]:
-        return next((s for s in self.steps if s.status != StepStatus.DONE), None)
+        return next((
+            s for s in self.steps
+            if s.status not in {StepStatus.DONE, StepStatus.SKIPPED}
+        ), None)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -107,6 +115,9 @@ class TaskStore:
         return slug or "task"
 
     def create(self, title: str, *, goal: str, flow_id: str, autonomy: str,
+               assistant_id: str = "",
+               assistant_recipe_digest: str = "",
+               assistant_provider_bindings: Optional[Dict[str, str]] = None,
                constraints: Optional[List[str]] = None,
                acceptance: Optional[List[str]] = None,
                design_contract: Optional[Dict[str, object]] = None,
@@ -119,6 +130,9 @@ class TaskStore:
             goal=goal,
             flow_id=flow_id,
             autonomy=autonomy,
+            assistant_id=assistant_id,
+            assistant_recipe_digest=assistant_recipe_digest,
+            assistant_provider_bindings=assistant_provider_bindings or {},
             constraints=constraints or [],
             acceptance=acceptance or [],
             design_contract=design_contract or {},
@@ -181,6 +195,11 @@ class TaskStore:
             "title": task.title,
             "status": task.status.value,
             "flow_id": task.flow_id,
+            "assistant_id": task.assistant_id,
+            "assistant_recipe_digest": task.assistant_recipe_digest,
+            "assistant_provider_bindings": dict(
+                task.assistant_provider_bindings
+            ),
             "autonomy": task.autonomy,
             "current_stage": task.current_stage,
             "goal": task.goal,

@@ -1,7 +1,6 @@
 # iLoop 内核协议 SPEC
 
-> 内核与插件之间唯一的契约。内部版和开源版共享这份 spec，各自实现。
-> 内核只认这四种协议，不认识任何具体平台/语言。插件通过实现契约"插进"内核，而不是内核去"知道"插件。
+> 内核与扩展之间的稳定契约。内核不认识任何具体业务平台；扩展通过 Action、Recipe 和 Provider 插入，不让平台细节反向进入内核。
 >
 > 原则（VDD）：**推断不许当观测；完成 = 结果被验过；谁做的不能由谁判。**
 
@@ -106,8 +105,62 @@
 
 ---
 
+## 协议 5：ActionSpec 与 AssistantRecipe
+
+Driver `Capability` 回答“平台会做什么”；`ActionSpec` 回答“助手要完成什么业务动作”。两者不得混进同一个枚举。
+
+```json
+{
+  "action_id": "team.oncall.collect",
+  "description": "收集告警证据",
+  "risk": "low | medium | high",
+  "side_effects": ["read"],
+  "inputs": {"event_id": "string"},
+  "outputs": {"case_id": "string"},
+  "required_capabilities": ["logs", "probe"]
+}
+```
+
+`AssistantRecipe` 保存版本、有序 Action 列表、入口和持续观察标志。Action 可声明 `lifecycle_stage`（diagnosis / disposition / verification / observation），Runtime 只能按阶段推进。Recipe 引用未知 Action、重复 Action、越权助手或风险冲突时必须 fail closed。Recipe 不允许包含 deployment 分支。
+
+---
+
+## 协议 6：Provider Registry
+
+一个 Runtime 可以注册多个 `Plugin` Provider，并按 Driver Capability 路由。规则：
+
+- `platform_id` 全局唯一；
+- Provider 返回的 `platform` 和 `capability` 必须与实际调用一致；
+- 没有 Provider 时在装配阶段失败；
+- 多个 Provider 声明同一能力时必须显式 `provider_bindings`，不能按加载顺序猜。
+
+---
+
+## 协议 7：Versioned Resolve Case
+
+Case 在原有假设与四关之外，正交记录：
+
+- diagnosis：调查中 / 已冻结，并递增 `diagnosis_revision`；
+- disposition：计划 / 执行 / 完成 / 失效；
+- verification：待验证 / 通过 / 失败；
+- observation：不需要 / 待观察 / 观察中 / 稳定 / 回归。
+
+处置计划绑定确切 diagnosis revision。新增候选、反证冻结根因或观察到回归时必须重开诊断、清空旧四关并废止旧计划；旧非版本化 Case 读取时兼容迁移。
+
+---
+
+## 协议 8：Deployment 与执行信封
+
+`DeploymentProfile` 只声明目标节点和可用 Provider，不复制 Recipe。`TaskEnvelope` 的签名覆盖 task、assistant、Deployment 指纹、target node、diagnosis revision、Git base commit、policy、输入、Recipe 指纹、有序 Action/Driver Capability 清单、交错 evidence plan 和 TTL。
+
+Worker 必须在执行前验签并登记防重放。`WorkerReceipt` 绑定完整 Task digest；成功回执不得包含失败证据，并必须按顺序覆盖签名执行清单。Provider 没有可哈希产物时只能形成 `execution_record`，不能冒充 observed evidence。
+
+核心只提供 local/in-process worker 契约。远端队列、transport、节点身份和运行账号由宿主或扩展实现。
+
+---
+
 ## 内核不做什么（防过度设计）
 
 - 不认识任何具体平台的 CLI / 域名 / 字段——那是插件的事。
 - 不预建通用权限平台 / 账号中心 / 策略引擎——等第二个平台出现真实复用需求再抽象。
-- 首发只把 iOS 一个官方插件跑穿这四协议，再谈第二个。
+- 不在核心实现远端队列或企业平台 Adapter；先把本地 Recipe 主链和签名契约跑穿。

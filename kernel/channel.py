@@ -1,9 +1,9 @@
 """通知与事件接口 —— oncall 的通用抽取。
 
-把飞书剥掉后，oncall 剩下的通用骨架就是：
+剥掉具体企业 IM 后，oncall 剩下的通用骨架就是：
     事件源(EventSource) → 病例建档 → 证据驱动诊断 → 处置 → 通知渠道(Notifier)
 
-飞书只占 EventSource 和 Notifier 两个接口的一种实现。开源版提供 stdout/webhook
+企业 IM 只占 EventSource 和 Notifier 两个接口的一种实现。开源版提供 stdout/webhook
 参考实现；企业内部 IM 挂对应实现；社区挂 GitHub Issues / PagerDuty / Sentry。
 抽出来的不是 oncall，是"事件驱动的诊断闭环"。
 """

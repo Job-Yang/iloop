@@ -11,14 +11,17 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from .capability import Capability, Plugin
+from .action import ActionRisk, ActionSideEffect
 from .acceptance import AcceptanceStore, RiskLevel, Verdict, assess_risk
-from .case import Case
+from .case import Case, DispositionStatus
 from .dashboard import Dashboard
 from .evidence import EvidenceArtifact, EvidenceKind
 from .flow import FlowRegistry
 from .gate_capability import CapabilityGate
 from .global_review import GlobalReview, analyze_global_impact
 from .ledger import Ledger, RoundStatus
+from .recipe import RecipeCatalog
+from .provider import ProviderRegistry
 from .task import StepStatus, TaskRecord, TaskStatus, TaskStep, TaskStore
 from .storage import atomic_write_json, file_lock
 
@@ -52,14 +55,29 @@ CAPABILITY_GATE_HINT = {
 class Runtime:
     """One project-scoped runtime. All durable state stays below data_dir."""
 
-    def __init__(self, data_dir: str | Path, registry: FlowRegistry, plugin: Plugin,
+    def __init__(self, data_dir: str | Path, registry: FlowRegistry,
+                 plugin: Optional[Plugin] = None,
                  *, project_root: str | Path = "",
+                 recipe_catalog: Optional[RecipeCatalog] = None,
+                 provider_registry: Optional[ProviderRegistry] = None,
                  attestation_verifier: Optional[Callable[[str, Path, dict], bool]] = None,
                  attestation_recorder: Optional[Callable[[str, Path, dict], None]] = None) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.registry = registry
         self.plugin = plugin
+        self.recipe_catalog = recipe_catalog
+        if provider_registry is None:
+            if plugin is None:
+                raise ValueError("Runtime requires a plugin or ProviderRegistry")
+            provider_registry = ProviderRegistry([plugin])
+        elif plugin is not None and all(
+            item.platform_id != plugin.platform_id
+            for item in provider_registry.providers()
+        ):
+            provider_registry.register(plugin)
+        provider_registry.freeze()
+        self.providers = provider_registry
         self.attestation_verifier = attestation_verifier
         self.attestation_recorder = attestation_recorder
         self.project_root = str(Path(project_root).resolve()) if project_root else ""
@@ -91,6 +109,14 @@ class Runtime:
 
     def _requirements_path(self, task_id: str) -> Path:
         return self._task_dir(task_id) / "capability-requirements.json"
+
+    def _action_result_path(self, task_id: str, action_id: str) -> Path:
+        digest = hashlib.sha256(action_id.encode("utf-8")).hexdigest()[:16]
+        return self._task_dir(task_id) / "action-results" / f"{digest}.json"
+
+    def _action_execution_path(self, task_id: str, action_id: str) -> Path:
+        digest = hashlib.sha256(action_id.encode("utf-8")).hexdigest()[:16]
+        return self._task_dir(task_id) / "action-executions" / f"{digest}.json"
 
     @contextmanager
     def _transaction(self, task_id: str, operation: str):
@@ -152,6 +178,7 @@ class Runtime:
               acceptance: Optional[list[str]] = None,
               capabilities: Optional[Iterable[str]] = None,
               executor_id: str = "",
+              assistant_id: str = "",
               steps: Optional[list[TaskStep]] = None,
               design_contract: Optional[dict] = None,
               execution_context: Optional[dict[str, str]] = None) -> TaskRecord:
@@ -159,6 +186,49 @@ class Runtime:
         flow = decision["flow"]
         if flow is None:
             raise ValueError("no flow matched; clarify the task before execution")
+        assistant_id = assistant_id.strip()
+        assistant_recipe_digest = ""
+        assistant_provider_bindings = {}
+        assembly = None
+        assistant_high_risk = False
+        if assistant_id:
+            if self.recipe_catalog is None:
+                raise ValueError(
+                    "assistant_id requires a configured RecipeCatalog"
+                )
+            assembly = self.recipe_catalog.assemble(assistant_id)
+            self.providers.validate_capabilities(
+                assembly.required_capabilities
+            )
+            assistant_recipe_digest = assembly.fingerprint()
+            assistant_provider_bindings = {
+                capability.value: self.providers.resolve(
+                    capability
+                ).platform_id
+                for capability in assembly.required_capabilities
+            }
+            assistant_high_risk = any(
+                spec.risk == ActionRisk.HIGH for spec in assembly.actions
+            )
+            if flow.autonomy.value == "L1" and any(
+                effect not in {
+                    ActionSideEffect.NONE, ActionSideEffect.READ,
+                }
+                for spec in assembly.actions
+                for effect in spec.side_effects
+            ):
+                raise ValueError(
+                    "L1 flow cannot execute assistant actions with write/process "
+                    "side effects"
+                )
+            if steps is not None:
+                raise ValueError(
+                    "assistant tasks derive steps from AssistantRecipe"
+                )
+            if list(capabilities or []):
+                raise ValueError(
+                    "assistant tasks execute capabilities through their Recipe"
+                )
         if flow.autonomy.value in {"L2", "L3"} and not self.project_root:
             raise ValueError(
                 "L2/L3 tasks require project_root (set ILOOP_PROJECT_ROOT or "
@@ -167,25 +237,40 @@ class Runtime:
         if (
             decision["acceptance_gate"]
             or assess_risk(title) == RiskLevel.HIGH
+            or assistant_high_risk
         ) and not executor_id.strip():
             raise ValueError(
                 "high-risk tasks require executor_id before task creation"
             )
-        task_steps = steps or [
-            TaskStep(title=s)
-            for s in FLOW_STEPS.get(flow.flow_id, ["执行", "验证", "收口"])
-        ]
-        for cap in capabilities or []:
-            capability = Capability(cap).value
-            task_steps.append(TaskStep(
-                title=f"执行能力: {capability}",
-                capability=capability,
-            ))
+        if assembly is not None:
+            task_steps = [
+                TaskStep(
+                    title=f"执行动作: {spec.action_id}",
+                    action_id=spec.action_id,
+                )
+                for spec in assembly.actions
+            ]
+        else:
+            task_steps = steps or [
+                TaskStep(title=s)
+                for s in FLOW_STEPS.get(
+                    flow.flow_id, ["执行", "验证", "收口"]
+                )
+            ]
+            for cap in capabilities or []:
+                capability = Capability(cap).value
+                task_steps.append(TaskStep(
+                    title=f"执行能力: {capability}",
+                    capability=capability,
+                ))
         task = self.tasks.create(
             title,
             goal=title,
             flow_id=flow.flow_id,
             autonomy=flow.autonomy.value,
+            assistant_id=assistant_id,
+            assistant_recipe_digest=assistant_recipe_digest,
+            assistant_provider_bindings=assistant_provider_bindings,
             constraints=constraints,
             acceptance=acceptance,
             design_contract=design_contract,
@@ -213,6 +298,7 @@ class Runtime:
         task.independent_acceptance_required = (
             decision["acceptance_gate"]
             or assess_risk(title) == RiskLevel.HIGH
+            or assistant_high_risk
         )
         task.acceptance_status = "pending" if task.independent_acceptance_required else "not_required"
         case = Case(task.id, title)
@@ -228,6 +314,11 @@ class Runtime:
                 "title": task.title,
                 "goal": task.goal,
                 "flow_id": task.flow_id,
+                "assistant_id": task.assistant_id,
+                "assistant_recipe_digest": task.assistant_recipe_digest,
+                "assistant_provider_bindings": dict(
+                    task.assistant_provider_bindings
+                ),
                 "autonomy": task.autonomy,
                 "constraints": list(task.constraints),
                 "acceptance": list(task.acceptance),
@@ -237,6 +328,7 @@ class Runtime:
                         "id": step.id,
                         "title": step.title,
                         "capability": step.capability,
+                        "action_id": step.action_id,
                     }
                     for step in task.steps
                 ],
@@ -313,6 +405,11 @@ class Runtime:
                     "title": task.title,
                     "goal": task.goal,
                     "flow_id": task.flow_id,
+                    "assistant_id": task.assistant_id,
+                    "assistant_recipe_digest": task.assistant_recipe_digest,
+                    "assistant_provider_bindings": dict(
+                        task.assistant_provider_bindings
+                    ),
                     "autonomy": task.autonomy,
                     "constraints": list(task.constraints),
                     "acceptance": list(task.acceptance),
@@ -322,6 +419,7 @@ class Runtime:
                             "id": step.id,
                             "title": step.title,
                             "capability": step.capability,
+                            "action_id": step.action_id,
                         }
                         for step in task.steps
                     ],
@@ -340,18 +438,64 @@ class Runtime:
                 json.dumps(legacy_policy, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            self._attest("task_policy", policy_path, legacy_policy)
         policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        if (
+            self.attestation_verifier is not None
+            and not self.attestation_verifier(
+                "task_policy", policy_path, policy
+            )
+        ):
+            raise ValueError("task creation policy is not host attested")
         if policy.get("task_id") != task.id:
             raise ValueError("task policy task_id mismatch")
         changed = False
         for field_name in (
             "title", "goal", "flow_id", "autonomy", "project_root", "base_commit",
-            "executor_id",
+            "executor_id", "assistant_id", "assistant_recipe_digest",
         ):
             expected = policy.get(field_name, "")
             if getattr(task, field_name) != expected:
                 setattr(task, field_name, expected)
                 changed = True
+        expected_provider_bindings = {
+            str(key): str(value)
+            for key, value in policy.get(
+                "assistant_provider_bindings", {}
+            ).items()
+        }
+        if task.assistant_provider_bindings != expected_provider_bindings:
+            task.assistant_provider_bindings = expected_provider_bindings
+            changed = True
+        if task.assistant_id:
+            if self.recipe_catalog is None:
+                raise ValueError(
+                    "task policy requires assistant_id but no RecipeCatalog is configured"
+                )
+            assembly = self.recipe_catalog.assemble(task.assistant_id)
+            if (
+                task.assistant_recipe_digest
+                and assembly.fingerprint() != task.assistant_recipe_digest
+            ):
+                raise ValueError(
+                    "task assistant recipe changed since task creation"
+                )
+            self.providers.validate_capabilities(
+                assembly.required_capabilities
+            )
+            current_bindings = {
+                capability.value: self.providers.resolve(
+                    capability
+                ).platform_id
+                for capability in assembly.required_capabilities
+            }
+            if (
+                task.assistant_provider_bindings
+                and current_bindings != task.assistant_provider_bindings
+            ):
+                raise ValueError(
+                    "task assistant provider bindings changed since task creation"
+                )
         for field_name in ("constraints", "acceptance"):
             expected = list(policy.get(field_name, []))
             if getattr(task, field_name) != expected:
@@ -381,10 +525,12 @@ class Runtime:
                         id=str(contract["id"]),
                         title=str(contract["title"]),
                         capability=str(contract.get("capability", "")),
+                        action_id=str(contract.get("action_id", "")),
                     )
                 else:
                     step.title = str(contract["title"])
                     step.capability = str(contract.get("capability", ""))
+                    step.action_id = str(contract.get("action_id", ""))
                 restored.append(step)
             if [step.id for step in task.steps] != [step.id for step in restored]:
                 task.steps = restored
@@ -461,6 +607,26 @@ class Runtime:
         artifact_sha256 = EvidenceArtifact._artifact_digest(artifact)
         if not artifact_sha256 or artifact_sha256 != row["artifact_sha256"]:
             raise ValueError("evidence attestation artifact hash mismatch")
+        metadata = {
+            "task_id": task.id,
+            "run_id": row.get("run_id", ""),
+            "source_run_id": row.get("source_run_id", ""),
+            "subjects": list(row.get("subjects", [])),
+            "gates": list(row.get("gates", [])),
+            "flow_id": row.get("flow_id", ""),
+            "ui_flow_id": row.get("ui_flow_id", ""),
+            "flow_run_id": row.get("flow_run_id", ""),
+            "device": row.get("device", ""),
+            "device_id": row.get("device_id", ""),
+            "attestation_path": str(path),
+            "attestation_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "artifact_sha256": artifact_sha256,
+            "human_confirmed": row.get("kind") == "user_confirmation",
+            "user_id": row.get("user_id", ""),
+        }
+        for key in ("diagnosis_revision", "disposition_plan_id"):
+            if key in row:
+                metadata[key] = row[key]
         evidence = EvidenceArtifact(
             capability=str(row["capability"]),
             source=str(row["source"]),
@@ -468,23 +634,7 @@ class Runtime:
             outcome=str(row["outcome"]),
             summary=str(row["summary"]),
             path=str(artifact),
-            metadata={
-                "task_id": task.id,
-                "run_id": row.get("run_id", ""),
-                "source_run_id": row.get("source_run_id", ""),
-                "subjects": list(row.get("subjects", [])),
-                "gates": list(row.get("gates", [])),
-                "flow_id": row.get("flow_id", ""),
-                "ui_flow_id": row.get("ui_flow_id", ""),
-                "flow_run_id": row.get("flow_run_id", ""),
-                "device": row.get("device", ""),
-                "device_id": row.get("device_id", ""),
-                "attestation_path": str(path),
-                "attestation_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "artifact_sha256": artifact_sha256,
-                "human_confirmed": row.get("kind") == "user_confirmation",
-                "user_id": row.get("user_id", ""),
-            },
+            metadata=metadata,
             created_at=float(row["created_at"]),
         )
         case = Case.load(task.case_path)
@@ -587,8 +737,537 @@ class Runtime:
 
     def execute_capabilities(self, task: TaskRecord, capabilities: Iterable[str],
                              **kwargs) -> TaskRecord:
+        task = self.load(task.id)
+        if task.assistant_id:
+            raise ValueError(
+                "assistant task capabilities must execute through AssistantRecipe"
+            )
         with self._transaction(task.id, "execute_capabilities"):
             return self._execute_capabilities_locked(task, capabilities, **kwargs)
+
+    def execute_assistant(
+        self,
+        task: TaskRecord,
+        inputs: Optional[dict[str, object]] = None,
+        **provider_kwargs,
+    ) -> TaskRecord:
+        with file_lock(
+            self._task_dir(task.id) / ".assistant-execution.lock"
+        ):
+            return self._execute_assistant_locked(
+                task, inputs, **provider_kwargs
+            )
+
+    def _execute_assistant_locked(
+        self,
+        task: TaskRecord,
+        inputs: Optional[dict[str, object]] = None,
+        **provider_kwargs,
+    ) -> TaskRecord:
+        task = self.load(task.id)
+        if not task.assistant_id or self.recipe_catalog is None:
+            raise ValueError("task is not bound to an AssistantRecipe")
+        assembly = self.recipe_catalog.assemble(task.assistant_id)
+        context: dict[str, object] = dict(inputs or {})
+        for spec in assembly.actions:
+            step = next(
+                item for item in task.steps if item.action_id == spec.action_id
+            )
+            case = Case.load(task.case_path)
+            disposition_plan = next(
+                (
+                    plan for plan in reversed(case.disposition_plans)
+                    if plan.diagnosis_revision == case.diagnosis_revision
+                    and case.disposition_progress.get(plan.plan_id)
+                    != DispositionStatus.INVALIDATED
+                ),
+                None,
+            )
+            action_binding = self._action_binding(
+                case, spec.lifecycle_stage, disposition_plan
+            )
+            if step.status == StepStatus.DONE:
+                try:
+                    outputs = self._load_action_result(
+                        task, spec.action_id, action_binding
+                    )
+                except ValueError as error:
+                    if "action result lifecycle binding mismatch" not in str(error):
+                        raise
+                    step.status = StepStatus.PENDING
+                    step.evidence_ids = []
+                    step.summary = ""
+                    self.tasks.save(task)
+                else:
+                    context.update(outputs)
+                    if spec.lifecycle_stage == "disposition":
+                        case = Case.load(task.case_path)
+                        plan = next(
+                            (
+                                item for item in reversed(case.disposition_plans)
+                                if item.diagnosis_revision
+                                == case.diagnosis_revision
+                                and item.action_id == spec.action_id
+                            ),
+                            None,
+                        )
+                        if (
+                            plan is not None
+                            and case.disposition_progress.get(plan.plan_id)
+                            == DispositionStatus.EXECUTING
+                        ):
+                            case.advance_disposition(
+                                plan.plan_id, DispositionStatus.COMPLETED
+                            )
+                            case.save(task.case_path)
+                    elif spec.lifecycle_stage == "observation":
+                        case = Case.load(task.case_path)
+                        if case.observation_status.value == "observing":
+                            evidence_id = self._ensure_action_evidence(
+                                task, spec.action_id
+                            )
+                            verifier = (
+                                lambda path, row: self.attestation_verifier(
+                                    "evidence", path, row
+                                )
+                            ) if self.attestation_verifier is not None else None
+                            case.finish_observation(
+                                stable=True,
+                                evidence_ids=[evidence_id],
+                                verify_attestation=verifier,
+                            )
+                            case.save(task.case_path)
+                    continue
+            if spec.lifecycle_stage == "disposition":
+                if (
+                    case.diagnosis_status.value != "frozen"
+                    or disposition_plan is None
+                ):
+                    return task
+                if disposition_plan.action_id != spec.action_id:
+                    step.status = StepStatus.SKIPPED
+                    step.summary = (
+                        f"not selected by {disposition_plan.plan_id}"
+                    )
+                    self.tasks.save(task)
+                    continue
+                if (
+                    case.disposition_progress.get(disposition_plan.plan_id)
+                    == DispositionStatus.PLANNED
+                ):
+                    case.advance_disposition(
+                        disposition_plan.plan_id,
+                        DispositionStatus.EXECUTING,
+                    )
+                    case.save(task.case_path)
+            elif (
+                spec.lifecycle_stage == "verification"
+                and case.disposition_status != DispositionStatus.COMPLETED
+            ):
+                return task
+            elif (
+                spec.lifecycle_stage == "observation"
+            ):
+                verifier = (
+                    lambda path, row: self.attestation_verifier(
+                        "evidence", path, row
+                    )
+                ) if self.attestation_verifier is not None else None
+                if not case.verification_is_valid(verifier):
+                    return task
+                if case.observation_status.value == "pending":
+                    case.start_observation(verifier)
+                    case.save(task.case_path)
+                elif case.observation_status.value != "observing":
+                    return task
+            result_path = self._action_result_path(task.id, spec.action_id)
+            if result_path.is_file():
+                try:
+                    outputs = self._load_action_result(
+                        task, spec.action_id, action_binding
+                    )
+                except ValueError as error:
+                    if "action result lifecycle binding mismatch" not in str(error):
+                        raise
+                    outputs = None
+                if outputs is None:
+                    pass
+                else:
+                    task = self.load(task.id)
+                    step = next(
+                        item for item in task.steps
+                        if item.action_id == spec.action_id
+                    )
+                    action_evidence_id = self._ensure_action_evidence(
+                        task, spec.action_id
+                    )
+                    result_row = json.loads(
+                        result_path.read_text(encoding="utf-8")
+                    )
+                    step.evidence_ids = sorted(set(
+                        list(result_row.get("evidence_ids", []))
+                        + [action_evidence_id]
+                    ))
+                    step.completion_source = "machine"
+                    step.status = StepStatus.DONE
+                    step.summary = json.dumps(
+                        outputs, ensure_ascii=False, sort_keys=True
+                    )
+                    task.status = TaskStatus.OPEN
+                    self.tasks.save(task)
+                    self._write_action_execution(
+                        task, spec.action_id, "completed"
+                    )
+                    if (
+                        spec.lifecycle_stage == "disposition"
+                        and disposition_plan is not None
+                    ):
+                        case = Case.load(task.case_path)
+                        if (
+                            case.disposition_progress.get(
+                                disposition_plan.plan_id
+                            )
+                            == DispositionStatus.EXECUTING
+                        ):
+                            case.advance_disposition(
+                                disposition_plan.plan_id,
+                                DispositionStatus.COMPLETED,
+                            )
+                            case.save(task.case_path)
+                    elif spec.lifecycle_stage == "observation":
+                        case = Case.load(task.case_path)
+                        if case.observation_status.value == "observing":
+                            verifier = (
+                                lambda path, row: self.attestation_verifier(
+                                    "evidence", path, row
+                                )
+                            ) if self.attestation_verifier is not None else None
+                            case.finish_observation(
+                                stable=True,
+                                evidence_ids=[action_evidence_id],
+                                verify_attestation=verifier,
+                            )
+                            case.save(task.case_path)
+                    context.update(outputs)
+                    continue
+            execution_path = self._action_execution_path(
+                task.id, spec.action_id
+            )
+            if execution_path.is_file():
+                execution = json.loads(
+                    execution_path.read_text(encoding="utf-8")
+                )
+                if (
+                    self.attestation_verifier is not None
+                    and not self.attestation_verifier(
+                        "action_execution", execution_path, execution
+                    )
+                ):
+                    task.status = TaskStatus.BLOCKED
+                    step.status = StepStatus.FAILED
+                    step.summary = "action execution journal is not host attested"
+                    self.tasks.save(task)
+                    return task
+                has_side_effect = any(
+                    effect not in {
+                        ActionSideEffect.NONE, ActionSideEffect.READ,
+                    }
+                    for effect in spec.side_effects
+                )
+                if (
+                    execution.get("status") in {"executing", "failed"}
+                    and has_side_effect
+                ):
+                    task.status = TaskStatus.BLOCKED
+                    step.status = StepStatus.FAILED
+                    step.summary = (
+                        "action side effect is indeterminate; reconcile before retry"
+                    )
+                    self.tasks.save(task)
+                    return task
+            before = set(task.evidence_ids)
+            task = self.load(task.id)
+            step = next(
+                item for item in task.steps if item.action_id == spec.action_id
+            )
+            step.status = StepStatus.RUNNING
+            task.status = TaskStatus.RUNNING
+            self.tasks.save(task)
+            self._write_action_execution(task, spec.action_id, "executing")
+            if spec.required_capabilities:
+                with self._transaction(
+                    task.id, f"execute_action_capabilities:{spec.action_id}"
+                ):
+                    task = self._execute_capabilities_locked(
+                        task,
+                        [
+                            item.value
+                            for item in spec.required_capabilities
+                        ],
+                        **provider_kwargs,
+                    )
+                if task.status == TaskStatus.BLOCKED:
+                    self._write_action_execution(
+                        task,
+                        spec.action_id,
+                        "failed",
+                        error="provider capability execution failed",
+                    )
+                    step = next(
+                        item for item in task.steps
+                        if item.action_id == spec.action_id
+                    )
+                    step.status = StepStatus.FAILED
+                    self.tasks.save(task)
+                    return task
+            try:
+                result = self.recipe_catalog.execute(
+                    task.assistant_id, spec.action_id, context
+                )
+                json.dumps(result.outputs)
+            except Exception as error:
+                self._write_action_execution(
+                    task,
+                    spec.action_id,
+                    "failed",
+                    error=f"{type(error).__name__}: {error}",
+                )
+                task = self.load(task.id)
+                step = next(
+                    item for item in task.steps
+                    if item.action_id == spec.action_id
+                )
+                step.status = StepStatus.FAILED
+                step.summary = f"{type(error).__name__}: {error}"
+                task.status = TaskStatus.BLOCKED
+                self.tasks.save(task)
+                return task
+            context.update(result.outputs)
+            task = self.load(task.id)
+            step = next(
+                item for item in task.steps if item.action_id == spec.action_id
+            )
+            new_evidence = [
+                evidence_id for evidence_id in task.evidence_ids
+                if evidence_id not in before
+            ]
+            step.evidence_ids = new_evidence
+            step.completion_source = "machine"
+            step.status = StepStatus.DONE
+            step.summary = json.dumps(
+                dict(result.outputs), ensure_ascii=False, sort_keys=True
+            )
+            self._save_action_result(
+                task,
+                spec.action_id,
+                dict(result.outputs),
+                new_evidence,
+                action_binding,
+            )
+            action_evidence_id = self._ensure_action_evidence(
+                task, spec.action_id
+            )
+            step.evidence_ids = sorted(set(
+                step.evidence_ids + [action_evidence_id]
+            ))
+            task.status = TaskStatus.OPEN
+            self.tasks.save(task)
+            self._write_action_execution(
+                task, spec.action_id, "completed"
+            )
+            if (
+                spec.lifecycle_stage == "disposition"
+                and disposition_plan is not None
+            ):
+                case = Case.load(task.case_path)
+                if (
+                    case.disposition_progress.get(disposition_plan.plan_id)
+                    == DispositionStatus.EXECUTING
+                ):
+                    case.advance_disposition(
+                        disposition_plan.plan_id,
+                        DispositionStatus.COMPLETED,
+                    )
+                    case.save(task.case_path)
+            elif spec.lifecycle_stage == "observation":
+                case = Case.load(task.case_path)
+                if case.observation_status.value == "observing":
+                    verifier = (
+                        lambda path, row: self.attestation_verifier(
+                            "evidence", path, row
+                        )
+                    ) if self.attestation_verifier is not None else None
+                    case.finish_observation(
+                        stable=True,
+                        evidence_ids=[action_evidence_id],
+                        verify_attestation=verifier,
+                    )
+                    case.save(task.case_path)
+        self.write_dashboard(task.id)
+        return self.load(task.id)
+
+    def _write_action_execution(
+        self,
+        task: TaskRecord,
+        action_id: str,
+        status: str,
+        *,
+        error: str = "",
+    ) -> None:
+        payload = {
+            "task_id": task.id,
+            "assistant_id": task.assistant_id,
+            "assistant_recipe_digest": task.assistant_recipe_digest,
+            "action_id": action_id,
+            "status": status,
+            "error": error,
+            "updated_at": time.time(),
+        }
+        path = self._action_execution_path(task.id, action_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, payload)
+        self._attest("action_execution", path, payload)
+
+    def _ensure_action_evidence(
+        self,
+        task: TaskRecord,
+        action_id: str,
+    ) -> str:
+        result_path = self._action_result_path(task.id, action_id)
+        case = Case.load(task.case_path)
+        plan_id = next(
+            (
+                plan.plan_id
+                for plan in reversed(case.disposition_plans)
+                if plan.diagnosis_revision == case.diagnosis_revision
+                and case.disposition_progress.get(plan.plan_id)
+                == DispositionStatus.COMPLETED
+            ),
+            "",
+        )
+        for item in self.evidence(task.id):
+            if (
+                item.capability == f"action:{action_id}"
+                and item.path == str(result_path)
+                and self._supports_success(item, task)
+            ):
+                return item.id
+        evidence = EvidenceArtifact(
+            capability=f"action:{action_id}",
+            source="iloop-runtime",
+            kind=EvidenceKind.OBSERVED,
+            outcome="success",
+            summary=f"application action completed: {action_id}",
+            path=str(result_path),
+            metadata={
+                "task_id": task.id,
+                "run_id": f"{task.id}:action:{action_id}:{time.time_ns()}",
+                "source_run_id": "",
+                "subjects": [action_id],
+                "gates": [],
+                "flow_id": task.flow_id,
+                "ui_flow_id": "",
+                "flow_run_id": "",
+                "device": "",
+                "device_id": "",
+                "trusted_producer": True,
+                "diagnosis_revision": case.diagnosis_revision,
+                "disposition_plan_id": plan_id,
+            },
+        )
+        self._seal_trusted_evidence(task, evidence)
+        self._append_evidence(task.id, evidence)
+        task.evidence_ids.append(evidence.id)
+        return evidence.id
+
+    def _save_action_result(
+        self,
+        task: TaskRecord,
+        action_id: str,
+        outputs: dict[str, object],
+        evidence_ids: list[str],
+        lifecycle_binding: dict[str, object],
+    ) -> None:
+        payload = {
+            "task_id": task.id,
+            "assistant_id": task.assistant_id,
+            "assistant_recipe_digest": task.assistant_recipe_digest,
+            "action_id": action_id,
+            "outputs": outputs,
+            "evidence_ids": list(evidence_ids),
+            "diagnosis_revision": lifecycle_binding[
+                "diagnosis_revision"
+            ],
+            "disposition_plan_id": lifecycle_binding[
+                "disposition_plan_id"
+            ],
+            "created_at": time.time(),
+        }
+        path = self._action_result_path(task.id, action_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, payload)
+        self._attest("action_result", path, payload)
+
+    def _load_action_result(
+        self,
+        task: TaskRecord,
+        action_id: str,
+        lifecycle_binding: Optional[dict[str, object]] = None,
+    ) -> dict[str, object]:
+        path = self._action_result_path(task.id, action_id)
+        if not path.is_file():
+            raise ValueError(
+                f"completed action '{action_id}' has no durable result"
+            )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        expected = {
+            "task_id": task.id,
+            "assistant_id": task.assistant_id,
+            "assistant_recipe_digest": task.assistant_recipe_digest,
+            "action_id": action_id,
+        }
+        if any(payload.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"action result binding mismatch: {action_id}")
+        if lifecycle_binding and any(
+            payload.get(key) != value
+            for key, value in lifecycle_binding.items()
+        ):
+            raise ValueError(
+                f"action result lifecycle binding mismatch: {action_id}"
+            )
+        if (
+            self.attestation_verifier is None
+            or not self.attestation_verifier("action_result", path, payload)
+        ):
+            raise ValueError(
+                f"action result is not host attested: {action_id}"
+            )
+        outputs = payload.get("outputs")
+        if not isinstance(outputs, dict):
+            raise ValueError(f"action result outputs are invalid: {action_id}")
+        return dict(outputs)
+
+    @staticmethod
+    def _action_binding(
+        case: Case,
+        lifecycle_stage: str,
+        disposition_plan,
+    ) -> dict[str, object]:
+        revision = case.diagnosis_revision
+        if (
+            lifecycle_stage == "diagnosis"
+            and case.diagnosis_status.value != "frozen"
+        ):
+            revision += 1
+        return {
+            "diagnosis_revision": revision,
+            "disposition_plan_id": (
+                disposition_plan.plan_id
+                if disposition_plan is not None
+                and lifecycle_stage != "diagnosis"
+                else ""
+            ),
+        }
 
     def _execute_capabilities_locked(
         self,
@@ -596,11 +1275,25 @@ class Runtime:
         capabilities: Iterable[str],
         **kwargs,
     ) -> TaskRecord:
+        requested = tuple(Capability(item) for item in capabilities)
+        if task.assistant_id:
+            assembly = self.recipe_catalog.assemble(task.assistant_id)
+            allowed = set(assembly.required_capabilities)
+            outside = sorted(
+                capability.value
+                for capability in requested
+                if capability not in allowed
+            )
+            if outside:
+                raise ValueError(
+                    f"assistant '{task.assistant_id}' does not allow driver "
+                    f"capabilities: {', '.join(outside)}"
+                )
+        self.providers.validate_capabilities(requested)
         ledger = Ledger.load(self._task_dir(task.id))
         case = Case.load(self._case_path(task.id))
         task.status = TaskStatus.RUNNING
-        for cap_name in capabilities:
-            capability = Capability(cap_name)
+        for capability in requested:
             stop, reason = ledger.should_stop(capability.value)
             if stop:
                 task.status = TaskStatus.BLOCKED
@@ -629,7 +1322,7 @@ class Runtime:
             invoke_kwargs = dict(kwargs)
             invoke_kwargs["task_id"] = task.id
             invoke_kwargs["run_id"] = source_run_id or run_id
-            result = self.plugin.invoke(capability, **invoke_kwargs)
+            result = self.providers.invoke(capability, **invoke_kwargs)
             gate_hint = CAPABILITY_GATE_HINT.get(capability)
             producer_subjects = [
                 str(item) for item in result.metadata.get("subjects", [])
@@ -657,11 +1350,29 @@ class Runtime:
                     "flow_run_id": kwargs.get("flow_run_id", ""),
                     "device": result.metadata.get("device", ""),
                     "trusted_producer": True,
+                    "diagnosis_revision": case.diagnosis_revision,
+                    "disposition_plan_id": next(
+                        (
+                            plan.plan_id
+                            for plan in reversed(case.disposition_plans)
+                            if plan.diagnosis_revision
+                            == case.diagnosis_revision
+                            and case.disposition_progress.get(plan.plan_id)
+                            == DispositionStatus.COMPLETED
+                        ),
+                        "",
+                    ),
                 },
             )
             self._seal_trusted_evidence(task, evidence)
             self._append_evidence(task.id, evidence)
-            case.attach("h1", evidence, refutes=not result.ok())
+            hypothesis_id = str(kwargs.get("hypothesis_id") or "")
+            if not hypothesis_id and case.diagnosis_revisions:
+                hypothesis_id = case.diagnosis_revisions[-1].hypothesis_id
+            if not hypothesis_id:
+                surviving = case.surviving()
+                hypothesis_id = surviving[0].id if surviving else "h1"
+            case.attach(hypothesis_id, evidence, refutes=not result.ok())
             if result.ok() and gate_hint:
                 case.bind_gate(gate_hint, evidence)
             case.save(self._case_path(task.id))
@@ -709,6 +1420,12 @@ class Runtime:
             "device_id": evidence.metadata.get("device_id", ""),
             "subjects": evidence.metadata.get("subjects", []),
             "gates": evidence.metadata.get("gates", []),
+            "diagnosis_revision": evidence.metadata.get(
+                "diagnosis_revision", 0
+            ),
+            "disposition_plan_id": evidence.metadata.get(
+                "disposition_plan_id", ""
+            ),
             "created_at": evidence.created_at,
         }
         proof_dir = self._task_dir(task.id) / "producer-receipts"
@@ -793,6 +1510,38 @@ class Runtime:
         if next_step:
             return {"kind": "task_step", "target": next_step.title,
                     "capability": next_step.capability}
+        if task.assistant_id:
+            assembly = self.recipe_catalog.assemble(task.assistant_id)
+            if case.status.value != "resolved":
+                return {
+                    "kind": "diagnosis",
+                    "target": task.case_path,
+                    "reason": "case diagnosis is not frozen",
+                }
+            if case.disposition_status.value != "completed":
+                return {
+                    "kind": "disposition",
+                    "target": task.case_path,
+                    "reason": (
+                        "route and complete a plan for the current "
+                        "diagnosis revision"
+                    ),
+                }
+            if not case.verification_is_valid(verifier):
+                return {
+                    "kind": "verification",
+                    "target": task.case_path,
+                    "reason": "record fresh post-disposition evidence",
+                }
+            if (
+                assembly.recipe.continuous_observation
+                and not case.observation_is_valid(verifier)
+            ):
+                return {
+                    "kind": "observation",
+                    "target": task.case_path,
+                    "reason": "continuous observation has not reached stable",
+                }
         if task.global_review_required and task.global_review_status != "completed":
             suggested_tests = []
             if Path(task.global_review_path).is_file():
@@ -862,8 +1611,10 @@ class Runtime:
             except (RuntimeError, OSError, ValueError) as error:
                 blockers.append(f"global review preparation failed: {error}")
         for index, step in enumerate(task.steps, 1):
-            if step.status != StepStatus.DONE:
+            if step.status not in {StepStatus.DONE, StepStatus.SKIPPED}:
                 blockers.append(f"step {index} unfinished: {step.title}")
+            elif step.status == StepStatus.SKIPPED:
+                continue
             elif not step.evidence_ids and step.completion_source != "human_confirmed":
                 blockers.append(f"step {index} has no evidence or human confirmation: {step.title}")
             elif step.evidence_ids:
@@ -943,6 +1694,30 @@ class Runtime:
             blockers.append(f"four gates missing: {', '.join(gate_result.missing)}")
         if case.status.value != "resolved":
             blockers.append(f"case is not resolved: {case.status.value}")
+        if task.assistant_id:
+            assembly = self.recipe_catalog.assemble(task.assistant_id)
+            for step in task.steps:
+                if not step.action_id or step.status != StepStatus.DONE:
+                    continue
+                try:
+                    self._load_action_result(task, step.action_id)
+                except ValueError as error:
+                    blockers.append(str(error))
+            if case.disposition_status.value != "completed":
+                blockers.append(
+                    "assistant case disposition is not completed"
+                )
+            if not case.verification_is_valid(evidence_verifier):
+                blockers.append(
+                    "assistant case verification has not passed with valid evidence"
+                )
+            if (
+                assembly.recipe.continuous_observation
+                and not case.observation_is_valid(evidence_verifier)
+            ):
+                blockers.append(
+                    "continuous-observation assistant case is not stable"
+                )
         if task.global_review_required:
             if not Path(task.global_review_path).exists():
                 blockers.append("global review has not been prepared")
