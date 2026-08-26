@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from .evidence import EvidenceArtifact
 
@@ -146,6 +147,20 @@ class AcceptancePackage:
             self.review_token = secrets.token_hex(16)
         if not self.expires_at:
             self.expires_at = self.created_at + 3600
+        if (
+            not self.case_id.strip()
+            or not self.goal.strip()
+            or not self.criteria
+        ):
+            raise ValueError("acceptance package identity is incomplete")
+        if (
+            not math.isfinite(self.created_at)
+            or not math.isfinite(self.expires_at)
+            or self.expires_at <= self.created_at
+        ):
+            raise ValueError(
+                "acceptance package expiry must follow creation"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -166,6 +181,29 @@ class AcceptancePackage:
                 "Do not modify implementation files.",
             ],
         }
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, object]
+    ) -> "AcceptancePackage":
+        return cls(
+            case_id=str(payload["case_id"]),
+            goal=str(payload["goal"]),
+            criteria=[str(item) for item in payload["criteria"]],
+            evidence=[
+                EvidenceArtifact(**dict(item))
+                for item in payload.get("evidence", [])
+            ],
+            subject_fingerprint=str(
+                payload.get("subject_fingerprint", "")
+            ),
+            executor_id=str(payload.get("executor_id", "")),
+            review_token=str(payload["review_token"]),
+            package_id=str(payload["package_id"]),
+            status=str(payload.get("status", "prepared")),
+            created_at=float(payload["created_at"]),
+            expires_at=float(payload["expires_at"]),
+        )
 
 
 @dataclass
@@ -239,11 +277,26 @@ class AcceptanceStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
 
-    def prepare(self, package: AcceptancePackage) -> AcceptancePackage:
+    def prepare(
+        self,
+        package: AcceptancePackage,
+        *,
+        batch: Optional["AcceptanceBatch"] = None,
+    ) -> AcceptancePackage:
+        if (
+            batch is not None
+            and batch.package.to_dict() != package.to_dict()
+        ):
+            raise ValueError(
+                "acceptance batch must derive from the stored package"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(
-            json.dumps({"package": package.to_dict(), "result": None},
-                       ensure_ascii=False, indent=2),
+            json.dumps({
+                "package": package.to_dict(),
+                "batch": batch.to_dict() if batch is not None else None,
+                "result": None,
+            }, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return package
@@ -307,6 +360,12 @@ class AcceptanceStore:
             raise ValueError(
                 "overall verdict does not match the per-criterion roll-up"
             )
+        batch_payload = data.get("batch")
+        if batch_payload:
+            AcceptanceBatch.from_dict(
+                AcceptancePackage.from_dict(package),
+                batch_payload,
+            ).validate_aggregate(row)
         result = AcceptanceResult(
             Verdict(row["verdict"]),
             reasons,
@@ -344,13 +403,22 @@ class AcceptanceStore:
             artifact_sha256=row.get("artifact_sha256", ""),
         )
         artifact = Path(result.artifact_path)
-        if not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != result.artifact_sha256:
+        if (
+            not artifact.is_file()
+            or hashlib.sha256(artifact.read_bytes()).hexdigest()
+            != result.artifact_sha256
+        ):
             return None
         try:
-            artifact_row = json.loads(artifact.read_text(encoding="utf-8"))
+            artifact_row = json.loads(
+                artifact.read_text(encoding="utf-8")
+            )
         except (json.JSONDecodeError, OSError):
             return None
-        if verify_attestation is None or not verify_attestation(artifact, artifact_row):
+        if (
+            verify_attestation is None
+            or not verify_attestation(artifact, artifact_row)
+        ):
             return None
         package = data.get("package") or {}
         if (
@@ -359,27 +427,354 @@ class AcceptanceStore:
                 bool(expected_case_id)
                 and package.get("case_id") != expected_case_id
             )
-            or float(artifact_row.get("reviewed_at", result.reviewed_at))
-            > float(package.get("expires_at", 0))
-            or artifact_row.get("package_id") != package.get("package_id")
+            or float(
+                artifact_row.get("reviewed_at", result.reviewed_at)
+            ) > float(package.get("expires_at", 0))
+            or artifact_row.get("package_id")
+            != package.get("package_id")
             or artifact_row.get("case_id") != package.get("case_id")
-            or artifact_row.get("review_token") != package.get("review_token")
-            or artifact_row.get("subject_fingerprint") != package.get("subject_fingerprint")
+            or artifact_row.get("review_token")
+            != package.get("review_token")
+            or artifact_row.get("subject_fingerprint")
+            != package.get("subject_fingerprint")
             or artifact_row.get("reviewer") != result.reviewer
             or not str(package.get("executor_id", "")).strip()
-            or artifact_row.get("reviewer") == package.get("executor_id")
+            or artifact_row.get("reviewer")
+            == package.get("executor_id")
             or artifact_row.get("verdict") != result.verdict.value
             or float(artifact_row.get("expires_at", 0)) <= time.time()
         ):
             return None
-        # Re-check per-criterion coverage so a hand-written result blob cannot
-        # bypass record_file() and claim an unjudged overall pass.
         criteria = list(package.get("criteria", []))
         per_criterion = artifact_row.get("criteria_verdicts")
-        if not isinstance(per_criterion, list) or len(per_criterion) != len(criteria):
-            return None
-        if _normalize_verdict(artifact_row.get("verdict")) != aggregate_criteria_verdicts(
-            len(criteria), [_normalize_verdict(item) for item in per_criterion]
+        if (
+            not isinstance(per_criterion, list)
+            or len(per_criterion) != len(criteria)
         ):
             return None
+        if _normalize_verdict(
+            artifact_row.get("verdict")
+        ) != aggregate_criteria_verdicts(
+            len(criteria),
+            [_normalize_verdict(item) for item in per_criterion],
+        ):
+            return None
+        batch_payload = data.get("batch")
+        if batch_payload:
+            try:
+                AcceptanceBatch.from_dict(
+                    AcceptancePackage.from_dict(package),
+                    batch_payload,
+                ).validate_aggregate(artifact_row)
+            except (KeyError, TypeError, ValueError):
+                return None
         return result
+
+
+@dataclass(frozen=True)
+class AcceptanceShard:
+    shard_id: str
+    scope: tuple[str, ...]
+    criterion_indexes: tuple[int, ...]
+    read_only: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.shard_id.strip():
+            raise ValueError("acceptance shard_id is required")
+        if not self.scope or not self.criterion_indexes:
+            raise ValueError(
+                "acceptance shard requires scope and criterion indexes"
+            )
+        if not self.read_only:
+            raise ValueError("parallel acceptance shards must be read-only")
+        indexes = tuple(int(item) for item in self.criterion_indexes)
+        if (
+            any(item < 0 for item in indexes)
+            or len(set(indexes)) != len(indexes)
+        ):
+            raise ValueError(
+                "acceptance shard criterion indexes must be unique "
+                "non-negative integers"
+            )
+        object.__setattr__(
+            self, "scope", tuple(str(item) for item in self.scope)
+        )
+        object.__setattr__(
+            self, "criterion_indexes", indexes
+        )
+
+
+@dataclass(frozen=True)
+class AcceptanceBatch:
+    """Read-only shards derived from one existing AcceptancePackage."""
+
+    batch_id: str
+    package: AcceptancePackage
+    shards: tuple[AcceptanceShard, ...]
+
+    def __post_init__(self) -> None:
+        if not self.batch_id.strip():
+            raise ValueError("acceptance batch_id is required")
+        if (
+            len(self.package.subject_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.package.subject_fingerprint.lower()
+            )
+        ):
+            raise ValueError(
+                "acceptance batch requires a sha256 subject fingerprint"
+            )
+        if not self.package.executor_id.strip():
+            raise ValueError(
+                "acceptance batch requires the package executor identity"
+            )
+        if not self.shards:
+            raise ValueError("acceptance batch requires shards")
+        ids = [item.shard_id for item in self.shards]
+        if len(set(ids)) != len(ids):
+            raise ValueError("acceptance batch shard IDs must be unique")
+        indexes = [
+            index
+            for shard in self.shards
+            for index in shard.criterion_indexes
+        ]
+        expected = list(range(len(self.package.criteria)))
+        if sorted(indexes) != expected:
+            raise ValueError(
+                "acceptance shards must partition every package criterion "
+                "exactly once"
+            )
+        object.__setattr__(self, "shards", tuple(self.shards))
+
+    @property
+    def case_id(self) -> str:
+        return self.package.case_id
+
+    @property
+    def subject_fingerprint(self) -> str:
+        return self.package.subject_fingerprint
+
+    @property
+    def executor_id(self) -> str:
+        return self.package.executor_id
+
+    @property
+    def created_at(self) -> float:
+        return self.package.created_at
+
+    @property
+    def expires_at(self) -> float:
+        return self.package.expires_at
+
+    def to_dict(self) -> dict:
+        return {
+            "batch_id": self.batch_id,
+            "package_id": self.package.package_id,
+            "case_id": self.package.case_id,
+            "review_token": self.package.review_token,
+            "subject_fingerprint": self.package.subject_fingerprint,
+            "executor_id": self.package.executor_id,
+            "shards": [asdict(item) for item in self.shards],
+            "created_at": self.package.created_at,
+            "expires_at": self.package.expires_at,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        package: AcceptancePackage,
+        payload: Mapping[str, object],
+    ) -> "AcceptanceBatch":
+        expected_identity = {
+            "package_id": package.package_id,
+            "case_id": package.case_id,
+            "review_token": package.review_token,
+            "subject_fingerprint": package.subject_fingerprint,
+            "executor_id": package.executor_id,
+            "created_at": package.created_at,
+            "expires_at": package.expires_at,
+        }
+        if any(
+            payload.get(key) != value
+            for key, value in expected_identity.items()
+        ):
+            raise ValueError(
+                "acceptance batch does not match its package"
+            )
+        return cls(
+            batch_id=str(payload["batch_id"]),
+            package=package,
+            shards=tuple(
+                AcceptanceShard(**dict(item))
+                for item in payload.get("shards", [])
+            ),
+        )
+
+    def _aggregate_rows(
+        self,
+        results: List[Mapping[str, object]],
+        *,
+        verify_attestation: Optional[
+            Callable[[Mapping[str, object]], bool]
+        ],
+        now: float,
+    ) -> dict:
+        if not math.isfinite(now) or now >= self.package.expires_at:
+            raise ValueError("acceptance batch has expired")
+        expected_identity = {
+            "batch_id": self.batch_id,
+            "package_id": self.package.package_id,
+            "case_id": self.package.case_id,
+            "review_token": self.package.review_token,
+            "subject_fingerprint": self.package.subject_fingerprint,
+        }
+        by_shard = {}
+        for source in results:
+            row = dict(source)
+            if any(
+                row.get(key) != value
+                for key, value in expected_identity.items()
+            ):
+                raise ValueError(
+                    "acceptance result does not match the frozen package"
+                )
+            shard_id = str(row.get("shard_id") or "")
+            if shard_id in by_shard:
+                raise ValueError(
+                    f"duplicate acceptance shard result: {shard_id}"
+                )
+            if (
+                verify_attestation is not None
+                and not verify_attestation(row)
+            ):
+                raise ValueError(
+                    "parallel acceptance result is not host attested"
+                )
+            by_shard[shard_id] = row
+        expected = {item.shard_id: item for item in self.shards}
+        if set(by_shard) != set(expected):
+            missing = sorted(set(expected) - set(by_shard))
+            extra = sorted(set(by_shard) - set(expected))
+            raise ValueError(
+                "acceptance batch result set mismatch: "
+                f"missing={missing}, extra={extra}"
+            )
+        criterion_verdicts = ["pending"] * len(self.package.criteria)
+        shard_results = []
+        reviewers = set()
+        reasons = []
+        reviewed_at_values = []
+        for shard_id in sorted(expected):
+            shard = expected[shard_id]
+            row = by_shard[shard_id]
+            shard_verdicts = [
+                _normalize_verdict(item)
+                for item in list(row.get("criteria_verdicts") or [])
+            ]
+            if len(shard_verdicts) != len(shard.criterion_indexes):
+                raise ValueError(
+                    f"acceptance shard '{shard_id}' must judge every criterion"
+                )
+            verdict = aggregate_criteria_verdicts(
+                len(shard.criterion_indexes), shard_verdicts
+            )
+            if _normalize_verdict(str(row.get("verdict"))) != verdict:
+                raise ValueError(
+                    f"acceptance shard '{shard_id}' verdict mismatch"
+                )
+            reviewer = str(row.get("reviewer") or "").strip()
+            reviewed_at = float(row.get("reviewed_at", 0))
+            if (
+                not reviewer
+                or reviewer == self.package.executor_id
+                or reviewer in reviewers
+                or not math.isfinite(reviewed_at)
+                or reviewed_at < self.package.created_at
+                or reviewed_at > min(now + 30, self.package.expires_at)
+            ):
+                raise ValueError(
+                    f"acceptance shard '{shard_id}' is not independent"
+                )
+            shard_reasons = [
+                str(item).strip()
+                for item in list(row.get("reasons") or [])
+                if str(item).strip()
+            ]
+            if not shard_reasons:
+                raise ValueError(
+                    f"acceptance shard '{shard_id}' requires reasons"
+                )
+            for index, criterion_verdict in zip(
+                shard.criterion_indexes, shard_verdicts
+            ):
+                criterion_verdicts[index] = criterion_verdict
+            reviewers.add(reviewer)
+            reviewed_at_values.append(reviewed_at)
+            reasons.extend(
+                f"{shard_id}: {reason}" for reason in shard_reasons
+            )
+            shard_results.append({
+                **expected_identity,
+                "shard_id": shard_id,
+                "reviewer": reviewer,
+                "verdict": verdict,
+                "criteria_verdicts": shard_verdicts,
+                "reasons": shard_reasons,
+                "reviewed_at": reviewed_at,
+            })
+        overall = aggregate_criteria_verdicts(
+            len(self.package.criteria), criterion_verdicts
+        )
+        return {
+            **expected_identity,
+            "reviewer": f"parallel:{self.batch_id}",
+            "verdict": overall,
+            "criteria_verdicts": criterion_verdicts,
+            "reasons": reasons,
+            "reviewed_at": max(reviewed_at_values),
+            "expires_at": self.package.expires_at,
+            "shards": shard_results,
+        }
+
+    def aggregate(
+        self,
+        results: List[Mapping[str, object]],
+        *,
+        verify_attestation: Optional[
+            Callable[[Mapping[str, object]], bool]
+        ] = None,
+        now: Optional[float] = None,
+    ) -> dict:
+        current = time.time() if now is None else float(now)
+        if verify_attestation is None:
+            raise ValueError(
+                "parallel acceptance requires a host attestation verifier"
+            )
+        return self._aggregate_rows(
+            results,
+            verify_attestation=verify_attestation,
+            now=current,
+        )
+
+    def validate_aggregate(
+        self,
+        row: Mapping[str, object],
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        current = time.time() if now is None else float(now)
+        rebuilt = self._aggregate_rows(
+            [dict(item) for item in row.get("shards", [])],
+            verify_attestation=None,
+            now=current,
+        )
+        for key in (
+            "batch_id", "package_id", "case_id", "review_token",
+            "subject_fingerprint", "reviewer", "verdict",
+            "criteria_verdicts", "reasons", "reviewed_at", "expires_at",
+        ):
+            if row.get(key) != rebuilt.get(key):
+                raise ValueError(
+                    f"acceptance batch aggregate mismatch: {key}"
+                )

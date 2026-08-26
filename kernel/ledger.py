@@ -56,6 +56,28 @@ class Round:
     ended_at: Optional[float] = None
 
 
+@dataclass
+class TimingEvent:
+    event_id: str
+    phase: str
+    status: str = "running"
+    task_id: str = ""
+    run_id: str = ""
+    worker_id: str = ""
+    action_id: str = ""
+    capability_id: str = ""
+    provider_id: str = ""
+    started_at: float = field(default_factory=time.time)
+    ended_at: Optional[float] = None
+    blocked_seconds: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        if self.ended_at is None:
+            return 0.0
+        return max(0.0, self.ended_at - self.started_at)
+
+
 class Ledger:
     """轮次记账 + trace 时间线 + 反循环闸门。"""
 
@@ -66,12 +88,14 @@ class Ledger:
         self.dir = Path(data_dir)
         self.rounds: List[Round] = []
         self.traces: List[str] = []
+        self.timings: List[TimingEvent] = []
 
     @classmethod
     def load(cls, data_dir: str | Path) -> "Ledger":
         ledger = cls(data_dir)
         rounds_path = ledger.dir / "rounds.json"
         traces_path = ledger.dir / "trace.jsonl"
+        timings_path = ledger.dir / "timings.json"
         if rounds_path.exists():
             for row in json.loads(rounds_path.read_text(encoding="utf-8")):
                 ledger.rounds.append(Round(
@@ -88,6 +112,11 @@ class Ledger:
                 for line in traces_path.read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
+        if timings_path.exists():
+            for row in json.loads(
+                timings_path.read_text(encoding="utf-8")
+            ):
+                ledger.timings.append(TimingEvent(**row))
         return ledger
 
     def log_round_start(self, goal: str, root_cause_tag: str = "") -> Round:
@@ -123,6 +152,109 @@ class Ledger:
         self.traces.append(line)
         return line
 
+    def start_timing(
+        self,
+        phase: str,
+        *,
+        task_id: str = "",
+        run_id: str = "",
+        worker_id: str = "",
+        action_id: str = "",
+        capability_id: str = "",
+        provider_id: str = "",
+        started_at: Optional[float] = None,
+    ) -> TimingEvent:
+        event = TimingEvent(
+            event_id=(
+                f"timing-{len(self.timings) + 1}-"
+                f"{int((started_at or time.time()) * 1000000)}"
+            ),
+            phase=phase,
+            task_id=task_id,
+            run_id=run_id,
+            worker_id=worker_id,
+            action_id=action_id,
+            capability_id=capability_id,
+            provider_id=provider_id,
+            started_at=time.time() if started_at is None else started_at,
+        )
+        self.timings.append(event)
+        return event
+
+    def end_timing(
+        self,
+        event_id: str,
+        status: str,
+        *,
+        blocked_seconds: float = 0.0,
+        ended_at: Optional[float] = None,
+    ) -> TimingEvent:
+        event = next(
+            (item for item in self.timings if item.event_id == event_id),
+            None,
+        )
+        if event is None:
+            raise KeyError(f"timing event not found: {event_id}")
+        if event.ended_at is not None:
+            raise ValueError(f"timing event already ended: {event_id}")
+        event.status = str(status)
+        event.ended_at = time.time() if ended_at is None else ended_at
+        event.blocked_seconds = max(0.0, float(blocked_seconds))
+        return event
+
+    def timing_metrics(self) -> dict:
+        completed = [
+            item for item in self.timings
+            if item.ended_at is not None
+        ]
+        by_phase = {}
+        by_action = {}
+        by_capability = {}
+        by_provider = {}
+        for item in completed:
+            for target, key in (
+                (by_phase, item.phase),
+                (by_action, item.action_id),
+                (by_capability, item.capability_id),
+                (by_provider, item.provider_id),
+            ):
+                if key:
+                    target[key] = round(
+                        target.get(key, 0.0) + item.duration, 6
+                    )
+        sweep = []
+        for item in completed:
+            sweep.append((item.started_at, 1))
+            sweep.append((float(item.ended_at), -1))
+        active = max_concurrency = 0
+        for _, delta in sorted(sweep, key=lambda row: (row[0], row[1])):
+            active += delta
+            max_concurrency = max(max_concurrency, active)
+        wall_seconds = (
+            max(float(item.ended_at) for item in completed)
+            - min(item.started_at for item in completed)
+            if completed else 0.0
+        )
+        return {
+            "events": len(completed),
+            "wall_seconds": round(max(0.0, wall_seconds), 3),
+            "work_seconds": round(
+                sum(item.duration for item in completed), 3
+            ),
+            "blocked_seconds": round(
+                sum(item.blocked_seconds for item in completed), 3
+            ),
+            "retry_events": sum(
+                item.status in {"failed", "blocked", "retry"}
+                for item in completed
+            ),
+            "max_concurrency": max_concurrency,
+            "by_phase": by_phase,
+            "by_action": by_action,
+            "by_capability": by_capability,
+            "by_provider": by_provider,
+        }
+
     def flush(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
         rounds = []
@@ -136,5 +268,13 @@ class Ledger:
         )
         (self.dir / "trace.jsonl").write_text(
             "\n".join(json.dumps({"line": t}, ensure_ascii=False) for t in self.traces),
+            encoding="utf-8",
+        )
+        (self.dir / "timings.json").write_text(
+            json.dumps(
+                [asdict(item) for item in self.timings],
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )

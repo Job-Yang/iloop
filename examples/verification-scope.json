@@ -1,0 +1,31 @@
+{
+  "global_shared": [
+    "kernel/",
+    "core/",
+    "shared/",
+    "common/",
+    "public/",
+    "api/"
+  ],
+  "module_shared": [
+    "services/",
+    "components/"
+  ],
+  "ui_hint": [
+    "view",
+    "screen",
+    "page",
+    "component",
+    "storyboard",
+    "xib"
+  ],
+  "asset_hint": [
+    ".xcassets/",
+    "assets/",
+    "images/"
+  ],
+  "ignore": [
+    "docs/",
+    "changelog"
+  ]
+}

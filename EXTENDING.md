@@ -46,6 +46,7 @@ python3 -m host_cli extension-init team.oncall
 ~/.iloop/extensions/team.oncall/
 ├── manifest.json
 ├── flows.json
+├── capabilities.json      # 可选：扩展自己的 Driver Capability
 ├── actions.json           # 应用动作契约
 ├── recipes.json           # 助手动作组合
 ├── application.py         # 可选：应用动作 handler
@@ -69,6 +70,7 @@ Agent 根据目标自主选择最少的插口，不要求每个扩展都实现�
 | 用户要做什么 | 该实现什么 | 接入方式 |
 |---|---|---|
 | 增加一类业务任务 | 业务 flow | 写 `flows.json` |
+| 增加新的底层执行能力 | `CapabilitySpec` | 写 `capabilities.json` |
 | 定义可组合的业务动作 | `ActionSpec` | 写 `actions.json` |
 | 组合 Oncall/Bugfix/稳定性助手 | `AssistantRecipe` | 写 `recipes.json` |
 | 实现动作编排逻辑 | Action handler | 在 `application.py` 导出 `create_action_handlers(config)` |
@@ -92,7 +94,21 @@ flow 至少写清：
 
 ### Action 和 Recipe 负责“做什么”
 
-`actions.json` 中每个 `action_id` 必须带扩展命名空间，并声明输入、输出、风险、副作用、允许的助手和所需 Driver Capability。Action 用 `lifecycle_stage` 声明 diagnosis / disposition / verification / observation 阶段；处置 Action 还要声明 `disposition_kind`（`code_change / isolation / human_handoff / observe`）。`recipes.json` 只保存版本、有序动作列表、入口和是否持续观察，不能写部署分支。
+`capabilities.json` 中每个 `capability_id` 必须带扩展命名空间。它声明输入、输出、副作用、可替代工具组和支持的 Deployment；Provider 只负责实现，不得在加载时偷偷增加未声明能力。重复、未知和输出缺失都会 fail closed。
+
+`actions.json` 中每个 `action_id` 必须带扩展命名空间，并声明输入、输出、风险、副作用、允许的助手和所需 Driver Capability。Action 的副作用声明不能比底层 Capability 更弱。Action 用 `lifecycle_stage` 声明 diagnosis / disposition / verification / observation 阶段；处置 Action 还要声明 `disposition_kind`（`code_change / isolation / human_handoff / observe`）。`recipes.json` 只保存版本、有序动作列表、入口和是否持续观察，不能写部署分支。
+
+```json
+{
+  "capability_id": "team.oncall.incident_scan",
+  "description": "Read incidents from the configured monitoring service",
+  "inputs": {"project": "string"},
+  "outputs": {"incidents": "array"},
+  "side_effect": "read",
+  "required_tools": [["sentry-cli", "custom-monitor-cli"]],
+  "supported_deployments": ["team.oncall.local"]
+}
+```
 
 需要执行应用逻辑时，在 manifest 的 `provides.application` 指向 Python 模块：
 
@@ -115,7 +131,14 @@ Capability Plugin 是宿主进程内执行的可信代码。安装第三方插�
 
 需要运行时代码时，在 `manifest.json` 设置 `provides.plugin`，并导出 `create_plugin(config)`。返回对象必须满足 `Plugin` 协议。多个 Provider 可以同时装配；能力重叠时必须显式绑定，否则 fail closed。加载器会拒绝路径逃逸、缺文件、重复 `platform_id` 和不符合契约的返回值。
 
+需要加入 `AssistantSuite` 的 Provider 还必须实现 `runtime_fingerprint()`，返回 64 位
+SHA-256。摘要要同时覆盖实现版本和影响执行结果的配置，但不能泄露密钥原文。Provider
+不提供有效摘要时仍可用于普通装配，Suite 会保持 `production_ready=false`，旧 smoke
+不能替新实现或新配置背书。
+
 如果能力不支持，返回 `unsupported`；不要假装成功。
+
+有 `workspace_write`、`external_write` 或 `process` 副作用的 Action 必须由宿主提供短期 `AuthorizationGrant`。Grant 绑定 Task、Case、诊断 revision、policy 指纹和 Action；兼容层直接执行副作用 Capability 时必须由 `allowed_capabilities` 单独授权。扩展不能从用户文本自行推导授权，也不能在 Provider 内补默认放行。宿主还应把同一授权接到 PreToolUse Gate，阻止绕过 Runtime 的直接 shell 写操作；未知工具默认拒绝。
 
 ### 领域判断先放 flow
 
@@ -135,6 +158,8 @@ python3 -m host_cli extension-validate ~/.iloop/extensions/team.oncall
 - flow 没带扩展命名空间；
 - flow 与核心 ID 冲突；
 - Action/Recipe 没有扩展命名空间；
+- Capability 没有扩展命名空间、重复或 schema 不完整；
+- Action 漏报底层 Capability 的副作用；
 - Recipe 引用不存在的 Action 或风险声明冲突；
 - manifest、flows、actions 或 recipes 格式非法。
 

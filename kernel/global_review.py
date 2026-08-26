@@ -14,7 +14,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 # 评审三裁决协议：对一片改动只给三种结论之一，对照计划期冻结的设计契约（不改边界），
@@ -58,7 +58,8 @@ BEHAVIOR_SUFFIXES = {
     ".json", ".yaml", ".yml", ".plist", ".podspec", ".sh", ".bash",
     ".xcconfig", ".entitlements", ".toml", ".ini", ".xml", ".pbxproj",
     ".resolved", ".lock", ".gradle", ".properties", ".strings",
-    ".stringsdict", ".storyboard", ".xib", ".bazel",
+    ".stringsdict", ".storyboard", ".xib", ".bazel", ".css", ".scss",
+    ".sass", ".less", ".html", ".vue", ".svelte",
 }
 BEHAVIOR_FILENAMES = {
     "Dockerfile", "Makefile", "Podfile", "Gemfile", "BUILD", "WORKSPACE",
@@ -109,6 +110,10 @@ class ImpactItem:
     consumers: List[str] = field(default_factory=list)
     entry_points: List[str] = field(default_factory=list)
     suggested_tests: List[str] = field(default_factory=list)
+    ownership: str = "unknown"
+    verification_scope: str = "R2"
+    verification_mode: str = "targeted"
+    visual_required: bool = False
     evidence_ids: List[str] = field(default_factory=list)
     status: str = "pending"  # pending | verified | accepted
     resolution: str = ""
@@ -126,6 +131,12 @@ class GlobalReview:
     score: int
     risk_level: str
     fingerprint: str
+    verification_scope: str = "R0"
+    verification_mode: str = "spot"
+    visual_required: bool = False
+    symptom_is_ui: bool = False
+    scope_rules: dict = field(default_factory=dict)
+    unknown_impacts: List[str] = field(default_factory=list)
     status: str = "pending"
     created_at: float = field(default_factory=time.time)
     completed_at: float = 0.0
@@ -139,8 +150,17 @@ class GlobalReview:
     def pending(self) -> List[ImpactItem]:
         return [item for item in self.impacts if item.status == "pending"]
 
-    def verify(self, target: str, evidence_ids: List[str], *, accepted: bool = False,
-               resolution: str = "", user_confirmation_id: str = "") -> None:
+    def verify(
+        self,
+        target: str,
+        evidence_ids: List[str],
+        *,
+        accepted: bool = False,
+        resolution: str = "",
+        user_confirmation_id: str = "",
+        evidence_capabilities: Optional[List[str]] = None,
+        evidence_subjects: Optional[dict[str, List[str]]] = None,
+    ) -> None:
         matches = [entry for entry in self.impacts if entry.target == target]
         if not matches:
             raise KeyError(f"global-review impact not found: {target}")
@@ -155,6 +175,24 @@ class GlobalReview:
             raise ValueError(
                 "accepted risk requires a resolution reason and user confirmation evidence"
             )
+        if item.visual_required:
+            screenshot_ids = [
+                evidence_id
+                for evidence_id, capability in zip(
+                    evidence_ids,
+                    evidence_capabilities or [],
+                )
+                if capability == "screenshot"
+            ]
+            subjects = evidence_subjects or {}
+            if not any(
+                item.target in subjects.get(evidence_id, [])
+                for evidence_id in screenshot_ids
+            ):
+                raise ValueError(
+                    "visual impact verification requires screenshot "
+                    "evidence covering the target"
+                )
         item.evidence_ids = list(evidence_ids)
         if user_confirmation_id:
             item.evidence_ids.append(user_confirmation_id)
@@ -172,9 +210,17 @@ class GlobalReview:
     @classmethod
     def load(cls, path: str | Path) -> "GlobalReview":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        data["impacts"] = [ImpactItem(**row) for row in data.get("impacts", [])]
+        data["impacts"] = [
+            ImpactItem(**row) for row in data.get("impacts", [])
+        ]
         # Old reviews remain readable but become stale and must be regenerated.
         data.setdefault("fingerprint", "")
+        data.setdefault("verification_scope", "R0")
+        data.setdefault("verification_mode", "spot")
+        data.setdefault("visual_required", False)
+        data.setdefault("symptom_is_ui", False)
+        data.setdefault("scope_rules", {})
+        data.setdefault("unknown_impacts", [])
         return cls(**data)
 
 
@@ -329,7 +375,8 @@ def _definitions(text: str, suffix: str = "") -> List[tuple[int, str]]:
             (text.count("\n", 0, match.start()) + 1, match.group(1))
             for match in SOURCE_DEFINITION_RE.finditer(text)
         ]
-        definitions.extend(_objc_selectors(text))
+        if suffix in {".m", ".mm", ".h"}:
+            definitions.extend(_objc_selectors(text))
     definitions.extend(
         (text.count("\n", 0, match.start()) + 1, match.group(1))
         for match in PUBLIC_ASSIGNMENT_RE.finditer(text)
@@ -693,8 +740,164 @@ def _changed_symbols(root: Path, base: str, changed: List[str]) -> dict[str, Lis
     return {path: sorted(names) for path, names in symbols_by_file.items() if names}
 
 
-def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> GlobalReview:
+_SCOPE_ORDER = {"R0": 0, "R1": 1, "R2": 2, "R3": 3}
+
+
+def _path_matches(path: str, patterns: List[str]) -> bool:
+    lowered = path.lower()
+    return any(
+        pattern
+        and (
+            lowered == pattern.lower()
+            or lowered.startswith(pattern.lower())
+            or pattern.lower() in lowered
+        )
+        for pattern in patterns
+    )
+
+
+def _is_visual_path(path: str) -> bool:
+    candidate = Path(path)
+    suffix = candidate.suffix.lower()
+    if suffix in {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+        ".xcassets", ".storyboard", ".xib", ".tsx", ".jsx",
+        ".css", ".scss", ".sass", ".less", ".html", ".vue", ".svelte",
+    }:
+        return True
+    parts = {part.casefold() for part in candidate.parts[:-1]}
+    if (
+        suffix in SOURCE_SUFFIXES | BEHAVIOR_SUFFIXES
+        and parts & {
+        "ui", "view", "views", "screen", "screens", "page", "pages",
+        "component", "components",
+        }
+    ):
+        return True
+    if suffix not in {".swift", ".m", ".mm", ".h"}:
+        return False
+    return bool(re.search(
+        r"(?:view|viewcontroller|screen|page|cell|header|footer)$",
+        candidate.stem,
+        re.IGNORECASE,
+    ))
+
+
+def _normalize_scope_rules(rules: Optional[dict]) -> dict:
+    if rules is None:
+        return {}
+    if not isinstance(rules, dict):
+        raise ValueError("verification scope rules must be an object")
+    supported = {
+        "global_shared", "module_shared", "ui_hint",
+        "asset_hint", "ignore",
+    }
+    unknown = sorted(set(rules) - supported)
+    if unknown:
+        raise ValueError(
+            "unknown verification scope rules: "
+            + ", ".join(unknown)
+        )
+    normalized = {}
+    for key, value in rules.items():
+        if (
+            not isinstance(value, list)
+            or any(not isinstance(item, str) for item in value)
+        ):
+            raise ValueError(
+                f"verification scope rule '{key}' must be an array of strings"
+            )
+        normalized[key] = [
+            item.strip() for item in value if item.strip()
+        ]
+    return normalized
+
+
+def _verification_scope(
+    item: ImpactItem,
+    *,
+    changed_files: List[str],
+    symptom_is_ui: bool,
+    rules: dict,
+) -> tuple[str, str, str, bool]:
+    target = item.target
+    ownership = "unknown"
+    scope = "R2"
+    visual = symptom_is_ui or _is_visual_path(target)
+    if item.kind in {"shared_surface", "deleted_behavior"}:
+        ownership, scope = "global_shared", "R3"
+    elif item.kind == "behavioral_file" and item.entry_points:
+        ownership, scope = "global_shared", "R3"
+    elif any(
+        marker in target.lower() for marker in SHARED_PATH_MARKERS
+    ):
+        ownership, scope = "global_shared", "R3"
+    elif item.consumers:
+        roots = {
+            Path(path).parts[0]
+            for path in [target, *item.consumers]
+            if Path(path).parts
+        }
+        if len(roots) > 1:
+            ownership, scope = "global_shared", "R3"
+        else:
+            ownership, scope = "module_shared", "R2"
+    else:
+        suffix = Path(target).suffix.lower()
+        if suffix in {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+            ".xcassets", ".strings",
+        }:
+            ownership, scope, visual = "page_private", "R0", True
+        elif suffix in SOURCE_SUFFIXES or suffix in BEHAVIOR_SUFFIXES:
+            ownership, scope = "unknown", "R2"
+        elif changed_files and all(
+            Path(path).suffix.lower() in {".md", ".txt", ".rst"}
+            for path in changed_files
+        ):
+            ownership, scope = "documentation", "R0"
+
+    # Project rules may conservatively increase scope, never lower the
+    # code-derived floor.
+    if _path_matches(target, list(rules.get("global_shared", []))):
+        ownership, scope = "global_shared", "R3"
+    elif (
+        _path_matches(target, list(rules.get("module_shared", [])))
+        and _SCOPE_ORDER[scope] < _SCOPE_ORDER["R2"]
+    ):
+        ownership, scope = "module_shared", "R2"
+    if _path_matches(target, list(rules.get("ui_hint", []))):
+        visual = True
+        if _SCOPE_ORDER[scope] < _SCOPE_ORDER["R1"]:
+            ownership, scope = "page_private", "R1"
+    if _path_matches(target, list(rules.get("asset_hint", []))):
+        visual = True
+    if (
+        scope == "R0"
+        and ownership == "documentation"
+        and _path_matches(target, list(rules.get("ignore", [])))
+    ):
+        ownership = "ignored"
+    if visual and _SCOPE_ORDER[scope] < _SCOPE_ORDER["R1"]:
+        scope = "R1"
+    mode = {
+        "R0": "spot",
+        "R1": "spot",
+        "R2": "targeted",
+        "R3": "full",
+    }[scope]
+    return ownership, scope, mode, visual
+
+
+def analyze_global_impact(
+    project_root: str | Path,
+    *,
+    base: str = "HEAD",
+    symptom_is_ui: bool = False,
+    scope_rules: Optional[dict] = None,
+) -> GlobalReview:
     root = Path(project_root).resolve()
+    normalized_rules = _normalize_scope_rules(scope_rules)
     changed = _changed_files(root, base)
     additions, deletions = _numstat(root, base)
     symbols_by_file = _changed_symbols(root, base, changed)
@@ -854,6 +1057,39 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
             tokens,
             item.consumers,
         )
+        (
+            item.ownership,
+            item.verification_scope,
+            item.verification_mode,
+            item.visual_required,
+        ) = _verification_scope(
+            item,
+            changed_files=changed,
+            symptom_is_ui=symptom_is_ui,
+            rules=normalized_rules,
+        )
+
+    verification_scope = max(
+        (item.verification_scope for item in impacts),
+        key=lambda value: _SCOPE_ORDER[value],
+        default="R0",
+    )
+    verification_mode = {
+        "R0": "spot",
+        "R1": "spot",
+        "R2": "targeted",
+        "R3": "full",
+    }[verification_scope]
+    visual_required = symptom_is_ui or any(
+        item.visual_required for item in impacts
+    )
+    if visual_required and verification_scope == "R0":
+        verification_scope = "R1"
+        verification_mode = "spot"
+    unknown_impacts = sorted(
+        item.target for item in impacts
+        if item.ownership == "unknown"
+    )
 
     score = additions // 40 + deletions // 20 + len(changed) * 3 + len(symbols) * 2
     if any(item.kind == "shared_surface" for item in impacts):
@@ -883,6 +1119,8 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
                 "symbols": symbols_by_file,
                 "diff": _git(root, "diff", "--binary", base),
                 "untracked_hashes": untracked_hashes,
+                "symptom_is_ui": bool(symptom_is_ui),
+                "scope_rules": normalized_rules,
                 "impact_scope": [
                     {
                         "kind": item.kind,
@@ -891,11 +1129,21 @@ def analyze_global_impact(project_root: str | Path, *, base: str = "HEAD") -> Gl
                         "consumers": item.consumers,
                         "entry_points": item.entry_points,
                         "suggested_tests": item.suggested_tests,
+                        "ownership": item.ownership,
+                        "verification_scope": item.verification_scope,
+                        "verification_mode": item.verification_mode,
+                        "visual_required": item.visual_required,
                     }
                     for item in impacts
                 ],
             }, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest(),
+        verification_scope=verification_scope,
+        verification_mode=verification_mode,
+        visual_required=visual_required,
+        symptom_is_ui=bool(symptom_is_ui),
+        scope_rules=normalized_rules,
+        unknown_impacts=unknown_impacts,
         status="completed" if no_changes else "pending",
         completed_at=time.time() if no_changes else 0.0,
     )

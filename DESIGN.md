@@ -330,6 +330,37 @@ DeploymentProfile
 
 换业务只替换业务层，换平台只替换执行插件，核心循环不需要重写。
 
+Driver Capability 也不是一个永远封闭的枚举。内置的 build、logs、screenshot 保留兼容接口；扩展可以声明带命名空间的 `CapabilitySpec`，写清输入、输出、副作用、依赖工具和可用 Deployment。Action 引用不存在的能力、Provider 漏输出、或者 Action 隐瞒底层副作用，都会在装配或调用阶段被拒绝。
+
+## 能装配，还要证明能安全运行
+
+一套 Recipe 能装配，只说明引用关系成立。真正交给用户前，还要分清五种状态：
+
+```text
+declared
+  -> handler installed
+      -> implementation ready
+          -> runtime ready
+              -> production ready
+```
+
+`AssistantSuite` 对任意助手列表执行 validate、compile、preflight、install、smoke 和 status。`production_ready` 只接受当前 Recipe、Deployment、Provider 配置指纹下的新鲜 live smoke；smoke 产物被改、回执过期或配置变化后，状态立即回到 blocked。
+
+安全执行同样不能只靠“用户好像同意了”。有副作用的 Action 在调用 Provider 前必须验证 `AuthorizationGrant`。Grant 绑定 Task、Case、诊断 revision、policy 指纹、允许的 Action 和有效期。Runtime 管 Action 边界，宿主的 PreToolUse Gate 管 shell、写文件等旁路；两层都通过，写操作才成立。
+
+源码修复使用一条可追溯血缘：
+
+```text
+base commit
+  -> isolated worktree
+      -> allowed paths + change digest
+          -> candidate commit
+              -> draft change request
+                  -> CI for the exact candidate commit
+```
+
+公开 Git Provider 实现这条链，GitHub 只是第一个平台 Adapter。核心只认识 Snapshot、Candidate、ChangeRequest 和 CI Receipt，不认识具体代码托管平台。
+
 判断一段逻辑是否应进入核心，可以只问一句：
 
 > 换一家公司、换一套工具链，这段逻辑还成立吗？
@@ -441,52 +472,25 @@ iLoop 不把自己的生命线绑在某个 IDE 或模型上。它分成三部分
 
 指标只用于发现问题和展示过程，不能替代真实验收。这与 VDD 的原则一致：覆盖率、步骤数、自动化次数都不是“完成”的门槛。
 
+提速也服从同一原则。GlobalReview 先根据完整影响图把验证范围归为 R0 控件、R1 页面、R2 模块或 R3 全局，再选择 spot、targeted 或 full；未知归属默认按 R2 处理，UI 任务始终保留视觉点验。Ledger 记录 Action、Capability、Provider、阻塞和并发时间，Dashboard 才能回答时间究竟花在哪里。
+
+只读、互不依赖的验收分片可以并行，但必须绑定同一 subject fingerprint，由宿主证明 reviewer 身份，最后逐条汇总。写操作、共享设备和有顺序依赖的验证仍然串行。iLoop 优化的是等待，不用并发换取不确定性。
+
 对应实现：`kernel/ledger.py`、`kernel/dashboard.py`。
 
 ---
 
-## 开源版当前落到了哪里
+## 开源实现提供什么
 
-### 已实现
+开源仓随版本一起交付入口协议、平台无关内核、Git/GitHub 参考 Provider、BugFix 参考 Recipe 和 iOS 官方插件。用户把仓库地址交给 Agent 后，安装器会先在候选目录完成 selftest 与 fresh-clone smoke，再原子切换正式目录并注册宿主入口。
 
-- 平台无关内核，纯 Python 标准库；
-- 入口提示词与按需分片提示词；
-- 10 个内置 flow 和 L1/L2/L3 放权；
-- 证据分级、四道关卡、病例、诊断专家；
-- `tick / consult / reroute` 持续诊断；
-- 独立验收与改动风险粗筛；
-- 完整 diff 全局影响复核：公共定义、调用方、共享边界、删除逻辑逐项留证；
-- 错题本、反循环、能力 Gate、红线守卫；
-- 提效看板；
-- Agent 驱动的扩展脚手架和校验器；
-- 应用动作 `ActionSpec`、助手 `AssistantRecipe` 与多 Provider 能力路由；
-- 版本化 Resolve Case：根因 revision、处置、验证和观察状态机；
-- 与 Recipe 正交的 `DeploymentProfile`，以及签名 TaskEnvelope、持久化防重放和 WorkerReceipt；
-- 可恢复运行时：Task 计划、当前阶段、Case/Gate、轮次账、证据索引和看板均落盘，`run/resume/tasks` 可跨会话继续；
-- 工程记忆：inputs manifest、Constitution、结构化 blocker、records；
-- 可复用 UI Flow：路径图、验证节点证据、转 Task；
-- iOS 官方插件：XcodeBuildMCP build/run/install/launch/单次绑定动态日志/模拟器 UI 自动化，以及固定版本 WDA 托管、screenshot、probe、crash；
-- 模拟器与真机执行路径，真机 UI 基于 Appium WebDriverAgent；
-- 307 条 selftest 断言（内核 232 + iOS 插件 75）。
+内核提供证据、四关、Case、Task、Capability Gate、全局复核、独立验收、错题本、看板、动态 Capability、Action/Recipe、Provider/Deployment、签名 Envelope/Receipt、授权 Gate、Suite readiness 和验证耗时账本。它们都只依赖 Python 标准库。
 
-### 已真实验证
+公开 Git Provider 已用本地真实 Git 仓库跑通隔离 worktree、改动快照、候选提交和远端分支；draft PR 与精确 candidate CI 使用可替换 Runner 做协议级 fixture，并覆盖血缘篡改拒绝。真实 GitHub 写入仍需要用户自己的登录态和测试仓，不能拿 fixture 冒充线上平台验收。
 
-- 内核和 iOS 插件 selftest 全绿；
-- Xcode 自动发现；
-- XcodeBuildMCP 生成的 SwiftUI fixture 已真实跑通模拟器 build-and-run、UI tree、截图、snapshot 自动恢复 tap 和本次 run 绑定日志；
-- E2E 反馈已修复截图冷启动超时、宿主尾部非零覆盖真实产物、运行日志 home 路径解析、后台 helper 阻塞、进程组泄漏与重复语义控件误重绑；
-- oncall demo 从事件到病例、证据、四关、通知完整运行；
-- 扩展创建、校验和防覆盖核心 flow。
-- 两个不同助手的 Action 组合、双 Provider 路由、完整两动作本地 Recipe 回放；
-- Envelope 输入/Recipe/TTL/节点/Git 基线防篡改，Receipt 动作覆盖与 replay 防护。
+iOS 插件继续提供 XcodeBuildMCP build/run/install/launch、单次绑定动态日志、模拟器 UI 自动化，以及固定版本 WDA 托管、screenshot、probe 和 crash。模拟器链已真实验证；真机仍取决于用户自己的设备、Apple Developer 签名和 `iproxy`。
 
-### 仍需继续验证
-
-- 将本次生成式 fixture 固化为公开 CI E2E；
-- 更多真机与系统版本覆盖；
-- WDA 首次真机签名与完整 elementRef 路径的多设备实测；
-- Android、Web、Lynx 等新平台应以插件方式逐个接入并真实验证，不能仅凭架构推断已经通用。
-- 远端 transport、worker 拉取和企业级节点身份仍由后续公开扩展验证，不把本地 HMAC 契约描述成已完成的远端系统。
+当前明确留在核心之外的内容包括远端队列、Worker 拉取、企业节点身份、自动合并与发布，以及 Android、Web、Lynx 等尚未真实跑通的平台实现。架构允许扩展，不等于这些平台已经得到验证。
 
 这也是 iLoop 对自己的要求：可以说架构为跨平台准备好了，但在某个平台真跑通之前，不能把“可以扩展”说成“已经支持”。
 

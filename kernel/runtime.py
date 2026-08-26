@@ -8,10 +8,11 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
-from .capability import Capability, Plugin
-from .action import ActionRisk, ActionSideEffect
+from .capability import Capability, CapabilityLike, Plugin, capability_id
+from .action import ActionRisk, ActionSideEffect, ActionSpec
+from .authorization import AuthorizationGrant, AuthorizationVerifier
 from .acceptance import AcceptanceStore, RiskLevel, Verdict, assess_risk
 from .case import Case, DispositionStatus
 from .dashboard import Dashboard
@@ -40,15 +41,15 @@ FLOW_STEPS = {
 }
 
 CAPABILITY_GATE_HINT = {
-    Capability.BUILD: "mechanism",
-    Capability.RUN: "time",
-    Capability.LAUNCH: "time",
-    Capability.LOGS: "mechanism",
-    Capability.VIEW_TREE: "scope",
-    Capability.SCREENSHOT: "scope",
-    Capability.CRASH: "time",
-    Capability.PROBE: "scope",
-    Capability.COUNTER_PROBE: "counter_evidence",
+    capability_id(Capability.BUILD): "mechanism",
+    capability_id(Capability.RUN): "time",
+    capability_id(Capability.LAUNCH): "time",
+    capability_id(Capability.LOGS): "mechanism",
+    capability_id(Capability.VIEW_TREE): "scope",
+    capability_id(Capability.SCREENSHOT): "scope",
+    capability_id(Capability.CRASH): "time",
+    capability_id(Capability.PROBE): "scope",
+    capability_id(Capability.COUNTER_PROBE): "counter_evidence",
 }
 
 
@@ -61,7 +62,8 @@ class Runtime:
                  recipe_catalog: Optional[RecipeCatalog] = None,
                  provider_registry: Optional[ProviderRegistry] = None,
                  attestation_verifier: Optional[Callable[[str, Path, dict], bool]] = None,
-                 attestation_recorder: Optional[Callable[[str, Path, dict], None]] = None) -> None:
+                 attestation_recorder: Optional[Callable[[str, Path, dict], None]] = None,
+                 authorization_verifier: Optional[AuthorizationVerifier] = None) -> None:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.registry = registry
@@ -70,16 +72,26 @@ class Runtime:
         if provider_registry is None:
             if plugin is None:
                 raise ValueError("Runtime requires a plugin or ProviderRegistry")
-            provider_registry = ProviderRegistry([plugin])
+            provider_registry = ProviderRegistry(
+                [plugin],
+                capability_catalog=(
+                    recipe_catalog.actions.capabilities
+                    if recipe_catalog is not None
+                    else None
+                ),
+            )
         elif plugin is not None and all(
             item.platform_id != plugin.platform_id
             for item in provider_registry.providers()
         ):
             provider_registry.register(plugin)
+        if recipe_catalog is not None:
+            recipe_catalog.freeze()
         provider_registry.freeze()
         self.providers = provider_registry
         self.attestation_verifier = attestation_verifier
         self.attestation_recorder = attestation_recorder
+        self.authorization_verifier = authorization_verifier
         self.project_root = str(Path(project_root).resolve()) if project_root else ""
         self.tasks = TaskStore(self.data_dir)
 
@@ -258,7 +270,7 @@ class Runtime:
                 )
             ]
             for cap in capabilities or []:
-                capability = Capability(cap).value
+                capability = capability_id(cap).value
                 task_steps.append(TaskStep(
                     title=f"执行能力: {capability}",
                     capability=capability,
@@ -370,6 +382,99 @@ class Runtime:
     def _attest(self, kind: str, path: Path, payload: dict) -> None:
         if self.attestation_recorder is not None:
             self.attestation_recorder(kind, path, payload)
+
+    def _policy_digest(self, task_id: str) -> str:
+        payload = json.loads(
+            self._task_policy_path(task_id).read_text(encoding="utf-8")
+        )
+        return hashlib.sha256(json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def _require_action_authorization(
+        self,
+        task: TaskRecord,
+        case: Case,
+        spec: ActionSpec,
+        grant: Optional[AuthorizationGrant],
+    ) -> None:
+        action_effects = {
+            item.value for item in spec.side_effects
+        }
+        capability_effects = {
+            self.recipe_catalog.actions.capabilities.get(
+                capability
+            ).side_effect
+            for capability in spec.required_capabilities
+        }
+        needs_grant = bool(
+            (action_effects | capability_effects)
+            - {"none", "read"}
+        )
+        if not needs_grant:
+            return
+        if grant is None or self.authorization_verifier is None:
+            raise ValueError(
+                f"action '{spec.action_id}' requires host-verified authorization"
+            )
+        if not self.authorization_verifier.verify(
+            grant,
+            action_id=spec.action_id,
+            task_id=task.id,
+            case_id=case.case_id,
+            diagnosis_revision=case.diagnosis_revision,
+            policy_digest=self._policy_digest(task.id),
+        ):
+            raise ValueError(
+                f"authorization rejected for action '{spec.action_id}'"
+            )
+
+    def _require_direct_capability_authorization(
+        self,
+        task: TaskRecord,
+        case: Case,
+        capabilities: Iterable[CapabilityLike],
+        grant: Optional[AuthorizationGrant],
+    ) -> frozenset[str]:
+        side_effects = frozenset(
+            capability_id(item).value
+            for item in capabilities
+            if self.providers.capability_catalog.get(item).side_effect
+            not in {"none", "read"}
+        )
+        if not side_effects:
+            return side_effects
+        if grant is None or self.authorization_verifier is None:
+            raise ValueError(
+                "direct side-effect capabilities require host-verified "
+                "authorization"
+            )
+        verify_capability = getattr(
+            self.authorization_verifier,
+            "verify_capability",
+            None,
+        )
+        if not callable(verify_capability):
+            raise ValueError(
+                "authorization verifier cannot verify direct capabilities"
+            )
+        for capability in sorted(side_effects):
+            if not verify_capability(
+                grant,
+                capability_id=capability,
+                task_id=task.id,
+                case_id=case.case_id,
+                diagnosis_revision=case.diagnosis_revision,
+                policy_digest=self._policy_digest(task.id),
+            ):
+                raise ValueError(
+                    f"authorization rejected for direct capability "
+                    f"'{capability}'"
+                )
+        return side_effects
 
     def load(self, task_id: str) -> TaskRecord:
         task = self.tasks.load(task_id)
@@ -735,40 +840,61 @@ class Runtime:
             self.tasks.save(task)
         return operation
 
-    def execute_capabilities(self, task: TaskRecord, capabilities: Iterable[str],
-                             **kwargs) -> TaskRecord:
+    def execute_capabilities(
+        self,
+        task: TaskRecord,
+        capabilities: Iterable[str],
+        authorization: Optional[AuthorizationGrant] = None,
+        **kwargs,
+    ) -> TaskRecord:
         task = self.load(task.id)
         if task.assistant_id:
             raise ValueError(
                 "assistant task capabilities must execute through AssistantRecipe"
             )
+        requested = tuple(capability_id(item) for item in capabilities)
+        case = Case.load(self._case_path(task.id))
+        authorized_direct = self._require_direct_capability_authorization(
+            task,
+            case,
+            requested,
+            authorization,
+        )
         with self._transaction(task.id, "execute_capabilities"):
-            return self._execute_capabilities_locked(task, capabilities, **kwargs)
+            return self._execute_capabilities_locked(
+                task,
+                requested,
+                direct_authorized_capabilities=authorized_direct,
+                provider_kwargs=kwargs,
+            )
 
     def execute_assistant(
         self,
         task: TaskRecord,
         inputs: Optional[dict[str, object]] = None,
+        authorization: Optional[AuthorizationGrant] = None,
         **provider_kwargs,
     ) -> TaskRecord:
         with file_lock(
             self._task_dir(task.id) / ".assistant-execution.lock"
         ):
             return self._execute_assistant_locked(
-                task, inputs, **provider_kwargs
+                task, inputs, authorization, **provider_kwargs
             )
 
     def _execute_assistant_locked(
         self,
         task: TaskRecord,
         inputs: Optional[dict[str, object]] = None,
+        authorization: Optional[AuthorizationGrant] = None,
         **provider_kwargs,
     ) -> TaskRecord:
         task = self.load(task.id)
         if not task.assistant_id or self.recipe_catalog is None:
             raise ValueError("task is not bound to an AssistantRecipe")
         assembly = self.recipe_catalog.assemble(task.assistant_id)
-        context: dict[str, object] = dict(inputs or {})
+        context: dict[str, object] = dict(task.execution_context)
+        context.update(inputs or {})
         for spec in assembly.actions:
             step = next(
                 item for item in task.steps if item.action_id == spec.action_id
@@ -851,15 +977,6 @@ class Runtime:
                     )
                     self.tasks.save(task)
                     continue
-                if (
-                    case.disposition_progress.get(disposition_plan.plan_id)
-                    == DispositionStatus.PLANNED
-                ):
-                    case.advance_disposition(
-                        disposition_plan.plan_id,
-                        DispositionStatus.EXECUTING,
-                    )
-                    case.save(task.case_path)
             elif (
                 spec.lifecycle_stage == "verification"
                 and case.disposition_status != DispositionStatus.COMPLETED
@@ -875,11 +992,42 @@ class Runtime:
                 ) if self.attestation_verifier is not None else None
                 if not case.verification_is_valid(verifier):
                     return task
-                if case.observation_status.value == "pending":
-                    case.start_observation(verifier)
-                    case.save(task.case_path)
-                elif case.observation_status.value != "observing":
+                if case.observation_status.value not in {
+                    "pending", "observing",
+                }:
                     return task
+            try:
+                spec.validate_input(context)
+            except Exception as error:
+                task = self.load(task.id)
+                step = next(
+                    item for item in task.steps
+                    if item.action_id == spec.action_id
+                )
+                step.status = StepStatus.FAILED
+                step.summary = (
+                    f"{type(error).__name__}: {error}"
+                )
+                task.status = TaskStatus.BLOCKED
+                self.tasks.save(task)
+                return task
+            if (
+                spec.lifecycle_stage == "disposition"
+                and disposition_plan is not None
+                and case.disposition_progress.get(disposition_plan.plan_id)
+                == DispositionStatus.PLANNED
+            ):
+                case.advance_disposition(
+                    disposition_plan.plan_id,
+                    DispositionStatus.EXECUTING,
+                )
+                case.save(task.case_path)
+            if (
+                spec.lifecycle_stage == "observation"
+                and case.observation_status.value == "pending"
+            ):
+                case.start_observation(verifier)
+                case.save(task.case_path)
             result_path = self._action_result_path(task.id, spec.action_id)
             if result_path.is_file():
                 try:
@@ -985,6 +1133,12 @@ class Runtime:
                     )
                     self.tasks.save(task)
                     return task
+            self._require_action_authorization(
+                task,
+                case,
+                spec,
+                authorization,
+            )
             before = set(task.evidence_ids)
             task = self.load(task.id)
             step = next(
@@ -1000,11 +1154,9 @@ class Runtime:
                 ):
                     task = self._execute_capabilities_locked(
                         task,
-                        [
-                            item.value
-                            for item in spec.required_capabilities
-                        ],
-                        **provider_kwargs,
+                        spec.required_capabilities,
+                        authorized_action=spec,
+                        provider_kwargs=provider_kwargs,
                     )
                 if task.status == TaskStatus.BLOCKED:
                     self._write_action_execution(
@@ -1021,11 +1173,27 @@ class Runtime:
                     self.tasks.save(task)
                     return task
             try:
+                action_ledger = Ledger.load(self._task_dir(task.id))
+                action_timing = action_ledger.start_timing(
+                    "action",
+                    task_id=task.id,
+                    run_id=f"{task.id}:action:{spec.action_id}",
+                    action_id=spec.action_id,
+                )
+                action_ledger.flush()
                 result = self.recipe_catalog.execute(
                     task.assistant_id, spec.action_id, context
                 )
                 json.dumps(result.outputs)
             except Exception as error:
+                action_ledger = Ledger.load(self._task_dir(task.id))
+                try:
+                    action_ledger.end_timing(
+                        action_timing.event_id, "failed"
+                    )
+                except (KeyError, ValueError):
+                    pass
+                action_ledger.flush()
                 self._write_action_execution(
                     task,
                     spec.action_id,
@@ -1042,6 +1210,9 @@ class Runtime:
                 task.status = TaskStatus.BLOCKED
                 self.tasks.save(task)
                 return task
+            action_ledger = Ledger.load(self._task_dir(task.id))
+            action_ledger.end_timing(action_timing.event_id, "success")
+            action_ledger.flush()
             context.update(result.outputs)
             task = self.load(task.id)
             step = next(
@@ -1272,10 +1443,44 @@ class Runtime:
     def _execute_capabilities_locked(
         self,
         task: TaskRecord,
-        capabilities: Iterable[str],
-        **kwargs,
+        capabilities: Iterable[CapabilityLike],
+        *,
+        authorized_action: Optional[ActionSpec] = None,
+        direct_authorized_capabilities: frozenset[str] = frozenset(),
+        provider_kwargs: Optional[Mapping[str, object]] = None,
     ) -> TaskRecord:
-        requested = tuple(Capability(item) for item in capabilities)
+        requested = tuple(capability_id(item) for item in capabilities)
+        options = dict(provider_kwargs or {})
+        action_id = (
+            authorized_action.action_id
+            if authorized_action is not None else ""
+        )
+        if authorized_action is not None:
+            outside_action = sorted(
+                capability.value
+                for capability in requested
+                if capability not in authorized_action.required_capabilities
+            )
+            if outside_action:
+                raise ValueError(
+                    f"action '{authorized_action.action_id}' does not allow "
+                    f"capabilities: {', '.join(outside_action)}"
+                )
+        unauthorized = sorted(
+            capability.value
+            for capability in requested
+            if (
+                self.providers.capability_catalog.get(capability).side_effect
+                not in {"none", "read"}
+                and authorized_action is None
+                and capability.value not in direct_authorized_capabilities
+            )
+        )
+        if unauthorized:
+            raise ValueError(
+                "side-effect capabilities were not authorized before "
+                f"dispatch: {', '.join(unauthorized)}"
+            )
         if task.assistant_id:
             assembly = self.recipe_catalog.assemble(task.assistant_id)
             allowed = set(assembly.required_capabilities)
@@ -1316,19 +1521,42 @@ class Runtime:
             run_id = f"{task.id}:round:{len(ledger.rounds)}"
             source_run_id = (
                 task.capability_runs.get(Capability.RUN.value, "")
-                if capability in {Capability.LOGS, Capability.CRASH}
+                if capability in {
+                    capability_id(Capability.LOGS),
+                    capability_id(Capability.CRASH),
+                }
                 else ""
             )
-            invoke_kwargs = dict(kwargs)
+            invoke_kwargs = dict(options)
             invoke_kwargs["task_id"] = task.id
             invoke_kwargs["run_id"] = source_run_id or run_id
-            result = self.providers.invoke(capability, **invoke_kwargs)
+            provider = self.providers.resolve(capability)
+            timing = ledger.start_timing(
+                "capability",
+                task_id=task.id,
+                run_id=run_id,
+                action_id=action_id,
+                capability_id=capability.value,
+                provider_id=provider.platform_id if provider else "",
+            )
+            try:
+                result = self.providers.invoke(
+                    capability, **invoke_kwargs
+                )
+            except BaseException:
+                ledger.end_timing(timing.event_id, "failed")
+                ledger.flush()
+                raise
+            ledger.end_timing(
+                timing.event_id,
+                "success" if result.ok() else "failed",
+            )
             gate_hint = CAPABILITY_GATE_HINT.get(capability)
             producer_subjects = [
                 str(item) for item in result.metadata.get("subjects", [])
             ]
             subjects = sorted(set(producer_subjects))
-            ui_flow_id = str(kwargs.get("ui_flow_id") or "")
+            ui_flow_id = str(options.get("ui_flow_id") or "")
             evidence = EvidenceArtifact(
                 capability=capability.value,
                 source=result.platform,
@@ -1343,11 +1571,15 @@ class Runtime:
                     "run_id": run_id,
                     "source_run_id": source_run_id,
                     "subjects": subjects,
-                    "device_id": kwargs.get("device_udid") or kwargs.get("sim_udid") or "",
+                    "device_id": (
+                        options.get("device_udid")
+                        or options.get("sim_udid")
+                        or ""
+                    ),
                     "gates": [gate_hint] if gate_hint else [],
                     "flow_id": task.flow_id,
                     "ui_flow_id": ui_flow_id,
-                    "flow_run_id": kwargs.get("flow_run_id", ""),
+                    "flow_run_id": options.get("flow_run_id", ""),
                     "device": result.metadata.get("device", ""),
                     "trusted_producer": True,
                     "diagnosis_revision": case.diagnosis_revision,
@@ -1366,7 +1598,7 @@ class Runtime:
             )
             self._seal_trusted_evidence(task, evidence)
             self._append_evidence(task.id, evidence)
-            hypothesis_id = str(kwargs.get("hypothesis_id") or "")
+            hypothesis_id = str(options.get("hypothesis_id") or "")
             if not hypothesis_id and case.diagnosis_revisions:
                 hypothesis_id = case.diagnosis_revisions[-1].hypothesis_id
             if not hypothesis_id:
@@ -1441,13 +1673,22 @@ class Runtime:
         ).hexdigest()
         self._attest("evidence", path, payload)
 
-    def prepare_global_review(self, task: TaskRecord, project_root: str | Path,
-                              *, base: str = "") -> GlobalReview:
+    def prepare_global_review(
+        self,
+        task: TaskRecord,
+        project_root: str | Path,
+        *,
+        base: str = "",
+        symptom_is_ui: bool = False,
+        scope_rules: Optional[dict] = None,
+    ) -> GlobalReview:
         with self._transaction(task.id, "prepare_global_review"):
             return self._prepare_global_review_locked(
                 task,
                 project_root,
                 base=base,
+                symptom_is_ui=symptom_is_ui,
+                scope_rules=scope_rules,
             )
 
     def _prepare_global_review_locked(
@@ -1456,6 +1697,8 @@ class Runtime:
         project_root: str | Path,
         *,
         base: str = "",
+        symptom_is_ui: bool = False,
+        scope_rules: Optional[dict] = None,
     ) -> GlobalReview:
         if self._enforce_policy(task):
             self.tasks.save(task)
@@ -1471,7 +1714,12 @@ class Runtime:
             raise ValueError(
                 f"global review base must match task base_commit: {expected_base}"
             )
-        review = analyze_global_impact(resolved_root, base=expected_base)
+        review = analyze_global_impact(
+            resolved_root,
+            base=expected_base,
+            symptom_is_ui=symptom_is_ui,
+            scope_rules=scope_rules,
+        )
         review.save(task.global_review_path)
         task.global_review_required = True
         task.global_review_status = review.status
@@ -1734,7 +1982,10 @@ class Runtime:
                     )
                 try:
                     current_review = analyze_global_impact(
-                        expected_root, base=task.base_commit
+                        expected_root,
+                        base=task.base_commit,
+                        symptom_is_ui=review.symptom_is_ui,
+                        scope_rules=review.scope_rules,
                     )
                     if current_review.fingerprint != review.fingerprint:
                         blockers.append("global review is stale: project diff changed after review")
@@ -1795,6 +2046,26 @@ class Runtime:
                         blockers.append(
                             f"global review {impact.target} uses evidence older than the review: {stale}"
                         )
+                    if impact.visual_required:
+                        screenshots = [
+                            evidence_by_id[item]
+                            for item in impact.evidence_ids
+                            if item in evidence_by_id
+                            and evidence_by_id[item].capability
+                            == Capability.SCREENSHOT.value
+                            and self._supports_success(
+                                evidence_by_id[item], task
+                            )
+                            and impact.target
+                            in evidence_by_id[item].metadata.get(
+                                "subjects", []
+                            )
+                        ]
+                        if not screenshots:
+                            blockers.append(
+                                f"global review {impact.target} lacks "
+                                "target-bound screenshot evidence"
+                            )
                     if impact.status == "verified":
                         subjects = {
                             str(subject)

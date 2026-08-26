@@ -1,0 +1,35 @@
+{
+  "suite_id": "builtin.bugfix.local",
+  "members": [
+    {
+      "assistant_id": "builtin.bugfix",
+      "deployment_id": "local.git"
+    }
+  ],
+  "deployments": [
+    {
+      "deployment_id": "local.git",
+      "target_node": "local",
+      "provider_ids": [
+        "git_native"
+      ],
+      "provider_bindings": {
+        "source.inspect": "git_native",
+        "source.candidate_pipeline": "git_native",
+        "ci.verify_candidate": "git_native"
+      }
+    }
+  ],
+  "smoke_checks": [
+    {
+      "check_id": "inspect-current-repository",
+      "assistant_id": "builtin.bugfix",
+      "deployment_id": "local.git",
+      "capability": "source.inspect",
+      "inputs": {
+        "project_root": "."
+      }
+    }
+  ],
+  "smoke_ttl_seconds": 3600
+}

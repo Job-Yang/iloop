@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from .flow import Flow, FlowRegistry
-from .capability import Capability, Plugin
+from .capability import (
+    CapabilityId, CapabilitySpec, Plugin, capability_id,
+)
 from .action import (
     ActionCatalog, ActionRisk, ActionSideEffect, ActionSpec,
 )
@@ -28,6 +30,7 @@ MANIFEST_NAME = "manifest.json"
 FLOWS_NAME = "flows.json"
 ACTIONS_NAME = "actions.json"
 RECIPES_NAME = "recipes.json"
+CAPABILITIES_NAME = "capabilities.json"
 
 
 @dataclass
@@ -55,11 +58,12 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     root.mkdir(parents=True, exist_ok=True)
     manifest = {
         "name": name,
-        "version": "0.3.0",
-        "iloop_kernel": ">=0.3.0",
+        "version": "0.4.0",
+        "iloop_kernel": ">=0.4.0",
         "description": f"{name} iLoop extension",
         "provides": {
             "flows": FLOWS_NAME,
+            "capabilities": CAPABILITIES_NAME,
             "actions": ACTIONS_NAME,
             "recipes": RECIPES_NAME,
             "plugin": None,
@@ -82,6 +86,7 @@ def scaffold_extension(name: str, base_dir: str | Path) -> Extension:
     }], ensure_ascii=False, indent=2), encoding="utf-8")
     (root / ACTIONS_NAME).write_text("[]\n", encoding="utf-8")
     (root / RECIPES_NAME).write_text("[]\n", encoding="utf-8")
+    (root / CAPABILITIES_NAME).write_text("[]\n", encoding="utf-8")
     return Extension(name=name, root=root, manifest=manifest)
 
 
@@ -171,7 +176,7 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
     else:
         for capability, platform_id in bindings.items():
             try:
-                Capability(capability)
+                capability_id(capability)
             except ValueError:
                 issues.append(ValidationIssue(
                     "error", f"unknown provider binding capability: {capability}"
@@ -180,7 +185,7 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
                 issues.append(ValidationIssue(
                     "error", f"provider binding '{capability}' has empty platform_id"
                 ))
-    for key in ("actions", "recipes"):
+    for key in ("capabilities", "actions", "recipes"):
         relative = provides.get(key)
         if not relative:
             continue
@@ -198,6 +203,7 @@ def validate_extension(ext: Extension, *, core_flow_ids: Optional[set[str]] = No
     )
     if paths_valid and provides_valid:
         try:
+            _parse_capability_contribution(ext)
             _parse_application_contribution(ext)
         except (
             TypeError, ValueError, KeyError, OSError, json.JSONDecodeError,
@@ -213,6 +219,45 @@ def _json_array(path: Path) -> list:
     if not isinstance(payload, list):
         raise TypeError(f"{path.name} must contain an array")
     return payload
+
+
+def _parse_capability_contribution(
+    ext: Extension,
+) -> List[CapabilitySpec]:
+    provides = ext.manifest.get("provides", {})
+    rows = (
+        _json_array(ext.root / provides["capabilities"])
+        if provides.get("capabilities")
+        else []
+    )
+    specs = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise TypeError("each capability must be an object")
+        spec = CapabilitySpec(
+            capability_id=capability_id(row["capability_id"]),
+            description=str(row["description"]),
+            inputs=dict(row.get("inputs", {})),
+            outputs=dict(row.get("outputs", {})),
+            side_effect=str(row.get("side_effect", "none")),
+            required_tools=tuple(row.get("required_tools", [])),
+            supported_deployments=tuple(
+                row.get("supported_deployments", [])
+            ),
+        )
+        if not spec.capability_id.startswith(ext.name + "."):
+            raise ValueError(
+                f"capability_id '{spec.capability_id}' must start with "
+                f"'{ext.name}.'"
+            )
+        if spec.capability_id in seen:
+            raise ValueError(
+                f"duplicate capability_id '{spec.capability_id}'"
+            )
+        seen.add(spec.capability_id)
+        specs.append(spec)
+    return specs
 
 
 def _parse_application_contribution(
@@ -246,7 +291,7 @@ def _parse_application_contribution(
             inputs=dict(row.get("inputs", {})),
             outputs=dict(row.get("outputs", {})),
             required_capabilities=tuple(
-                Capability(item)
+                capability_id(item)
                 for item in row.get("required_capabilities", [])
             ),
             disposition_kind=str(row.get("disposition_kind", "")),
@@ -304,6 +349,7 @@ def load_extension_application(
     issues = validate_extension(ext)
     if has_errors(issues):
         raise ValueError("; ".join(issue.message for issue in issues))
+    capability_specs = _parse_capability_contribution(ext)
     action_specs, assistant_recipes = _parse_application_contribution(ext)
     handlers = load_extension_action_handlers(ext, config)
     unknown_handlers = sorted(set(handlers) - {
@@ -314,6 +360,21 @@ def load_extension_application(
             "application declares handlers for unknown actions: "
             + ", ".join(unknown_handlers)
         )
+    staged_capabilities = actions.capabilities.clone()
+    for spec in capability_specs:
+        staged_capabilities.register(spec)
+    staged_actions = ActionCatalog(staged_capabilities)
+    for spec in actions.all():
+        staged_actions.register(spec)
+    for spec in action_specs:
+        staged_actions.register(spec, handlers.get(spec.action_id))
+    staged_recipes = RecipeCatalog(staged_actions)
+    for recipe in recipes.all():
+        staged_recipes.register(recipe)
+    for recipe in assistant_recipes:
+        staged_recipes.register(recipe)
+    for spec in capability_specs:
+        actions.capabilities.register(spec)
     for spec in action_specs:
         actions.register(spec, handlers.get(spec.action_id))
     for recipe in assistant_recipes:
@@ -352,13 +413,13 @@ def load_extension_action_handlers(
     return {str(key): value for key, value in handlers.items()}
 
 
-def extension_provider_bindings(ext: Extension) -> Dict[Capability, str]:
+def extension_provider_bindings(ext: Extension) -> Dict[CapabilityId, str]:
     issues = validate_extension(ext)
     if has_errors(issues):
         raise ValueError("; ".join(issue.message for issue in issues))
     rows = ext.manifest.get("provides", {}).get("provider_bindings", {})
     return {
-        Capability(capability): str(platform_id)
+        capability_id(capability): str(platform_id)
         for capability, platform_id in rows.items()
     }
 
@@ -368,7 +429,7 @@ def load_installed_application(
     actions: ActionCatalog,
     recipes: RecipeCatalog,
     config: Optional[dict] = None,
-) -> Tuple[Tuple[int, int], Dict[Capability, str], List[ValidationIssue]]:
+) -> Tuple[Tuple[int, int], Dict[CapabilityId, str], List[ValidationIssue]]:
     """Load valid application declarations while isolating broken neighbors."""
     base = Path(base_dir).expanduser()
     if not base.exists():
@@ -394,10 +455,17 @@ def load_installed_application(
             continue
         valid.append(ext)
 
-    parsed = [(ext, *_parse_application_contribution(ext)) for ext in valid]
+    parsed = [
+        (
+            ext,
+            _parse_capability_contribution(ext),
+            *_parse_application_contribution(ext),
+        )
+        for ext in valid
+    ]
     usable = []
     handlers_by_extension = {}
-    for ext, action_specs, assistant_recipes in parsed:
+    for ext, capability_specs, action_specs, assistant_recipes in parsed:
         try:
             handlers = load_extension_action_handlers(ext, config)
         except (Exception, SystemExit) as error:
@@ -427,20 +495,62 @@ def load_installed_application(
             ))
             continue
         handlers_by_extension[ext.name] = handlers
-        usable.append((ext, action_specs, assistant_recipes))
+        usable.append((
+            ext, capability_specs, action_specs, assistant_recipes,
+        ))
 
-    staging_actions = ActionCatalog()
+    existing_capability_ids = {
+        spec.capability_id for spec in actions.capabilities.all()
+    }
+    capability_counts = Counter(
+        spec.capability_id
+        for _, capability_specs, _, _ in usable
+        for spec in capability_specs
+    )
+    invalid_extensions = set()
+    valid_capabilities = []
+    staging_capabilities = actions.capabilities.clone()
+    for ext, capability_specs, _, _ in usable:
+        duplicates = [
+            spec.capability_id for spec in capability_specs
+            if (
+                spec.capability_id in existing_capability_ids
+                or capability_counts[spec.capability_id] > 1
+            )
+        ]
+        if duplicates:
+            invalid_extensions.add(ext.name)
+            for capability in duplicates:
+                issues.append(ValidationIssue(
+                    "error",
+                    f"{ext.name}: duplicate capability_id '{capability}'",
+                ))
+            continue
+        try:
+            for spec in capability_specs:
+                staging_capabilities.register(spec)
+        except ValueError as error:
+            issues.append(ValidationIssue(
+                "error",
+                f"{ext.name}: capability assembly failed: {error}",
+            ))
+            invalid_extensions.add(ext.name)
+            continue
+        valid_capabilities.extend((ext, spec) for spec in capability_specs)
+
+    staging_actions = ActionCatalog(staging_capabilities)
     for spec in actions.all():
         staging_actions.register(spec)
     existing_action_ids = {spec.action_id for spec in actions.all()}
     action_counts = Counter(
         spec.action_id
-        for _, action_specs, _ in usable
+        for _, _, action_specs, _ in usable
         for spec in action_specs
     )
     valid_actions = []
-    invalid_extensions = set()
-    for ext, action_specs, _ in usable:
+    for ext, _, action_specs, _ in usable:
+        if ext.name in invalid_extensions:
+            continue
         duplicates = [
             spec.action_id for spec in action_specs
             if (
@@ -469,10 +579,10 @@ def load_installed_application(
     existing_recipe_ids = {recipe.assistant_id for recipe in recipes.all()}
     recipe_counts = Counter(
         recipe.assistant_id
-        for _, _, assistant_recipes in usable
+        for _, _, _, assistant_recipes in usable
         for recipe in assistant_recipes
     )
-    for ext, _, assistant_recipes in usable:
+    for ext, _, _, assistant_recipes in usable:
         duplicates = [
             recipe.assistant_id for recipe in assistant_recipes
             if (
@@ -489,18 +599,38 @@ def load_installed_application(
                 ))
 
     while True:
-        current_actions = ActionCatalog()
+        current_capabilities = actions.capabilities.clone()
+        for ext, capability_specs, _, _ in usable:
+            if ext.name not in invalid_extensions:
+                for spec in capability_specs:
+                    if not current_capabilities.contains(
+                        spec.capability_id
+                    ):
+                        current_capabilities.register(spec)
+        current_actions = ActionCatalog(current_capabilities)
         for spec in actions.all():
             current_actions.register(spec)
-        for ext, action_specs, _ in usable:
-            if ext.name not in invalid_extensions:
+        newly_invalid = set()
+        for ext, _, action_specs, _ in usable:
+            if ext.name in invalid_extensions:
+                continue
+            try:
                 for spec in action_specs:
                     current_actions.register(spec)
+            except (KeyError, TypeError, ValueError) as error:
+                issues.append(ValidationIssue(
+                    "error",
+                    f"{ext.name}: action dependency failed: {error}",
+                ))
+                newly_invalid.add(ext.name)
+        if newly_invalid:
+            invalid_extensions.update(newly_invalid)
+            continue
         current_recipes = RecipeCatalog(current_actions)
         for recipe in recipes.all():
             current_recipes.register(recipe)
         newly_invalid = set()
-        for ext, _, assistant_recipes in usable:
+        for ext, _, _, assistant_recipes in usable:
             if ext.name in invalid_extensions:
                 continue
             try:
@@ -517,14 +647,18 @@ def load_installed_application(
 
     valid_recipes = [
         (ext, recipe)
-        for ext, _, assistant_recipes in usable
+        for ext, _, _, assistant_recipes in usable
         if ext.name not in invalid_extensions
         for recipe in assistant_recipes
     ]
 
     action_count = recipe_count = 0
-    bindings: Dict[Capability, str] = {}
+    bindings: Dict[CapabilityId, str] = {}
     binding_conflicts = set()
+    for ext, spec in valid_capabilities:
+        if ext.name in invalid_extensions:
+            continue
+        actions.capabilities.register(spec)
     for ext, spec in valid_actions:
         if ext.name in invalid_extensions:
             continue
@@ -537,10 +671,17 @@ def load_installed_application(
             continue
         recipes.register(recipe)
         recipe_count += 1
-    for ext, _, _ in usable:
+    for ext, _, _, _ in usable:
         if ext.name in invalid_extensions:
             continue
         for capability, platform_id in extension_provider_bindings(ext).items():
+            if not actions.capabilities.contains(capability):
+                issues.append(ValidationIssue(
+                    "error",
+                    f"{ext.name}: provider binding references unknown "
+                    f"capability '{capability.value}'",
+                ))
+                continue
             if capability in binding_conflicts:
                 continue
             previous = bindings.get(capability)

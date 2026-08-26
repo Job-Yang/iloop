@@ -13,7 +13,10 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
-from .capability import Capability
+from .capability import capability_id
+from .authorization import (
+    AuthorizationGrant, AuthorizationVerifier,
+)
 from .deployment import DeploymentAssembly
 from .evidence import EvidenceArtifact
 from .storage import atomic_write_json, file_lock
@@ -54,6 +57,7 @@ class TaskEnvelope:
     evidence_plan: Tuple[str, ...]
     issued_at: float
     expires_at: float
+    authorization: Mapping[str, object] = field(default_factory=dict)
     signature: str = ""
 
     def __post_init__(self) -> None:
@@ -95,11 +99,12 @@ class TaskEnvelope:
         object.__setattr__(self, "policy", dict(self.policy))
         object.__setattr__(self, "inputs", dict(self.inputs))
         object.__setattr__(self, "lifecycle", dict(self.lifecycle))
+        object.__setattr__(self, "authorization", dict(self.authorization))
         object.__setattr__(self, "execution_plan", plan)
         object.__setattr__(
             self,
             "capability_plan",
-            tuple(Capability(item).value for item in self.capability_plan),
+            tuple(capability_id(item).value for item in self.capability_plan),
         )
         object.__setattr__(
             self,
@@ -127,6 +132,7 @@ class TaskEnvelope:
             "evidence_plan": list(self.evidence_plan),
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
+            "authorization": dict(self.authorization),
         }
 
     def task_digest(self) -> str:
@@ -157,6 +163,7 @@ class TaskEnvelope:
         secret: bytes,
         ttl_seconds: float = 300,
         now: Optional[float] = None,
+        authorization: Optional[AuthorizationGrant] = None,
     ) -> "TaskEnvelope":
         issued_at = time.time() if now is None else float(now)
         if not math.isfinite(issued_at):
@@ -187,6 +194,9 @@ class TaskEnvelope:
             evidence_plan=tuple(str(item) for item in evidence_plan),
             issued_at=issued_at,
             expires_at=issued_at + ttl_seconds,
+            authorization=(
+                authorization.to_dict() if authorization is not None else {}
+            ),
         )
         return replace(
             unsigned,
@@ -214,6 +224,7 @@ class TaskEnvelope:
             evidence_plan=tuple(payload.get("evidence_plan", [])),
             issued_at=float(payload["issued_at"]),
             expires_at=float(payload["expires_at"]),
+            authorization=dict(payload.get("authorization", {})),
             signature=str(payload.get("signature", "")),
         )
 
@@ -492,12 +503,14 @@ class LocalRecipeWorker:
         secret: bytes,
         replay_guard: ReplayGuard,
         base_commit: str,
+        authorization_verifier: Optional[AuthorizationVerifier] = None,
     ) -> None:
         self.assembly = assembly
         self.recipes = assembly.recipes
         self.secret = secret
         self.replay_guard = replay_guard
         self.base_commit = base_commit
+        self.authorization_verifier = authorization_verifier
 
     def execute(
         self,
@@ -558,6 +571,7 @@ class LocalRecipeWorker:
         if envelope.evidence_plan != expected_evidence:
             raise ValueError("TaskEnvelope evidence_plan mismatch")
         self._validate_lifecycle(envelope, selected_specs)
+        self._validate_authorization(envelope, selected_specs)
         self.replay_guard.consume(envelope)
         context: Dict[str, object] = dict(envelope.inputs)
         evidence: List[WorkerEvidence] = []
@@ -691,6 +705,60 @@ class LocalRecipeWorker:
             raise ValueError(
                 "TaskEnvelope observation requires passed verification"
             )
+
+    def _validate_authorization(
+        self,
+        envelope: TaskEnvelope,
+        selected_specs,
+    ) -> None:
+        needs_grant = any(
+            bool(
+                {
+                    item.value for item in spec.side_effects
+                }.union({
+                    self.recipes.actions.capabilities.get(
+                        capability
+                    ).side_effect
+                    for capability in spec.required_capabilities
+                }) - {"none", "read"}
+            )
+            for spec in selected_specs
+        )
+        if not needs_grant:
+            return
+        if (
+            not envelope.authorization
+            or self.authorization_verifier is None
+        ):
+            raise ValueError(
+                "TaskEnvelope side effects require host-verified authorization"
+            )
+        grant = AuthorizationGrant.from_dict(envelope.authorization)
+        policy_digest = hashlib.sha256(
+            _canonical(envelope.policy)
+        ).hexdigest()
+        for spec in selected_specs:
+            spec_effects = {
+                item.value for item in spec.side_effects
+            }.union({
+                self.recipes.actions.capabilities.get(
+                    capability
+                ).side_effect
+                for capability in spec.required_capabilities
+            })
+            if spec_effects <= {"none", "read"}:
+                continue
+            if not self.authorization_verifier.verify(
+                grant,
+                action_id=spec.action_id,
+                task_id=envelope.task_id,
+                case_id=envelope.task_id,
+                diagnosis_revision=envelope.diagnosis_revision,
+                policy_digest=policy_digest,
+            ):
+                raise ValueError(
+                    f"authorization rejected for action '{spec.action_id}'"
+                )
 
     def _failure_receipt(
         self,

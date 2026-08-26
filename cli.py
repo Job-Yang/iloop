@@ -27,6 +27,9 @@
   python3 -m cli oncall-demo                # 演示：同一内核驱动 oncall 诊断
   python3 -m cli extension-init <team.ext> [dir]   # 创建业务扩展包骨架
   python3 -m cli extension-validate <dir>          # 校验扩展包（二开硬边界）
+  python3 -m cli suite validate|compile|preflight|install|smoke|status <manifest>
+  python3 -m cli source prepare repository=... base_commit=... task_id=...
+  python3 -m cli install|update|install-status
   python3 -m cli selftest                   # 内核 + 插件自测，全绿才算完成
 """
 
@@ -36,6 +39,7 @@ import os
 import sys
 import hashlib
 import json
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -52,8 +56,13 @@ from kernel import (  # noqa: E402
     THREE_VERDICT_PROTOCOL, design_contract_filled,
     load_installed_plugins, load_installed_application,
     ActionCatalog, RecipeCatalog, ProviderRegistry, HostTrustStore,
+    AuthorizationGrant,
+    AssistantSuite, DeploymentProfile, SuiteManifest,
 )
 from plugins.ios_native import IOSNativePlugin  # noqa: E402
+from plugins.git_native import (  # noqa: E402
+    GitNativeProvider, register_reference_bugfix,
+)
 
 FLOWS_JSON = ROOT / "workflow" / "flows.json"
 
@@ -93,6 +102,12 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
     extensions_dir = Path(os.environ.get(
         "ILOOP_EXTENSIONS_DIR", str(Path.home() / ".iloop" / "extensions")
     )).expanduser()
+    actions = ActionCatalog()
+    recipes = RecipeCatalog(actions)
+    register_reference_bugfix(actions, recipes)
+    _, bindings, application_issues = load_installed_application(
+        extensions_dir, actions, recipes, kwargs
+    )
     plugin_issues = []
     candidates = load_installed_plugins(
         extensions_dir,
@@ -103,6 +118,8 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
     if platform:
         selected = (
             plugin if platform == "ios_native"
+            else GitNativeProvider(data_dir / "git-native")
+            if platform == "git_native"
             else next(
                 (item for item in candidates if item.platform_id == platform),
                 None,
@@ -110,9 +127,15 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
         )
         if selected is None:
             raise ValueError(f"extension platform plugin not found: {platform}")
-        providers = ProviderRegistry([selected])
+        providers = ProviderRegistry(
+            [selected],
+            capability_catalog=actions.capabilities,
+        )
     else:
-        providers = ProviderRegistry([plugin])
+        providers = ProviderRegistry(
+            [plugin, GitNativeProvider(data_dir / "git-native")],
+            capability_catalog=actions.capabilities,
+        )
         for candidate in candidates:
             try:
                 providers.register(candidate)
@@ -123,11 +146,6 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
                         f"failed: {error}"
                     )
                 })())
-    actions = ActionCatalog()
-    recipes = RecipeCatalog(actions)
-    _, bindings, application_issues = load_installed_application(
-        extensions_dir, actions, recipes, kwargs
-    )
     requested_assistant = str(kwargs.get("assistant_id", "")).strip()
     if requested_assistant and application_issues:
         try:
@@ -157,11 +175,107 @@ def _runtime(real: bool, kwargs: dict) -> Runtime:
         provider_registry=providers,
         attestation_verifier=trust.verify if trust else None,
         attestation_recorder=trust.attest if trust else None,
+        authorization_verifier=(
+            trust.authorization_authority() if trust else None
+        ),
     )
 
 
 def _split(value: str) -> list[str]:
     return [part.strip() for part in value.replace(",", ";").split(";") if part.strip()]
+
+
+def _suite_secret(data_dir: Path) -> bytes:
+    path = data_dir / "suites" / ".suite.key"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(os.urandom(32))
+    return path.read_bytes()
+
+
+def _suite_from_file(path: str, kwargs: dict) -> AssistantSuite:
+    payload = json.loads(
+        Path(path).expanduser().read_text(encoding="utf-8")
+    )
+    manifest = SuiteManifest.from_dict(payload)
+    deployments = {
+        str(row["deployment_id"]): DeploymentProfile(
+            deployment_id=str(row["deployment_id"]),
+            target_node=str(row["target_node"]),
+            provider_ids=tuple(row["provider_ids"]),
+            provider_bindings=dict(row.get("provider_bindings", {})),
+            features=dict(row.get("features", {})),
+        )
+        for row in payload.get("deployments", [])
+    }
+    runtime = _runtime(False, kwargs)
+    return AssistantSuite(
+        manifest,
+        runtime.recipe_catalog,
+        deployments,
+        runtime.providers,
+        state_dir=runtime.data_dir / "suites" / manifest.suite_id,
+        secret=_suite_secret(runtime.data_dir),
+        tool_resolver=shutil.which,
+    )
+
+
+def cmd_suite(action: str, path: str, kwargs: dict) -> int:
+    suite = _suite_from_file(path, kwargs)
+    if action in {"validate", "compile"}:
+        value = suite.compile()
+    elif action == "preflight":
+        value = suite.preflight()
+    elif action == "install":
+        value = suite.install()
+    elif action == "smoke":
+        value = suite.smoke().to_dict()
+    elif action == "status":
+        value = suite.status()
+    else:
+        print("usage: suite validate|compile|preflight|install|smoke|status <manifest>")
+        return 2
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+    return 0 if value.get("status") != "blocked" else 1
+
+
+def cmd_source(action: str, kwargs: dict) -> int:
+    if action != "prepare":
+        print(
+            "usage: source prepare repository=... "
+            "base_commit=... task_id=... [branch=...]"
+        )
+        return 2
+    required = ("repository", "base_commit", "task_id")
+    missing = [key for key in required if not kwargs.get(key)]
+    if missing:
+        print("source prepare missing: " + ", ".join(missing))
+        return 2
+    provider = GitNativeProvider(
+        _data_dir(str(kwargs["repository"])) / "git-native"
+    )
+    workspace = provider.prepare_workspace(
+        str(kwargs["repository"]),
+        base_commit=str(kwargs["base_commit"]),
+        task_id=str(kwargs["task_id"]),
+        branch=str(kwargs.get("branch") or ""),
+    )
+    print(json.dumps({
+        "status": "ready",
+        "workspace": str(workspace),
+        "base_commit": str(kwargs["base_commit"]),
+    }, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _print_resume_card(runtime: Runtime, task) -> None:
@@ -175,6 +289,13 @@ def _print_resume_card(runtime: Runtime, task) -> None:
 
 def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
     runtime = _runtime(real, kwargs)
+    authorization_file = kwargs.pop("authorization_file", "")
+    authorization = (
+        AuthorizationGrant.from_dict(json.loads(
+            Path(authorization_file).read_text(encoding="utf-8")
+        ))
+        if authorization_file else None
+    )
     capabilities = _split(kwargs.pop("caps", kwargs.pop("capabilities", "")))
     assistant_id = kwargs.pop("assistant_id", "")
     executor_id = kwargs.pop("executor_id", "")
@@ -213,10 +334,15 @@ def cmd_run(task_text: str, real: bool, kwargs: dict) -> int:
     )
     if assistant_id:
         task = runtime.execute_assistant(
-            task, execution_context, **kwargs
+            task, execution_context, authorization=authorization, **kwargs
         )
     elif capabilities:
-        task = runtime.execute_capabilities(task, capabilities, **kwargs)
+        task = runtime.execute_capabilities(
+            task,
+            capabilities,
+            authorization=authorization,
+            **kwargs,
+        )
     _print_resume_card(runtime, task)
     return 1 if task.status == TaskStatus.BLOCKED else 0
 
@@ -230,6 +356,13 @@ def cmd_resume(task_id: str, real: bool, kwargs: dict) -> int:
         if stored_platform:
             kwargs["platform"] = stored_platform
     runtime = _runtime(real, kwargs)
+    authorization_file = kwargs.pop("authorization_file", "")
+    authorization = (
+        AuthorizationGrant.from_dict(json.loads(
+            Path(authorization_file).read_text(encoding="utf-8")
+        ))
+        if authorization_file else None
+    )
     task = runtime.load(task_id)
     capabilities = _split(kwargs.pop("caps", kwargs.pop("capabilities", "")))
     run_recipe = kwargs.pop("recipe", "").lower() in {"1", "true", "yes"}
@@ -238,6 +371,7 @@ def cmd_resume(task_id: str, real: bool, kwargs: dict) -> int:
         task = runtime.execute_assistant(
             task,
             execution_kwargs,
+            authorization=authorization,
             **execution_kwargs,
         )
     elif capabilities:
@@ -245,6 +379,7 @@ def cmd_resume(task_id: str, real: bool, kwargs: dict) -> int:
         task = runtime.execute_capabilities(
             task,
             capabilities,
+            authorization=authorization,
             **execution_kwargs,
         )
     _print_resume_card(runtime, task)
@@ -677,10 +812,31 @@ def cmd_global_review(action: str, task_id: str, rest: list[str]) -> int:
         if not project_root:
             print("global-review prepare requires project_root=... or ILOOP_PROJECT_ROOT")
             return 2
+        rules_path = values.get("scope_rules", "")
+        scope_rules = (
+            json.loads(
+                Path(rules_path).expanduser().read_text(
+                    encoding="utf-8"
+                )
+            )
+            if rules_path else None
+        )
+        ui_hint = (
+            values.get("ui", "").lower() in {"1", "true", "yes"}
+            or any(
+                token in task.title.casefold()
+                for token in (
+                    "ui", "界面", "页面", "按钮", "控件",
+                    "布局", "样式", "显示",
+                )
+            )
+        )
         review = runtime.prepare_global_review(
             task,
             project_root,
             base=values.get("base", ""),
+            symptom_is_ui=ui_hint,
+            scope_rules=scope_rules,
         )
     else:
         if not Path(task.global_review_path).exists():
@@ -741,6 +897,19 @@ def cmd_global_review(action: str, task_id: str, rest: list[str]) -> int:
                     accepted=values.get("accepted", "").lower() in ("1", "true", "yes"),
                     resolution=values.get("reason", ""),
                     user_confirmation_id=user_confirmation,
+                    evidence_capabilities=[
+                        evidence_by_id[item].capability
+                        for item in evidence_ids
+                    ],
+                    evidence_subjects={
+                        item: [
+                            str(subject)
+                            for subject in evidence_by_id[
+                                item
+                            ].metadata.get("subjects", [])
+                        ]
+                        for item in evidence_ids
+                    },
                 )
             except (KeyError, ValueError) as error:
                 print(render("blocked", str(error)))
@@ -1399,6 +1568,33 @@ def main(argv: list[str]) -> int:
             print("usage: extension-validate <dir>")
             return 2
         return cmd_extension_validate(pos[0])
+    if cmd == "suite":
+        if len(rest) < 2:
+            print(
+                "usage: suite validate|compile|preflight|install|"
+                "smoke|status <manifest>"
+            )
+            return 2
+        return cmd_suite(rest[0], rest[1], _parse_kv(rest[2:]))
+    if cmd == "source":
+        if not rest:
+            print("usage: source prepare ...")
+            return 2
+        return cmd_source(rest[0], _parse_kv(rest[1:]))
+    if cmd in {"install", "update", "install-status"}:
+        from installer import main as installer_main
+        installer_command = (
+            "status" if cmd == "install-status" else cmd
+        )
+        return installer_main([
+            installer_command,
+            "--source", str(ROOT),
+            *(
+                ["--home", _parse_kv(rest).get("home", "")]
+                if _parse_kv(rest).get("home")
+                else []
+            ),
+        ])
     if cmd == "selftest":
         return cmd_selftest()
     print(f"unknown command: {cmd}\n{__doc__}")

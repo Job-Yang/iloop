@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Mapping, Tuple
 
 from .action import ActionCatalog, ActionResult, ActionRisk, ActionSpec
-from .capability import Capability
+from .capability import CapabilityId, CapabilitySpec
 
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
@@ -53,7 +53,8 @@ class AssistantRecipe:
 class AssistantAssembly:
     recipe: AssistantRecipe
     actions: Tuple[ActionSpec, ...]
-    required_capabilities: Tuple[Capability, ...]
+    required_capabilities: Tuple[CapabilityId, ...]
+    capability_contracts: Tuple[CapabilitySpec, ...]
     catalog_token: object = field(repr=False)
 
     def fingerprint(self) -> str:
@@ -81,6 +82,9 @@ class AssistantAssembly:
             ],
             "ingress": list(self.recipe.ingress),
             "continuous_observation": self.recipe.continuous_observation,
+            "capability_contracts": [
+                item.to_dict() for item in self.capability_contracts
+            ],
         }
         return hashlib.sha256(json.dumps(
             payload,
@@ -124,8 +128,11 @@ class RecipeCatalog:
         self.actions = actions
         self._recipes: Dict[str, AssistantRecipe] = {}
         self._token = object()
+        self._frozen = False
 
     def register(self, recipe: AssistantRecipe) -> None:
+        if self._frozen:
+            raise ValueError("RecipeCatalog is frozen")
         if recipe.assistant_id in self._recipes:
             raise ValueError(f"duplicate assistant_id '{recipe.assistant_id}'")
         specs = tuple(self.actions.get(action_id) for action_id in recipe.actions)
@@ -178,11 +185,21 @@ class RecipeCatalog:
             recipe=recipe,
             actions=specs,
             required_capabilities=self.actions.required_capabilities(recipe.actions),
+            capability_contracts=tuple(
+                self.actions.capabilities.get(capability)
+                for capability in self.actions.required_capabilities(
+                    recipe.actions
+                )
+            ),
             catalog_token=self._token,
         )
 
     def all(self) -> Tuple[AssistantRecipe, ...]:
         return tuple(self._recipes[key] for key in sorted(self._recipes))
+
+    def freeze(self) -> None:
+        self.actions.freeze()
+        self._frozen = True
 
     def owns(self, assembly: AssistantAssembly) -> bool:
         if assembly.catalog_token is not self._token:
@@ -196,6 +213,8 @@ class RecipeCatalog:
             and current.actions == assembly.actions
             and current.required_capabilities
             == assembly.required_capabilities
+            and current.capability_contracts
+            == assembly.capability_contracts
         )
 
     def execute(

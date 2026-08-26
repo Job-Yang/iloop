@@ -31,6 +31,7 @@ class Dashboard:
         rounds = self.ledger.rounds
         ev_by_cap = Counter(e.capability for e in self.evidence)
         observed = sum(1 for e in self.evidence if e.is_observed())
+        timing = self.ledger.timing_metrics()
         return {
             "rounds": len(rounds),
             "success": sum(1 for r in rounds if r.status == RoundStatus.SUCCESS),
@@ -45,6 +46,7 @@ class Dashboard:
             "acceptance_status": (self.acceptance.get("result") or {}).get(
                 "verdict", "not_required"
             ),
+            "timing": timing,
         }
 
     def render_html(self) -> str:
@@ -54,6 +56,7 @@ class Dashboard:
             for k, v in sorted(m["evidence_by_capability"].items())
         ) or "<tr><td colspan=2>（暂无证据）</td></tr>"
         trace_items = "".join(f"<li>{html.escape(t)}</li>" for t in self.ledger.traces[-30:])
+        timing = m["timing"]
         return f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <title>iLoop 提效看板</title><style>
 body{{font-family:-apple-system,system-ui,sans-serif;margin:24px;color:#1d1d1f;background:#fafafa}}
@@ -75,6 +78,9 @@ ul{{background:#fff;border-radius:8px;padding:12px 28px;line-height:1.9}}
   <div class="card"><div class="n">{m['evidence_inferred']}</div><div class="l">推断证据</div></div>
   <div class="card"><div class="n">{html.escape(m['global_review_status'])}</div><div class="l">全局复核 · {m['global_impacts']} 项</div></div>
   <div class="card"><div class="n">{html.escape(m['acceptance_status'])}</div><div class="l">独立验收</div></div>
+  <div class="card"><div class="n">{timing['wall_seconds']}s</div><div class="l">墙钟耗时</div></div>
+  <div class="card"><div class="n">{timing['max_concurrency']}</div><div class="l">最大并发</div></div>
+  <div class="card"><div class="n">{timing['retry_events']}</div><div class="l">重试事件</div></div>
 </div>
 <h2>证据类型分布</h2>
 <table><tr><th>能力</th><th>证据数</th></tr>{cap_rows}</table>

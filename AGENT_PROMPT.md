@@ -16,6 +16,18 @@
 - **全局视角不是一句提醒**：L2/L3 Task 创建时固定工程根和 Git commit；收口前执行 `global-review prepare` 读取任务期完整 diff、公共定义、动态入口、行为配置、删除逻辑与仓内调用方。按 `suggested_tests` 回归，能力证据用经宿主证明的 `subjects` 明确覆盖 target/consumer；重构/高影响改动还必须有外部独立验收。未完成时 `wrapup` 必须拒绝。
 - **对照固定尺子评审，不追最新一句话**：多轮/大版本任务计划期可冻结设计契约（`run objectives=... design_decisions=... non_goals=...`，进 host-attested policy、随任务恢复）。评审按三裁决——符合基线→明说不改、偏离→给行号改回、基线没覆盖→先改基线再动手；映射不到基线的「问题」记为基线缺口另议，不当 bug 顺手扩改。软基线可留空、不阻断收口。
 
+## 安装与稳定入口
+
+普通用户不需要学习 iLoop 命令。收到“安装 iLoop”请求后，Agent 自己完成：
+
+1. 检查 Python 3.9+ 与 Git；
+2. 将正式 `main` 安装到 `~/.iloop/iloop`；
+3. 执行仓库根目录的 `install.sh`，注册当前宿主入口；
+4. 等候候选版本的 selftest 与 fresh-clone smoke 全部通过；
+5. 用 `install-status` 回读安装根、commit 与宿主入口，确认 `ready=true` 后再接任务。
+
+升级先在候选目录验证，再原子替换正式目录。候选 smoke 失败时保留旧版本，不能在坏版本上继续修补。Agent 已位于源码仓时可直接运行 `bash install.sh`；已安装后固定从 `~/.iloop/iloop` 调用，不依赖任意当前目录。
+
 ## 工具入口（开源版命令）
 
 所有能力默认通过本地完整性宿主入口调用（`cd` 到 iloop 仓库根）：
@@ -40,6 +52,10 @@ python3 -m host_cli invoke <cap> [--real] [k=v ...]
 python3 -m host_cli oncall-demo
 python3 -m host_cli extension-init <team.ext>
 python3 -m host_cli extension-validate <dir>
+python3 -m host_cli source prepare repository=... base_commit=... task_id=...
+python3 -m host_cli suite validate|compile|preflight|install|smoke|status <manifest>
+python3 -m host_cli update
+python3 -m host_cli install-status
 python3 -m host_cli selftest
 ```
 
@@ -78,15 +94,33 @@ flow 中文名和档位不要硬记——`plan`/`flows` 输出里就带。没命
 扩展助手按四层装配：`AssistantRecipe → ActionSpec → Driver Capability → Provider`。
 Recipe 只声明有序动作，不写 deployment 分支；`DeploymentProfile` 只声明节点和
 可用 Provider，不复制 Recipe。多个 Provider 支持同一 Capability 时必须显式绑定。
+扩展可在 `capabilities.json` 声明 namespaced Driver Capability，不需要修改核心枚举；
+Action 必须完整声明底层能力的副作用，否则装配直接失败。
 跨节点执行必须使用签名 `TaskEnvelope` 和 `WorkerReceipt`，输入、Recipe 指纹、
 动作/能力清单、诊断 revision、Git 基线和 TTL 缺一不可；核心只提供本地
 in-process worker，远端 transport 由宿主或扩展实现。
+
+有 `workspace_write`、`external_write` 或 `process` 副作用的 Action，必须在调用
+Provider 之前验证短期 `AuthorizationGrant`。Grant 绑定 task、Case、诊断 revision、
+policy 指纹和允许的 Action；用户历史消息、CLI 参数或 Action 自报授权都不算凭证。
+兼容层直接执行副作用 Capability 时，Grant 必须通过 `allowed_capabilities` 精确授权；
+只给 Action 授权不能顺带放行低层 Capability。
+宿主若允许 Agent 直接调用 shell/写文件，还要接入 `authorize_tool_use` 作为
+PreToolUse Gate，防止绕开 Action 直接写；未知工具默认拒绝。默认宿主拿不到独立身份
+时应阻塞并升级用户。
+
+公开 `builtin.bugfix` Recipe 提供一条参考源码链。Agent 先用 `source prepare` 创建
+绑定 `base_commit` 的隔离 worktree，完成最小修改后再运行候选 Action；Git Provider
+冻结 `allowed_paths + change_digest`，只允许 `iloop/` 分支，并要求 draft PR 与 CI
+回执绑定同一 candidate commit。自动 merge、approve、发布仍留给人工或业务扩展。
 
 ## 澄清 gate + 验收标准（所有任务都用，敏捷度不同）
 
 - **模糊先澄清**：目标有歧义/缺关键输入（设备 sim/real、验收口径、接口/PRD）时，先给候选点选澄清，不带歧义开干。
 - **开工前定验收标准**：动手前对齐"怎么算完成"，写成可验证硬指标。步骤不能裸改成 done；Plugin receipt 仍须由进程外宿主 verifier 复验，`trusted_producer` 不是凭证。用户确认、Task 创建策略和 Capability requirements 同属宿主信任边界，普通 CLI 无权伪造或自行收口。
 - **独立验收按风险触发**：高影响改动先 `accept prepare`，把验收包交给外部只读 Agent；宿主在进程外验证身份后，通过 `Runtime.record_external_acceptance(task, result_path)` 回写，或调用 `AcceptanceStore.record_file(result_path, verify_attestation=verifier)`。普通 CLI 默认拒绝 `accept record`，环境变量和 reviewer 字符串都不能充当身份证明。
+- **验证范围服从影响面**：GlobalReview 把影响归为 R0 控件、R1 页面、R2 模块、R3 全局，再选择 spot / targeted / full。未知归属默认 R2，不允许自动降级；界面源码、资源或 UI 任务始终保留截图点验，截图 subjects 必须覆盖当前 target，人工接受风险也不能取消。
+- **只读验收可并行**：`AcceptanceBatch` 必须从同一个 `AcceptancePackage` 派生并完整划分 criterion；多个 reviewer 绑定同一 subject fingerprint、只读分片和独立产物目录，聚合结果仍写回原 `AcceptanceStore`。多个写者、共享设备或有前后依赖的动作继续串行。
 
 ## 反循环（防死循环）
 
@@ -105,7 +139,7 @@ in-process worker，远端 transport 由宿主或扩展实现。
 - **危险命令不裸跑**：`sudo`/`rm -rf`/`git reset --hard`/`git checkout --`/`git rebase`/`git push -f`/`git commit --amend`/`kill` 等由内核 `redline` 守卫拦截，不直接暴露给用户。
 - **不污染用户工程目录**：所有过程产物（分析/日志/截图/临时探针）必须写进数据目录，**禁止写用户工程根**（内核 `guard_write_path`）。
 - **编辑最小化、不改产物**：不动 `Pods/`/`DerivedData/`/`*.xcodeproj`/锁文件（除非用户明确要）；不回滚用户未要求的改动。
-- **改 iLoop 自身必跑 `selftest`**：改了内核/协议/脚本视同改代码，完成前 `python3 -m host_cli selftest` 和 `python3 scripts/fresh_clone_smoke.py` 必须全绿。规则改了让代码/测试跟上，别只写文档不验证。
+- **改 iLoop 自身必跑 `selftest`**：改了内核/协议/脚本视同改代码，完成前 `python3 -m host_cli selftest` 和 `python3 scripts/fresh_clone_smoke.py` 必须全绿。Suite 的 `production_ready` 还要求同一配置指纹下的新鲜 live smoke；旧回执或被修改的产物都不能复用。规则改了让代码/测试跟上，别只写文档不验证。
 - **二开禁止改核心**：业务扩展只走 `extension-init` 返回的扩展目录，核心整体只读（细则 `EXTENDING.md`）。
 
 ## 输出可视化规范

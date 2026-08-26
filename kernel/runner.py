@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import marshal
 import os
 import signal
 import subprocess
@@ -15,6 +18,42 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence
+
+
+def _stable_runtime_value(value: object) -> object:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return {
+            "bytes_sha256": hashlib.sha256(value).hexdigest(),
+        }
+    if isinstance(value, Path):
+        return {"path": str(value.expanduser().resolve())}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_runtime_value(item)
+            for key, item in sorted(
+                value.items(), key=lambda pair: str(pair[0])
+            )
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_runtime_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        rows = [_stable_runtime_value(item) for item in value]
+        return sorted(
+            rows,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ),
+        )
+    raise TypeError(
+        "runner configuration contains an unstable value: "
+        f"{type(value).__module__}.{type(value).__qualname__}"
+    )
 
 
 @dataclass
@@ -72,6 +111,47 @@ class CommandRunner:
                         self.developer_dir
                     )
         self.enforce_redline = enforce_redline
+
+    def runtime_fingerprint(self) -> str:
+        run_callable = getattr(self, "run")
+        run_function = getattr(run_callable, "__func__", run_callable)
+        run_code = getattr(run_function, "__code__", None)
+        closure = getattr(run_function, "__closure__", None) or ()
+        payload = {
+            "implementation_sha256": hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
+            "run_implementation_sha256": (
+                hashlib.sha256(marshal.dumps(run_code)).hexdigest()
+                if run_code is not None else ""
+            ),
+            "run_defaults": _stable_runtime_value(
+                getattr(run_function, "__defaults__", None)
+            ),
+            "run_kwdefaults": _stable_runtime_value(
+                getattr(run_function, "__kwdefaults__", None)
+            ),
+            "run_closure": [
+                _stable_runtime_value(cell.cell_contents)
+                for cell in closure
+            ],
+            "runner": f"{type(self).__module__}.{type(self).__qualname__}",
+            "environment_overrides": {
+                str(key): str(value)
+                for key, value in sorted(
+                    self.environment_overrides.items()
+                )
+            },
+            "developer_dir": str(self.developer_dir or ""),
+            "enforce_redline": bool(self.enforce_redline),
+        }
+        return hashlib.sha256(json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
 
     def run(self, argv: Sequence[str], *, timeout: float = 600.0,
             cwd: Optional[str | Path] = None, allow_dangerous: bool = False) -> CommandOutput:

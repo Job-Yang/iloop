@@ -2,6 +2,53 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与语义化版本。
 
+## [0.4.0] - 2026-08-26
+
+### [breaking-entry] 安装与安全执行
+- 新增 Agent 驱动安装器：固定安装到 `~/.iloop/iloop`，注册通用、Claude Code 和
+  Codex 入口；升级先跑候选 selftest 与 fresh-clone smoke，失败保留旧版本。
+- 有副作用 Action 改为强制验证短期 `AuthorizationGrant`；Grant 绑定 Task、Case、
+  diagnosis revision、policy 指纹和允许的 Action。新增宿主 PreToolUse Guard API，
+  阻断绕过 Runtime 的直接写命令。
+- 内置 Capability 补齐副作用声明；兼容层直接执行写入/进程能力时必须使用
+  `allowed_capabilities` 单独授权。Tool Guard 对未知工具和写入型 Git 参数默认拒绝。
+
+### M5 · 可运行能力工厂
+- Driver Capability 从固定枚举扩展为 `CapabilitySpec` + `CapabilityCatalog`；
+  扩展可通过 `capabilities.json` 注册 namespaced 能力，旧枚举保持兼容。
+- Provider 装配新增未知能力、重复能力、缺输入、漏输出、Deployment 不支持和
+  副作用漏报校验。
+- 新增平台无关 Source Candidate 血缘协议，以及 Git/GitHub Provider：
+  `base commit → isolated worktree → change digest → candidate commit →
+  draft PR → exact-commit CI`。
+- 随仓提供 `builtin.bugfix` 参考 Recipe；本地 Git 使用真实仓库验证，GitHub draft PR
+  与 CI 使用可替换 Runner 做协议级 fixture。
+
+### M6 · 生产就绪与分发
+- 新增通用 `AssistantSuite`，支持任意 Assistant/Deployment 的
+  validate、compile、preflight、install、smoke 和 status。
+- 就绪状态区分 declared、handler installed、implementation ready、runtime ready
+  和 production ready；旧、篡改、错配置或产物变化后的 smoke receipt 全部失效。
+- Provider 必须提供覆盖实现与运行配置的 `runtime_fingerprint()` 才能进入
+  production ready，避免同 ID Provider 被替换后复用旧 smoke。
+- smoke 只允许只读 Capability，不能借体检执行写操作。
+
+### M7 · 验证提速
+- GlobalReview 在既有完整影响图上增加 R0 控件、R1 页面、R2 模块、R3 全局验证范围，
+  未知影响默认 R2；UI 源码/资源自动保留 target-bound screenshot 硬门槛，人工接受
+  风险也不能取消。scope rules 与 UI 输入随 Review 持久化，最终收口按原参数重算。
+- Ledger 新增结构化 TimingEvent，Dashboard 可复算阶段、Action、Capability、
+  Provider、阻塞、重试和最大并发。
+- 新增 `AcceptanceBatch`，从现有 `AcceptancePackage` 按 criterion 拆出只读分片并行
+  验收；错 package/token/fingerprint、缺失/重复分片、执行者自验和未逐条判定均拒绝，
+  聚合结果继续通过 `AcceptanceStore` 和既有收口 Gate。
+
+### 验证
+- 保留三版本 Python 矩阵、fresh-clone managed-host smoke 和 iOS 插件回归。
+- 新增动态扩展、授权前零调用、Git 候选篡改、Suite stale smoke、安装回滚、
+  UI 视觉地板、时间账本和并行验收的正反向用例。
+- selftest 共 324 条断言：内核 249 + iOS 插件 75。
+
 ## [0.3.0] - 2026-08-24
 
 ### [breaking-entry] 入口协议

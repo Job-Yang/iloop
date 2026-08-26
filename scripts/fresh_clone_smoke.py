@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from kernel import HostTrustStore  # noqa: E402
 
 
 def run(args: list[str], env: dict[str, str], *, check: bool = True) -> str:
@@ -89,6 +92,37 @@ def main() -> int:
         tasks = list((home / ".iloop" / "data").glob("*/tasks/*.json"))
         task = json.loads(tasks[0].read_text(encoding="utf-8"))
         task_id = task["id"]
+        policy_path = next(
+            (home / ".iloop" / "data").glob(
+                f"*/runtime/{task_id}/task-policy.json"
+            )
+        )
+        policy = json.loads(
+            policy_path.read_text(encoding="utf-8")
+        )
+        policy_digest = hashlib.sha256(json.dumps(
+            policy,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        run_grant = HostTrustStore(
+            home / ".iloop" / "host-trust"
+        ).authorization_authority().issue(
+            subject="fresh-clone-smoke",
+            kind="automation",
+            allowed_actions=(),
+            allowed_capabilities=("run",),
+            task_id=task_id,
+            case_id=task_id,
+            diagnosis_revision=0,
+            policy_digest=policy_digest,
+        )
+        run_grant_path = root / "run-authorization.json"
+        run_grant_path.write_text(
+            json.dumps(run_grant.to_dict()),
+            encoding="utf-8",
+        )
         arbitrary = root / "arbitrary.log"
         arbitrary.write_text("caller authored\n", encoding="utf-8")
         rejected = run([
@@ -120,6 +154,10 @@ def main() -> int:
                     "counter_condition=alternate fixture",
                     "counter_expect=summary_contains:verified",
                 ])
+            if capability == "run":
+                arguments.append(
+                    f"authorization_file={run_grant_path}"
+                )
             run(arguments, env)
             evidence_path = next(
                 (home / ".iloop" / "data").glob(

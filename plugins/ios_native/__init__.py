@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -87,6 +88,46 @@ class IOSNativePlugin:
             Capability.UI_PREPARE, Capability.UI_STATUS, Capability.UI_STOP,
         ]
         return caps
+
+    def runtime_fingerprint(self) -> str:
+        runner_fingerprint = getattr(
+            self.runner, "runtime_fingerprint", None
+        )
+        if not callable(runner_fingerprint):
+            return ""
+        runner_digest = str(runner_fingerprint()).strip().lower()
+        if (
+            len(runner_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in runner_digest
+            )
+        ):
+            return ""
+        payload = {
+            "provider": self.platform_id,
+            "implementation_sha256": hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
+            "mode": self.mode,
+            "config": {
+                str(key): str(value)
+                for key, value in sorted(self.config.items())
+            },
+            "developer_dir": str(self.developer_dir or ""),
+            "wda_endpoint": str(getattr(self.wda, "base", "")),
+            "runner": (
+                f"{type(self.runner).__module__}."
+                f"{type(self.runner).__qualname__}"
+            ),
+            "runner_fingerprint": runner_digest,
+        }
+        return hashlib.sha256(json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
 
     def invoke(self, capability: Capability, **kwargs) -> CapabilityResult:
         if capability not in self.capabilities():

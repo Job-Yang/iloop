@@ -7,7 +7,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, Iterable, Mapping, Optional, Tuple
 
-from .capability import Capability
+from .capability import (
+    CapabilityCatalog, CapabilityId, CapabilityLike, capability_id,
+)
 
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
@@ -38,7 +40,7 @@ class ActionSpec:
     allowed_assistants: Tuple[str, ...] = ()
     inputs: Mapping[str, str] = field(default_factory=dict)
     outputs: Mapping[str, str] = field(default_factory=dict)
-    required_capabilities: Tuple[Capability, ...] = ()
+    required_capabilities: Tuple[CapabilityLike, ...] = ()
     disposition_kind: str = ""
     lifecycle_stage: str = "diagnosis"
 
@@ -58,7 +60,9 @@ class ActionSpec:
         if len(set(effects)) != len(effects):
             raise ValueError(f"action '{self.action_id}' has duplicate side effects")
         object.__setattr__(self, "side_effects", effects)
-        capabilities = tuple(Capability(item) for item in self.required_capabilities)
+        capabilities = tuple(
+            capability_id(item) for item in self.required_capabilities
+        )
         if len(set(capabilities)) != len(capabilities):
             raise ValueError(
                 f"action '{self.action_id}' has duplicate driver capabilities"
@@ -118,17 +122,48 @@ ActionHandler = Callable[[Mapping[str, object]], Mapping[str, object]]
 class ActionCatalog:
     """Fail-closed registry for application action contracts and handlers."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        capability_catalog: Optional[CapabilityCatalog] = None,
+    ) -> None:
+        self.capabilities = capability_catalog or CapabilityCatalog()
         self._specs: Dict[str, ActionSpec] = {}
         self._handlers: Dict[str, ActionHandler] = {}
+        self._frozen = False
 
     def register(
         self,
         spec: ActionSpec,
         handler: Optional[ActionHandler] = None,
     ) -> None:
+        if self._frozen:
+            raise ValueError("ActionCatalog is frozen")
         if spec.action_id in self._specs:
             raise ValueError(f"duplicate action_id '{spec.action_id}'")
+        missing_capabilities = [
+            item.value for item in spec.required_capabilities
+            if not self.capabilities.contains(item)
+        ]
+        if missing_capabilities:
+            raise ValueError(
+                f"action '{spec.action_id}' references unknown capabilities: "
+                f"{', '.join(sorted(missing_capabilities))}"
+            )
+        capability_effects = {
+            self.capabilities.get(item).side_effect
+            for item in spec.required_capabilities
+        } - {"none", "read"}
+        declared_effects = {
+            item.value for item in spec.side_effects
+        }
+        undeclared_effects = sorted(
+            capability_effects - declared_effects
+        )
+        if undeclared_effects:
+            raise ValueError(
+                f"action '{spec.action_id}' does not declare capability "
+                f"side effects: {', '.join(undeclared_effects)}"
+            )
         if handler is not None and not callable(handler):
             raise TypeError(f"handler for '{spec.action_id}' must be callable")
         self._specs[spec.action_id] = spec
@@ -149,6 +184,8 @@ class ActionCatalog:
             raise ValueError(f"action '{action_id}' has no handler") from error
 
     def bind_handler(self, action_id: str, handler: ActionHandler) -> None:
+        if self._frozen:
+            raise ValueError("ActionCatalog is frozen")
         self.get(action_id)
         if action_id in self._handlers:
             raise ValueError(f"action '{action_id}' already has a handler")
@@ -159,10 +196,18 @@ class ActionCatalog:
     def all(self) -> Tuple[ActionSpec, ...]:
         return tuple(self._specs[key] for key in sorted(self._specs))
 
+    def has_handler(self, action_id: str) -> bool:
+        self.get(action_id)
+        return action_id in self._handlers
+
+    def freeze(self) -> None:
+        self.capabilities.freeze()
+        self._frozen = True
+
     def required_capabilities(
         self,
         action_ids: Iterable[str],
-    ) -> Tuple[Capability, ...]:
+    ) -> Tuple[CapabilityId, ...]:
         capabilities = {
             capability
             for action_id in action_ids

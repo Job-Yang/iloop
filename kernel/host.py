@@ -11,6 +11,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .authorization import HMACAuthorizationAuthority
+
 
 EXTERNAL_ATTESTATION_KINDS = frozenset({
     "evidence_subjects",
@@ -129,3 +131,12 @@ class HostTrustStore:
                 self._signature(kind, resolved, payload_sha256),
             )
         )
+
+    def authorization_authority(self) -> HMACAuthorizationAuthority:
+        """Return the local-integrity authority owned by this host adapter."""
+        derived = hmac.new(
+            self._key,
+            b"iloop-authorization-v1",
+            hashlib.sha256,
+        ).digest()
+        return HMACAuthorizationAuthority(derived)

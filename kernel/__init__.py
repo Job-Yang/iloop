@@ -17,7 +17,11 @@
 """
 
 from .evidence import EvidenceArtifact, EvidenceKind
-from .capability import Capability, CapabilityResult, CapabilityStatus, Plugin, unsupported
+from .capability import (
+    Capability, CapabilityCatalog, CapabilityId, CapabilityLike,
+    CapabilityResult, CapabilitySpec, CapabilityStatus, Plugin,
+    capability_id, unsupported,
+)
 from .action import (
     ActionCatalog, ActionHandler, ActionResult, ActionRisk, ActionSideEffect,
     ActionSpec,
@@ -32,6 +36,17 @@ from .deployment import (
 from .execution import (
     LocalRecipeWorker, ReplayGuard, TaskEnvelope, WorkerEvidence, WorkerReceipt,
 )
+from .authorization import (
+    AuthorizationGrant, AuthorizationVerifier, HMACAuthorizationAuthority,
+)
+from .source import (
+    CandidateLineage, CandidateRevision, ChangeRequestReceipt,
+    ChangeSnapshot, CICheckReceipt,
+)
+from .suite import (
+    AssistantSuite, SmokeCheck, SmokeReceipt, SuiteManifest, SuiteMember,
+)
+from .tool_guard import authorize_tool_use
 from .flow import Flow, Autonomy, FlowRegistry
 from .lesson import Lesson, LessonBook
 from .gate import FourGate, GateResult
@@ -41,11 +56,14 @@ from .case import (
     DispositionPlan, DispositionStatus, Hypothesis, HypothesisStatus,
     ObservationStatus, TestSpec, VerificationRecord, VerificationStatus,
 )
-from .ledger import Ledger, Round, RoundStatus, render, BRAND, PHASES
+from .ledger import (
+    Ledger, Round, RoundStatus, TimingEvent, render, BRAND, PHASES,
+)
 from .acceptance import (
     RiskLevel, assess_risk, needs_independent_review,
     AcceptancePackage, AcceptanceResult, Verdict, IndependentReviewer,
-    ChangeScore, score_change, AcceptanceStore, aggregate_criteria_verdicts,
+    AcceptanceBatch, AcceptanceShard, ChangeScore, score_change,
+    AcceptanceStore, aggregate_criteria_verdicts,
 )
 from .channel import (
     Event, EventSource, Notifier, StdoutNotifier, WebhookNotifier, StaticEventSource,
@@ -91,7 +109,9 @@ def discover_developer_dir():
 
 __all__ = [
     "EvidenceArtifact", "EvidenceKind",
-    "Capability", "CapabilityResult", "CapabilityStatus", "Plugin", "unsupported",
+    "Capability", "CapabilityCatalog", "CapabilityId", "CapabilityLike",
+    "CapabilityResult", "CapabilitySpec", "CapabilityStatus", "Plugin",
+    "capability_id", "unsupported",
     "ActionCatalog", "ActionHandler", "ActionResult", "ActionRisk",
     "ActionSideEffect", "ActionSpec",
     "AssistantAssembly", "AssistantRecipe", "RecipeCatalog",
@@ -99,6 +119,12 @@ __all__ = [
     "DeploymentAssembly", "DeploymentProfile", "assemble_deployment",
     "LocalRecipeWorker", "ReplayGuard", "TaskEnvelope", "WorkerEvidence",
     "WorkerReceipt",
+    "AuthorizationGrant", "AuthorizationVerifier",
+    "HMACAuthorizationAuthority",
+    "CandidateLineage", "CandidateRevision", "ChangeRequestReceipt",
+    "ChangeSnapshot", "CICheckReceipt",
+    "AssistantSuite", "SmokeCheck", "SmokeReceipt", "SuiteManifest",
+    "SuiteMember", "authorize_tool_use",
     "Flow", "Autonomy", "FlowRegistry",
     "Lesson", "LessonBook",
     "FourGate", "GateResult",
@@ -107,10 +133,12 @@ __all__ = [
     "DispositionKind", "DispositionPlan", "DispositionStatus",
     "Hypothesis", "HypothesisStatus", "ObservationStatus", "TestSpec",
     "VerificationRecord", "VerificationStatus",
-    "Ledger", "Round", "RoundStatus", "render", "BRAND", "PHASES",
+    "Ledger", "Round", "RoundStatus", "TimingEvent",
+    "render", "BRAND", "PHASES",
     "RiskLevel", "assess_risk", "needs_independent_review",
     "AcceptancePackage", "AcceptanceResult", "Verdict", "IndependentReviewer",
-    "ChangeScore", "score_change", "AcceptanceStore", "aggregate_criteria_verdicts",
+    "ChangeScore", "score_change", "AcceptanceStore",
+    "AcceptanceBatch", "AcceptanceShard", "aggregate_criteria_verdicts",
     "Event", "EventSource", "Notifier", "StdoutNotifier", "WebhookNotifier", "StaticEventSource",
     "CapabilityGate", "RequiredOperation", "OpStatus",
     "CommandRunner", "CommandOutput", "discover_developer_dir",
@@ -129,4 +157,4 @@ __all__ = [
     "HostTrustStore",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

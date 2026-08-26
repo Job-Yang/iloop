@@ -1371,9 +1371,11 @@ def test_runtime_task_resume_and_evidence() -> None:
             "验证页面行为",
             constraints=["不改公共 API"],
             acceptance=["编译通过"],
-            capabilities=["build", "logs"],
+            capabilities=["view_tree", "logs"],
         )
-        task = runtime.execute_capabilities(task, ["build", "logs"])
+        task = runtime.execute_capabilities(
+            task, ["view_tree", "logs"]
+        )
         restored = runtime.load(task.id)
         card = runtime.tasks.resume_card(restored)
         check("运行时: Task 原子落盘并可恢复", restored.id == task.id
@@ -1705,8 +1707,11 @@ def test_action_recipe_assembly_and_task_binding() -> None:
             "M1: 旧 Task 恢复时拒绝静默切换新版 Recipe",
             recipe_upgrade_rejected,
         )
-        from kernel import HostTrustStore
+        from kernel import HostTrustStore, HMACAuthorizationAuthority
         trust = HostTrustStore(Path(d) / "trust")
+        authority = HMACAuthorizationAuthority(
+            b"runtime-authorization-secret-32-bytes"
+        )
         managed = Runtime(
             Path(d) / "managed",
             registry,
@@ -1808,17 +1813,31 @@ def test_action_recipe_assembly_and_task_binding() -> None:
             recipe_catalog=side_recipes,
             attestation_recorder=trust.attest,
             attestation_verifier=trust.verify,
+            authorization_verifier=authority,
         )
         side_task = side_runtime.start(
             "实现功能",
             assistant_id="example.side_effect",
         )
+        side_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=("example.external_write",),
+            task_id=side_task.id,
+            case_id=side_task.id,
+            diagnosis_revision=0,
+            policy_digest=side_runtime._policy_digest(side_task.id),
+        )
         try:
-            side_runtime.execute_assistant(side_task)
+            side_runtime.execute_assistant(
+                side_task, authorization=side_grant
+            )
         except KeyboardInterrupt:
             pass
         side_task = side_runtime.load(side_task.id)
-        side_task = side_runtime.execute_assistant(side_task)
+        side_task = side_runtime.execute_assistant(
+            side_task, authorization=side_grant
+        )
         check(
             "M1: Action 中断后不重复执行不确定外部副作用",
             side_effect_count["value"] == 1
@@ -1856,17 +1875,33 @@ def test_action_recipe_assembly_and_task_binding() -> None:
             recipe_catalog=provider_recipes,
             attestation_recorder=trust.attest,
             attestation_verifier=trust.verify,
+            authorization_verifier=authority,
         )
         provider_task = provider_runtime.start(
             "实现功能",
             assistant_id="example.provider_interrupt",
         )
+        provider_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=("example.provider_side_effect",),
+            task_id=provider_task.id,
+            case_id=provider_task.id,
+            diagnosis_revision=0,
+            policy_digest=provider_runtime._policy_digest(
+                provider_task.id
+            ),
+        )
         try:
-            provider_runtime.execute_assistant(provider_task)
+            provider_runtime.execute_assistant(
+                provider_task, authorization=provider_grant
+            )
         except KeyboardInterrupt:
             pass
         provider_task = provider_runtime.load(provider_task.id)
-        provider_task = provider_runtime.execute_assistant(provider_task)
+        provider_task = provider_runtime.execute_assistant(
+            provider_task, authorization=provider_grant
+        )
         check(
             "M1: Provider 中断后 journal 阻止重复副作用",
             provider_count["value"] == 1
@@ -1900,15 +1935,28 @@ def test_action_recipe_assembly_and_task_binding() -> None:
             recipe_catalog=concurrent_recipes,
             attestation_recorder=trust.attest,
             attestation_verifier=trust.verify,
+            authorization_verifier=authority,
         )
         concurrent_task = concurrent_runtime.start(
             "实现功能",
             assistant_id="example.concurrent",
         )
+        concurrent_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=("example.concurrent_write",),
+            task_id=concurrent_task.id,
+            case_id=concurrent_task.id,
+            diagnosis_revision=0,
+            policy_digest=concurrent_runtime._policy_digest(
+                concurrent_task.id
+            ),
+        )
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(
                 lambda _: concurrent_runtime.execute_assistant(
-                    concurrent_task
+                    concurrent_task,
+                    authorization=concurrent_grant,
                 ),
                 range(2),
             ))
@@ -1991,6 +2039,7 @@ def test_provider_registry_routes_and_fails_closed() -> None:
     missing_actions.register(ActionSpec(
         action_id="example.missing",
         description="Needs an unavailable build provider",
+        side_effects=(ActionSideEffect.WORKSPACE_WRITE,),
         required_capabilities=(Capability.BUILD,),
     ))
     missing_recipes = RecipeCatalog(missing_actions)
@@ -2037,8 +2086,8 @@ def test_provider_registry_routes_and_fails_closed() -> None:
 def test_runtime_assistant_resolve_lifecycle() -> None:
     from kernel import (
         ActionCatalog, ActionSpec, AssistantRecipe, CapabilityResult,
-        DispositionStatus, HostTrustStore, HypothesisStatus, RecipeCatalog, Runtime,
-        TaskStatus,
+        DispositionStatus, HMACAuthorizationAuthority, HostTrustStore,
+        HypothesisStatus, RecipeCatalog, Runtime, TaskStatus,
     )
 
     with tempfile.TemporaryDirectory() as d:
@@ -2076,6 +2125,7 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
             ActionSpec(
                 action_id="example.diagnose_case",
                 description="Collect all diagnosis gates",
+                side_effects=(ActionSideEffect.PROCESS,),
                 required_capabilities=(
                     Capability.RUN,
                     Capability.VIEW_TREE,
@@ -2095,6 +2145,7 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
             ActionSpec(
                 action_id="example.apply_fix",
                 description="Apply the selected fix",
+                side_effects=(ActionSideEffect.WORKSPACE_WRITE,),
                 disposition_kind="code_change",
                 lifecycle_stage="disposition",
                 outputs={"fixed": "boolean"},
@@ -2105,6 +2156,7 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
             ActionSpec(
                 action_id="example.verify_fix",
                 description="Verify the selected fix",
+                side_effects=(ActionSideEffect.PROCESS,),
                 lifecycle_stage="verification",
                 required_capabilities=(Capability.RUN,),
                 outputs={"verified": "boolean"},
@@ -2123,19 +2175,36 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
         trust = HostTrustStore(root / "trust")
+        authority = HMACAuthorizationAuthority(
+            b"resolve-lifecycle-authorization-key"
+        )
         runtime = Runtime(
             root / "data",
             registry,
             EvidencePlugin(),
+            project_root=ROOT,
             recipe_catalog=recipes,
             attestation_recorder=trust.attest,
             attestation_verifier=trust.verify,
+            authorization_verifier=authority,
         )
         task = runtime.start(
-            "验证助手闭环",
+            "修复助手闭环",
             assistant_id="example.resolve_assistant",
+            executor_id="selftest",
         )
-        task = runtime.execute_assistant(task)
+        diagnosis_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=("example.diagnose_case",),
+            task_id=task.id,
+            case_id=task.id,
+            diagnosis_revision=0,
+            policy_digest=runtime._policy_digest(task.id),
+        )
+        task = runtime.execute_assistant(
+            task, authorization=diagnosis_grant
+        )
         case = Case.load(task.case_path)
         root_hypothesis = case.add_hypothesis("second hypothesis is root")
         case.hypotheses["h1"].status = HypothesisStatus.REFUTED
@@ -2147,7 +2216,21 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
             recipes.assemble(task.assistant_id).disposition_actions()
         )
         case.save(task.case_path)
-        task = runtime.execute_assistant(task)
+        disposition_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=(
+                "example.apply_fix",
+                "example.verify_fix",
+            ),
+            task_id=task.id,
+            case_id=task.id,
+            diagnosis_revision=case.diagnosis_revision,
+            policy_digest=runtime._policy_digest(task.id),
+        )
+        task = runtime.execute_assistant(
+            task, authorization=disposition_grant
+        )
         case = Case.load(task.case_path)
         disposition_completed = (
             case.disposition_progress.get(plan.plan_id)
@@ -2190,7 +2273,18 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
         case = Case.load(task.case_path)
         case.reopen_diagnosis("new evidence requires revision 2")
         case.save(task.case_path)
-        task = runtime.execute_assistant(task)
+        revised_diagnosis_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=("example.diagnose_case",),
+            task_id=task.id,
+            case_id=task.id,
+            diagnosis_revision=case.diagnosis_revision,
+            policy_digest=runtime._policy_digest(task.id),
+        )
+        task = runtime.execute_assistant(
+            task, authorization=revised_diagnosis_grant
+        )
         case = Case.load(task.case_path)
         resolved_again, _ = case.try_resolve(
             lambda path, row: trust.verify("evidence", path, row),
@@ -2200,7 +2294,21 @@ def test_runtime_assistant_resolve_lifecycle() -> None:
             recipes.assemble(task.assistant_id).disposition_actions()
         )
         case.save(task.case_path)
-        task = runtime.execute_assistant(task)
+        revised_disposition_grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=(
+                "example.apply_fix",
+                "example.verify_fix",
+            ),
+            task_id=task.id,
+            case_id=task.id,
+            diagnosis_revision=case.diagnosis_revision,
+            policy_digest=runtime._policy_digest(task.id),
+        )
+        task = runtime.execute_assistant(
+            task, authorization=revised_disposition_grant
+        )
         evidence_by_id = {
             item.id: item for item in runtime.evidence(task.id)
         }
@@ -2247,7 +2355,7 @@ def test_deployment_envelope_receipt_and_local_replay() -> None:
     from kernel import (
         ActionCatalog, ActionSpec, AssistantRecipe, CapabilityResult,
         DeploymentAssembly, DeploymentProfile, LocalRecipeWorker,
-        ProviderRegistry, RecipeCatalog,
+        HMACAuthorizationAuthority, ProviderRegistry, RecipeCatalog,
         ReplayGuard, TaskEnvelope, WorkerEvidence, WorkerReceipt,
         assemble_deployment,
     )
@@ -2389,6 +2497,9 @@ def test_deployment_envelope_receipt_and_local_replay() -> None:
     )
 
     secret = b"m4-contract-secret-with-32-bytes!!"
+    authorization_authority = HMACAuthorizationAuthority(
+        b"m4-authorization-secret-with-32-bytes"
+    )
     premature_disposition = TaskEnvelope.issue(
         task_id="task-premature-disposition",
         assistant_id="example.disposition",
@@ -2448,6 +2559,17 @@ def test_deployment_envelope_receipt_and_local_replay() -> None:
         capability_plan=(),
         evidence_plan=("action:example.remote_fix",),
         secret=secret,
+        authorization=authorization_authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=("example.remote_fix",),
+            task_id="task-concurrent-disposition",
+            case_id="task-concurrent-disposition",
+            diagnosis_revision=1,
+            policy_digest=__import__("hashlib").sha256(
+                b"{}"
+            ).hexdigest(),
+        ),
     )
 
     class SlowContainsSet(set):
@@ -2462,6 +2584,7 @@ def test_deployment_envelope_receipt_and_local_replay() -> None:
         secret=secret,
         replay_guard=concurrent_guard,
         base_commit="abc123",
+        authorization_verifier=authorization_authority,
     )
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
@@ -2880,7 +3003,10 @@ def test_deployment_envelope_receipt_and_local_replay() -> None:
 
 
 def test_runtime_logs_follow_successful_run_id() -> None:
-    from kernel import CapabilityResult, CapabilityStatus, GlobalReview, Runtime
+    from kernel import (
+        CapabilityResult, CapabilityStatus, GlobalReview,
+        HMACAuthorizationAuthority, Runtime,
+    )
 
     with tempfile.TemporaryDirectory() as d:
         calls = []
@@ -2901,17 +3027,35 @@ def test_runtime_logs_follow_successful_run_id() -> None:
 
         registry = FlowRegistry()
         registry.load_json(ROOT / "workflow" / "flows.json")
+        authority = HMACAuthorizationAuthority(
+            b"runtime-logs-authorization-key-32"
+        )
         runtime = Runtime(
             d,
             registry,
             FakePlugin(),
             attestation_verifier=lambda kind, path, row: True,
+            authorization_verifier=authority,
         )
         task = runtime.start(
             "验证运行日志",
             capabilities=["run", "logs"],
         )
-        task = runtime.execute_capabilities(task, ["run", "logs"])
+        grant = authority.issue(
+            subject="selftest",
+            kind="automation",
+            allowed_actions=(),
+            allowed_capabilities=("run",),
+            task_id=task.id,
+            case_id=task.id,
+            diagnosis_revision=0,
+            policy_digest=runtime._policy_digest(task.id),
+        )
+        task = runtime.execute_capabilities(
+            task,
+            ["run", "logs"],
+            authorization=grant,
+        )
         evidence = runtime.evidence(task.id)
         run_call = next(item for item in calls if item[0] == "run")
         logs_call = next(item for item in calls if item[0] == "logs")
@@ -3237,6 +3381,7 @@ def test_external_acceptance_is_persistent_and_not_self_reviewed() -> None:
             "case-expired", "目标", ["标准"],
             [observed("标准通过")],
             executor_id="main-agent",
+            created_at=time.time() - 2,
             expires_at=time.time() - 1,
         )
         expired_store.prepare(expired_package)
@@ -3349,9 +3494,19 @@ def test_global_review_finds_shared_consumers_and_requires_record() -> None:
         (root / "kernel" / "service.py").write_text("def shared_api():\n    return 2\n", encoding="utf-8")
         check("全局复核: 未逐项记录前保持 pending", review.status == "pending")
         for item in review.impacts:
+            evidence_id = (
+                "ev-screenshot" if item.visual_required
+                else "ev-review"
+            )
             review.verify(
-                item.target, ["ev-review"],
+                item.target, [evidence_id],
                 resolution=f"selftest covers {item.target}",
+                evidence_capabilities=(
+                    ["screenshot"] if item.visual_required else []
+                ),
+                evidence_subjects={
+                    evidence_id: [item.target]
+                },
             )
         path = root / "review.json"
         review.save(path)
@@ -3436,7 +3591,7 @@ def test_global_review_uses_task_base_and_explicit_subjects() -> None:
         )
         task = runtime.start(
             "重构公共模块",
-            capabilities=["build"],
+            capabilities=["probe"],
             executor_id="main-agent",
         )
         source.write_text("def feature():\n    return 2\n", encoding="utf-8")
@@ -3448,7 +3603,7 @@ def test_global_review_uses_task_base_and_explicit_subjects() -> None:
         review = runtime.prepare_global_review(task, root)
         task = runtime.execute_capabilities(
             task,
-            ["build"],
+            ["probe"],
             subjects="feature.py;tests/test_feature.py",
         )
         denied_evidence = runtime.evidence(task.id)[0]
@@ -4379,6 +4534,11 @@ def test_release_audit_regressions() -> None:
               scoped_evidence.metadata["subjects"] == [])
 
 
+def test_m5_m7_platform_evolution() -> None:
+    from m5_m7_selftest import run_checks
+    run_checks(check)
+
+
 def run() -> int:
     for fn in [
         test_evidence_observed_vs_inferred,
@@ -4431,6 +4591,7 @@ def run() -> int:
         test_global_review_requires_consumer_evidence,
         test_ui_flow_verification_requires_evidence,
         test_release_audit_regressions,
+        test_m5_m7_platform_evolution,
     ]:
         fn()
     passed = sum(1 for _, ok in _checks if ok)
