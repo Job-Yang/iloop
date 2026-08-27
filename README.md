@@ -34,35 +34,32 @@ iLoop 把这些缺失的部分接起来：
 
 ---
 
-## 它能干什么
+## 仓库里已经有什么
 
-iLoop 给现有 Agent 补上研发交付所需的工作循环：
+开源仓同时交付 Agent 入口、平台无关内核和公开执行插件。下面的“验证口径”用来区分随仓可运行能力、需要用户环境完成的 smoke，以及留给扩展实现的接口。
 
-- **按任务选工作流**：排查、修复、需求、重构、验收、环境问题走不同的路径，不让 Agent 一上来凭感觉乱做。
-- **按风险决定放权**：L1 只看不改、L2 小步修改、L3 授权后连续执行。
-- **用真实反馈纠偏**：验数据看日志，验控件看 UI 树，验最终表现看截图，验崩溃看 crash report。
-- **把任务当持续档案**：记录现象、候选原因、证据和下一步检查，长任务换会话也能继续。
-- **区分观测和推断**：真跑看到的是 `observed`，从源码推出来的是 `inferred`，两者不能混为一谈。
-- **换一个 Agent 做关键验收**：高风险改动不让执行者自己盖章。
-- **沉淀长期经验**：工程坑进入错题本，下次先召回，不从零再踩一次。
-- **展示交付过程**：轮次、证据、止损和验收进入提效看板，而不是只留下聊天记录。
-- **从整体复核改动**：收口读取完整 diff，检查公共定义、调用方、共享边界和删除逻辑，防止局部补丁都对、整体架构却持续变坏。
-- **用原子动作装配助手**：把应用动作、平台能力和部署位置拆开，同一组动作可以组成不同助手，同一助手也可以部署到不同节点。
-- **把写操作关进授权边界**：代码提交、远端写入等副作用必须绑定当前任务、根因版本和短期授权，不能从历史对话继承。
-- **按真实影响范围验证**：从控件、页面、模块到全局选择合适回归范围；UI 改动始终保留截图点验。
-- **证明助手真的可用**：区分“配置里声明了”和“生产环境跑通了”，只有当前配置的新鲜 smoke 通过才算 ready。
+| 能力 | 随仓交付 | 验证口径 |
+|---|---|---|
+| Agent 入口与工作流 | `AGENT_PROMPT.md`、按需加载的场景文档、flow 路由和 L1/L2/L3 放权等级 | Agent 先读目标和约束，再决定流程、工具与证据，不把 playbook 当固定命令清单 |
+| VDD 运行时 | Task、Evidence、FourGate、版本化 Case、断点恢复和硬收口 | `observed` 与 `inferred` 分开记录；时间、范围、机制和反证没有闭合时不能完成任务 |
+| 助手装配 | 动态 `CapabilitySpec`、`ActionSpec`、`AssistantRecipe`、Provider Registry 和 Deployment | Capability、Action、Provider 或部署缺失、歧义、漏报副作用时直接拒绝装配 |
+| 安全执行 | 短期 `AuthorizationGrant`、PreToolUse Guard、签名 `TaskEnvelope`、防重放账本和 `WorkerReceipt` | 写工作区、启动进程和远端写入必须先过授权；历史消息不能继承成当前写权限 |
+| 源码修复参考链 | `builtin.bugfix` Recipe 与 Git/GitHub Provider | 本地 Git worktree、快照、提交和远端分支使用真实仓库验证；draft PR 与 exact-commit CI 需要在使用者自己的 GitHub 登录态和测试仓做 live smoke |
+| 生产就绪检查 | `AssistantSuite` 的 validate、compile、preflight、install、smoke 和 status | 配置存在只代表 declared；当前 Recipe、Provider、工具和新鲜 smoke 全部通过后才是 `production_ready` |
+| 回归与验收 | GlobalReview R0-R3、target-bound UI screenshot、TimingEvent 和并行只读 AcceptanceBatch | 验证范围由完整影响图决定；项目规则只能升档，不能降低安全下限；并行验收仍回到同一 AcceptanceStore 收口 |
+| 任务记忆与可见性 | Case、Ledger、LessonBook、UI Flow 和 Dashboard | 长任务可以跨会话恢复；工程坑按条件进入错题本；看板展示证据和过程，不拿动作数量冒充完成 |
+| iOS 官方插件 | 模拟器与真机 build、install、launch、截图、UI 树、日志、Crash 和 UI 操作 | 模拟器闭环已端到端验证；真机实现使用 Appium WebDriverAgent，仍依赖使用者自己的签名、设备配对和 `iproxy` 环境 |
 
-开源版包含平台无关内核和一个 iOS 官方插件，支持：
+## 什么时候适合用
 
-- 模拟器与真机的 build / install / launch
-- 截图、UI 层级树、日志和 crash report
-- 基于 Appium WebDriverAgent 的真机 UI 自动化
-- 可复用 UI Flow（`verified` 由宿主证明的运行态证据写入），以及 Task/Case/Capability Gate/独立验收/全局复核的硬收口
-- `ActionSpec` / `AssistantRecipe` / Provider Registry，以及版本化 Resolve Case
-- 可扩展 Driver Capability、受控副作用授权和按能力装配的 Assistant Suite
-- Git/GitHub BugFix 参考链：隔离工作区、候选提交、draft PR 与精确 commit CI
-- 签名 `TaskEnvelope`、防重放账本和绑定完整任务指纹的 `WorkerReceipt`
-- 本机 Xcode 自动发现，不依赖全局 `xcode-select`
+iLoop 适合已经在使用 Coding Agent，又希望它能把任务做到“有证据地完成”的个人和团队。下面这些情况最典型：
+
+- Agent 会改代码，但编译、日志、UI、Crash 和回归仍靠人手工搬运；
+- 任务一长就丢目标、丢现场，换会话后只能重新解释；
+- 高风险改动需要独立验收，不能让执行者自己给自己盖章；
+- 想把排查、Bug 修复、Oncall 或稳定性能力拆成可复用动作，再接入自己的平台。
+
+iLoop 采用本机优先的执行方式。它没有内置托管控制面、企业账号中心或远端任务队列，也不会替团队预装所有监控、IM 和 CI 平台。
 
 ---
 
@@ -84,7 +81,7 @@ iLoop 不想替代 Spec Kit、Codex、Ralph、Superpowers 或各种 Harness 方�
 
 ## 核心设计
 
-### 1. VDD：验过才算数
+### VDD：验过才算数
 
 Agent 的结论必须落到证据。收敛时检查四件事：
 
@@ -95,15 +92,15 @@ Agent 的结论必须落到证据。收敛时检查四件事：
 
 最终收口是一道硬门禁。任务步骤、运行证据、Case、四关、全局复核和必要的独立验收没有全部通过时，任务不能标记完成。
 
-### 2. 工作流与放权等级
+### 工作流与放权等级
 
-iLoop 会根据任务选择 flow，并给出所需文档、取证方向、升级条件和下一步建议。flow 不是教条清单，而是让 Agent 在开工前先确定“这类问题应该怎么想”。
+iLoop 会根据任务选择 flow，并给出所需文档、取证方向、升级条件和下一步建议。flow 提供思考方向，Agent 仍要根据现场选择工具和验证方式。
 
 - **L1 只看不改**：调查、取证、分析。
 - **L2 动手改**：最小改动、可回滚、改后验证。
 - **L3 放手干**：用户明确授权、有任务清单和验收标准后连续执行。
 
-### 3. 长期记忆不是一个大知识库
+### 长期记忆按用途拆开
 
 iLoop 把记忆拆成不同用途：
 
@@ -114,15 +111,15 @@ iLoop 把记忆拆成不同用途：
 
 每轮只加载命中的方法和最小证据缺口，避免把所有历史塞进上下文。
 
-### 4. 关键验收换一个视角
+### 关键验收换一个视角
 
 低风险改动由主 Agent 自核；公共逻辑或高风险链路触发独立验收。验收 Agent 只拿验收标准和证据，不拿执行过程，避免被原来的推理路径带偏。
 
-### 5. 全局复核对照固定目标
+### 全局复核对照固定目标
 
 重大改动开始前，iLoop 会记录这次任务的核心目标、设计决策和不改边界。后续 Review 只做三种判断：符合目标就不改，偏离目标就改回，原目标没有覆盖就先补齐约定。这样全局复核有一把稳定的尺子，不会因为对话变长而忽松忽紧。
 
-### 6. 判断力、业务和平台分开
+### 判断力、业务和平台分开
 
 ```text
 稳定判断力：VDD / 工作流 / 病例 / 验收 / 错题本
@@ -132,7 +129,7 @@ iLoop 把记忆拆成不同用途：
 
 换业务只替换领域层，换平台只替换执行插件，主循环不用重写。
 
-### 7. 助手、平台和部署正交
+### 助手、平台和部署正交
 
 `ActionSpec` 描述一个应用动作需要什么输入、可能产生什么副作用、风险多高，以及依赖哪些底层 Driver Capability。`AssistantRecipe` 只声明动作组合，不写本地/远端分支；`ProviderRegistry` 再把 build、logs、screenshot 等 Driver Capability 路由到具体 Provider。
 
@@ -155,6 +152,8 @@ DeploymentProfile
 ## 安装和使用
 
 准备好 Python 3.9+ 和一个能读取文件、执行本地命令的 Coding Agent。iOS 开发还需要 macOS 与 Xcode；模拟器和真机能力所需的公开工具，由 Agent 在实际用到时检查和安装。
+
+入口协议、内核、插件和文档放在同一个仓库里，clone 一次就能拿到相互匹配的版本，不需要另外下载提示词。
 
 把下面这句话发给你的 Agent：
 
@@ -197,10 +196,14 @@ Agent 会按入口协议自动完成：
 
 ## 能力边界
 
-iLoop 核心负责反馈闭环、任务恢复、证据与验收、助手装配和本地执行契约。仓库附带一套公开 BugFix 参考 Recipe 和 Git/GitHub Provider，用来展示完整装配方式；具体团队的 Oncall、稳定性助手，以及 Sentry、Slack 和企业 CI 等平台接入，仍由扩展提供。
+iLoop 核心负责反馈闭环、任务恢复、证据与验收、助手装配和本地执行契约。开源仓还附带 BugFix 参考 Recipe、Git/GitHub Provider 和 iOS 官方插件。
 
 参考 BugFix Recipe 的远端写操作需要宿主签发短期授权。默认本地宿主只能提供同一系统用户内的完整性保护，不冒充独立身份系统；没有可信授权来源时会停在写操作之前。
 
-跨节点任务可以使用签名信封和回执约束输入与结果，但远端队列、Worker 拉取、节点身份和密钥分发不在核心内。iOS 真机执行还需要可用的 Apple Developer 签名、已配对设备和 `iproxy`；模拟器与真机使用不同的 UI 自动化路径，不能把一边的控件引用直接复用到另一边。
+团队自己的 Oncall、稳定性巡检、监控、IM 和企业 CI 通过扩展接入。仓库提供组装这些助手所需的协议和插槽，不把任何一家公司的平台实现写进核心。
+
+跨节点任务可以使用签名信封和回执约束输入与结果，但远端队列、Worker 拉取、节点身份和密钥分发不在核心内。自动 merge、approve、发布和线上回滚也保留给人工或外部系统。
+
+iOS 真机执行需要可用的 Apple Developer 签名、已配对设备和 `iproxy`。模拟器与真机使用不同的 UI 自动化路径，不能把一边的控件引用直接复用到另一边。Android、Web 和其他平台可以实现自己的 Provider；在官方 Provider 真正跑通之前，架构可扩展不等于已经支持。
 
 MIT License。欢迎使用、修改和二次开发。
